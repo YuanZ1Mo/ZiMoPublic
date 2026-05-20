@@ -1,0 +1,12 @@
+/** 版本定义 */
+
+#ifndef ZM_VERSION_DEFINE_H
+#define ZM_VERSION_DEFINE_H
+
+//#define OPENSSL_API_COMPAT  0x10100000L
+
+
+#define ZIMO_SERVER_VERSION "1.0.0.0"
+
+
+#endif /* ZM_DATA_DEFINE_H */

@@ -1,0 +1,4 @@
+1.下载master的libevent:	https://github.com/libevent/libevent
+2.安装cmake:		https://cmake.org/
+3.安装openssl:	https://slproweb.com/products/Win32OpenSSL.html,下载哪个版本看想编译哪个平台的libevent,x86就选win32,添加环境变量OPENSSL_ROOT_DIR为openssl安装目录,path中添加%OPENSSL_ROOT_DIR%\bin,使用openssl version查看是否配置成功
+4.使用cmake生成vs工程时,sourcecode填libevent源码目录,binaries填生成目录,Configuring时,若要编译x86的静态库则选win32,同时openssl也要安装win32版的,反之选择x64
