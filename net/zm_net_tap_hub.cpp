@@ -233,7 +233,7 @@ void ZmTapHubProxy::OnStopTap()
     CloseListener(&_listener);
 }
 
-uint16_t ZmTapHubProxy::AddDummpy(uint16_t port, const char* host, ZM_HUB_PROXY_PORT_TYPE type)
+uint16_t ZmTapHubProxy::AddDummy(uint16_t port, const char* host, ZM_HUB_PROXY_PORT_TYPE type)
 {
     if (port >= 0)
     {
@@ -279,13 +279,13 @@ uint16_t ZmTapHubProxy::AddDummpy(uint16_t port, const char* host, ZM_HUB_PROXY_
 
             if (bListen)
             {
-                PUBLIC_LOG_INFO("AddDummpy,Host: {}, Port: {}, Success", host, listener->host, listener->port);
+                PUBLIC_LOG_INFO("AddDummy,Host: {}, Port: {}, Success", host, listener->host, listener->port);
             }
             else
             {
                 CloseListener(listener);
                 _dummies.Remove(_dummies.OffsetOf(listener));
-                PUBLIC_LOG_ERROR("AddDummpy,Host: {}, Port: {}, Failed", listener->host, listener->port);
+                PUBLIC_LOG_ERROR("AddDummy,Host: {}, Port: {}, Failed", listener->host, listener->port);
             }
 
             return (bListen) ? listener->port : 0;
@@ -295,7 +295,7 @@ uint16_t ZmTapHubProxy::AddDummpy(uint16_t port, const char* host, ZM_HUB_PROXY_
     return 0;
 }
 
-void ZmTapHubProxy::RemoveDummpy(uint16_t port, const char* host)
+void ZmTapHubProxy::RemoveDummy(uint16_t port, const char* host)
 {
     for (size_t i = 0; i < _dummies.Count(); i++)
     {

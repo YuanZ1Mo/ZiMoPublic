@@ -1,5 +1,5 @@
 #include "zm_net_tap_jrpc.h"
-
+#include "../spdlog/zm_logger.h"
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -59,8 +59,14 @@ void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app
             if (datalen > 4)
             {
                 // [4]len [*]JSON-Data
-                uint32_t mlen = ntohl(*((uint32_t*)evbuffer_pullup(app_input, 4)));
-                //SP_DEV_LOGT("%s[jrpc][%p] datalen=%ld, mlen=%u", __SP_FUNC__, tap, (long)datalen, mlen);
+                const uint32_t* plen = (const uint32_t*)evbuffer_pullup(app_input, 4);
+                if (!plen)
+                {
+                    PUBLIC_LOG_ERROR("Tap: {}, evbuffer_pullup failed in JRPC header", (void*)tap);
+                    tap->tap_context->Drop(tap, "JRPC header pullup failed");
+                    return;
+                }
+                uint32_t mlen = ntohl(*plen);
                 ZmTapContext::SetOptData(tap, mlen + 1);
                 tap->requester_data_len = mlen; /** 需要的数据长度 */
                 tap->requester_content_len = 0;    /** 已经读取到的数据长度 */
@@ -75,7 +81,14 @@ void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app
 
         /** 只读取需要的长度，防止越界 */
         size_t rlen = ZM_MIN(datalen, tap->requester_data_len - tap->requester_content_len);
-        memcpy(tap->requester_data + tap->requester_content_len, evbuffer_pullup(app_input, datalen), rlen);
+        const void* pdata = evbuffer_pullup(app_input, rlen);
+        if (!pdata)
+        {
+            PUBLIC_LOG_ERROR("Tap: {}, evbuffer_pullup failed in JRPC body", (void*)tap);
+            tap->tap_context->Drop(tap, "JRPC body pullup failed");
+            return;
+        }
+        memcpy(tap->requester_data + tap->requester_content_len, pdata, rlen);
         tap->requester_content_len += (uint32_t)rlen;
         evbuffer_drain(app_input, rlen);
         if (tap->requester_content_len < tap->requester_data_len)
@@ -83,10 +96,10 @@ void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app
             return;
         }
 
-        if (m_tapDelegateJrpcRequsetReadCB)
+        if (m_tapDelegateJrpcRequestReadCB)
         {
             ZmTapContext::BackChainPush(tap, this);
-            m_tapDelegateJrpcRequsetReadCB(tap, (const char*)tap->requester_data);
+            m_tapDelegateJrpcRequestReadCB(tap, (const char*)tap->requester_data);
         }
         else
         {
@@ -113,7 +126,7 @@ void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app
     }
 }
 
-void ZmTapDelegateJRPC::SetJrpcRequsetReadCB(TapDelegateJrpcRequsetReadCB cb)
+void ZmTapDelegateJRPC::SetJrpcRequestReadCB(TapDelegateJrpcRequestReadCB cb)
 {
-    m_tapDelegateJrpcRequsetReadCB = cb;
+    m_tapDelegateJrpcRequestReadCB = cb;
 }

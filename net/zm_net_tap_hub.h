@@ -75,8 +75,8 @@ public:
     virtual bool IsCallbackSelfManaged() override { return true; }
 
     /** Add multiple dummy listening port */
-    uint16_t AddDummpy(uint16_t port, const char* host = nullptr, ZM_HUB_PROXY_PORT_TYPE type = PROXY_PORT_NOTYPE);
-    void RemoveDummpy(uint16_t port, const char* host = nullptr);
+    uint16_t AddDummy(uint16_t port, const char* host = nullptr, ZM_HUB_PROXY_PORT_TYPE type = PROXY_PORT_NOTYPE);
+    void RemoveDummy(uint16_t port, const char* host = nullptr);
     void SetJrpcDelegate(ZmTapDelegateJRPC* DelegateJRPC) { _delegate_jrpc = DelegateJRPC; }
 
 

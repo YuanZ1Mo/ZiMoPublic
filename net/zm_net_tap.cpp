@@ -17,6 +17,7 @@ ZmTapContext::ZmTapContext()
     _count = 0;
     _taps = (ZM_TAP_CTX**)malloc(TAP_ITEM_SIZE * _capacity);
     memset(_taps, 0, TAP_ITEM_SIZE * _capacity);
+    _seq_counter.store(0, std::memory_order_relaxed);
 }
 
 ZmTapContext::~ZmTapContext()
@@ -36,6 +37,7 @@ void ZmTapContext::Clear()
     }
     memset(_taps, 0, TAP_ITEM_SIZE * _capacity);
     _count = 0;
+    _free_stack.clear();
 }
 
 void ZmTapContext::Drop(ZM_TAP_CTX* tap, const char* reason)
@@ -78,6 +80,9 @@ void ZmTapContext::Drop(ZM_TAP_CTX* tap, const char* reason)
 
         tap->Clear();
 
+        // 回收到空闲栈，供 Get() 快速复用（O(1)）
+        _free_stack.push_back(tap);
+
         PUBLIC_LOG_INFO("Drop Tap: {} Over", (void*)tap);
     }
 }
@@ -88,22 +93,19 @@ void ZmTapContext::FreeRequesterEnd(ZM_TAP_CTX* tap)
     tap->requester_bev = nullptr;
 }
 
-/** TODO: 需改进算法提高效率，避免用锁 */
 ZM_TAP_CTX* ZmTapContext::Get()
 {
     std::lock_guard<std::mutex> lock(_mutex);
     ZM_TAP_CTX* tap = nullptr;
 
-    for (size_t i = 0; i < _count; i++)
+    // O(1) 从空闲栈取
+    if (!_free_stack.empty())
     {
-        ZM_TAP_CTX* item = _taps[i];
-        if (item->state == ZM_TAP_STATE_NONE)
-        {
-            tap = item;
-            tap->Clear();
-            break;
-        }
+        tap = _free_stack.back();
+        _free_stack.pop_back();
+        tap->Clear();
     }
+
     if (!tap)
     {
         PUBLIC_LOG_INFO("There are no available tap containers, try creating a new tap container");
@@ -141,27 +143,9 @@ ZM_TAP_CTX* ZmTapContext::Get()
 
     tap->tap_context = this;
 
-    bool b_seq_num_no_repetition = true;
-    do
-    {
-        b_seq_num_no_repetition = true;
-
-        std::string seq_num = ZmString::RandomString(10).c_str();
-        for (size_t i = 0; i < _count; i++)
-        {
-            ZM_TAP_CTX* item = _taps[i];
-            if (0 == strcmp(item->seq_num, seq_num.c_str()))
-            {
-                b_seq_num_no_repetition = false;
-                break;
-            }
-        }
-
-        if (b_seq_num_no_repetition)
-        {
-            memcpy(tap->seq_num, seq_num.c_str(), sizeof(tap->seq_num));
-        }
-    } while (!b_seq_num_no_repetition);
+    // 原子自增生成唯一 seq_num，O(1) 且保证不重复
+    uint64_t sn = _seq_counter.fetch_add(1, std::memory_order_relaxed);
+    snprintf(tap->seq_num, sizeof(tap->seq_num), "%llu", (unsigned long long)sn);
 
     return tap;
 }

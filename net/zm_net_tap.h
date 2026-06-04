@@ -1,10 +1,9 @@
 #ifndef ZM_NET_TAP_H
 #define ZM_NET_TAP_H
 
-//#include "../util/zm_util_thread.h"
-#include "../ssl/zm_ssl_ctx.h"
 #include "zm_net_http.h"
 
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -227,6 +226,9 @@ private:
     size_t          _count;
     size_t          _capacity;
     std::mutex      _mutex;
+
+    std::atomic<uint64_t> _seq_counter;       // 原子自增，用于生成唯一 seq_num
+    std::vector<ZM_TAP_CTX*> _free_stack;      // 空闲 TAP 栈，Get/Drop O(1)
 };
 
 
