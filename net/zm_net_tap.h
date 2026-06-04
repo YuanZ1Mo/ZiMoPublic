@@ -18,6 +18,16 @@
 #define ZM_TAP_DELEGATE_CHAIN_MAX   4
 #define ZM_EVENT_LISTEN_FLAGS       LEV_OPT_REUSEABLE|LEV_OPT_CLOSE_ON_FREE|LEV_OPT_CLOSE_ON_EXEC
 
+#define ZM_BUF_SIZE_16K             0x3FF0              // 16k - 12 - 4
+#define ZM_BUF_SIZE_32K             0x8000              // 32k
+#define ZM_BUF_SIZE_64K             0x10000             // 64k
+#define ZM_BUF_SIZE_512K            0x80000             // 512k
+#define ZM_BUF_SIZE_1M              0x100000            // 1024*1024
+#define ZM_BUF_SIZE_4M              0x400000            // 1024*1024*4
+
+#define ZM_BUF_WATERMARK_HIGH       ZM_BUF_SIZE_64K
+#define ZM_BUF_WATERMARK_LOW        ZM_BUF_SIZE_16K
+
 /** TLV结构 */
 typedef struct SP_PACKED
 {
@@ -254,6 +264,13 @@ public:
     virtual void OnTapDelegateEvent(short what) = 0;
 
     virtual void OnTapDelegateBackEvent(ZM_TAP_CTX* tap) {}
+
+    /**
+     * @brief delegate 是否自行管理 bufferevent 回调
+     * @return true  表示 OnTapRequesterAccept 中已设置回调，上层不再覆盖
+     *         false 使用默认的 OnRequesterReadCB / OnRequesterEventCB
+     */
+    virtual bool IsCallbackSelfManaged() { return false; }
 
 protected:
     inline  void ActiveTapDelegateEvent(short what) { if (_evdelegate) { event_active(_evdelegate, what, 0); } }

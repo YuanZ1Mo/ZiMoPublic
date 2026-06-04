@@ -6,18 +6,6 @@
 #include "zm_net_tap_hub.h"
 
 
-#define ZM_BUF_SIZE_16K             0x3FF0              // 16k - 12 - 4
-#define ZM_BUF_SIZE_32K             0x8000              // 32k
-#define ZM_BUF_SIZE_64K             0x10000             // 64k
-#define ZM_BUF_SIZE_512K            0x80000             // 512k
-#define ZM_BUF_SIZE_1M              0x100000            // 1024*1024
-#define ZM_BUF_SIZE_4M              0x400000            // 1024*1024*4
-
-#define ZM_BUF_WATERMARK_HIGH       ZM_BUF_SIZE_64K
-#define ZM_BUF_WATERMARK_LOW        ZM_BUF_SIZE_16K
-
-
-
 #define ZM_EVENT_BEV_OPTIONS        BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS|BEV_OPT_THREADSAFE
 
 
@@ -71,6 +59,7 @@ void ZmTapContext::Drop(ZM_TAP_CTX* tap, const char* reason)
         if (tap->ev_timeout)
         {
             event_free(tap->ev_timeout);
+            tap->ev_timeout = nullptr;
         }
 
         ZmHttpUtil::FreeRequest(tap->request);
@@ -78,11 +67,13 @@ void ZmTapContext::Drop(ZM_TAP_CTX* tap, const char* reason)
         if (tap->requester_data)
         {
             free(tap->requester_data);
+            tap->requester_data = nullptr;
         }
 
         if (tap->onback_data)
         {
             free(tap->onback_data);
+            tap->onback_data = nullptr;
         }
 
         tap->Clear();
@@ -470,7 +461,6 @@ void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* li
     ZM_TAP_CTX* tap = ((ZmTapHubProxy*)delegate)->TapContext()->Get();
     if (tap)
     {
-        //tap->ev_base = delegate->TapDelegateEventBase();
         tap->tap_context = ((ZmTapHubProxy*)delegate)->TapContext();
         tap->delegate = delegate;
         tap->requester_bev = bev;
@@ -481,10 +471,13 @@ void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* li
 
         if (delegate->OnTapRequesterAccept(tap, fd, address))
         {
-            /** assign the read/write callback  */
-            bufferevent_setcb(tap->requester_bev, ZmTapContextEventHandler::OnRequesterReadCB, NULL, ZmTapContextEventHandler::OnRequesterEventCB, tap);
-            bufferevent_enable(tap->requester_bev, EV_READ | EV_WRITE);
-            bufferevent_setwatermark(tap->requester_bev, EV_READ, 0, ZM_BUF_WATERMARK_HIGH);
+            if (!delegate->IsCallbackSelfManaged())
+            {
+                /** assign the read/write callback  */
+                bufferevent_setcb(tap->requester_bev, ZmTapContextEventHandler::OnRequesterReadCB, NULL, ZmTapContextEventHandler::OnRequesterEventCB, tap);
+                bufferevent_enable(tap->requester_bev, EV_READ | EV_WRITE);
+                bufferevent_setwatermark(tap->requester_bev, EV_READ, 0, ZM_BUF_WATERMARK_HIGH);
+            }
         }
         else
         {

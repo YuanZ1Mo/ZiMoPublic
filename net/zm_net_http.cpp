@@ -36,6 +36,7 @@ void ZmHttpUtil::FreeRequest(ZM_HTTP_REQ* req)
         ZM_APP_REQ_FREE_STR(path);
         ZM_APP_REQ_FREE_STR(useragent);
         free(req);
+        req = nullptr;
 #undef ZM_APP_REQ_FREE_STR
     }
 }

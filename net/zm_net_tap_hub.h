@@ -72,6 +72,7 @@ public:
     virtual bool OnTapRequesterAccept(ZM_TAP_CTX* tap, evutil_socket_t fd, struct sockaddr* address);
     virtual void OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app_input, size_t datalen);
     virtual void OnTapDelegateEvent(short what);
+    virtual bool IsCallbackSelfManaged() override { return true; }
 
     /** Add multiple dummy listening port */
     uint16_t AddDummpy(uint16_t port, const char* host = nullptr, ZM_HUB_PROXY_PORT_TYPE type = PROXY_PORT_NOTYPE);
@@ -87,11 +88,14 @@ protected:
     virtual bool OnStartTap();
     virtual void OnStopTap();
 
+    static void OnProbeReadCB(struct bufferevent* bev, void* ctx);
+    static void OnProbeEventCB(struct bufferevent* bev, short events, void* ctx);
+
 private:
+    void SwitchDelegate(ZM_TAP_CTX* tap, ZmTapDelegate* new_delegate);
+
     ZmArrayList<ZM_HUB_LISTENER>    _dummies;
-
     ZmTapDelegateJRPC* _delegate_jrpc;
-
     ZmTapContext* _context;
 };
 
