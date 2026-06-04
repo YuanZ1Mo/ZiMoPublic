@@ -334,6 +334,7 @@ void ZmTapHubProxy::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app_inp
                 evbuffer_drain(app_input, 4);
                 tap->delegate_mode = _delegate_jrpc->TapDelegateMode();
                 tap->delegate = _delegate_jrpc;
+                //tap->delegate_jrpc = _delegate_jrpc;
                 return tap->delegate->OnTapRequesterRead(tap, app_input, datalen - 4);
             }
             else

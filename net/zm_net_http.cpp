@@ -1135,6 +1135,7 @@ int ZmJsonRpcServer::OnJsonRpcRequest(ZmHttpdTask* task, const char* method, con
 * -32602	Invalid params	参数无效或不正确
 * -32603	Internal error	服务器内部错误
 * -32000 to -32099	Server error	服务器定义的错误（保留范围）
+* -32000    Internal portal does not have JRPC processing channel set up 门户未设置jrpcReq回调函数
 */
 int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t dlen)
 {

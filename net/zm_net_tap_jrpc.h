@@ -7,6 +7,7 @@
 
 #include "zm_net_tap.h"
 
+typedef std::function<void(ZM_TAP_CTX* tap, const char* reqData)> TapDelegateJrpcRequsetReadCB;
 
 class ZmTapDelegateJRPC : public ZmTapDelegate
 {
@@ -19,10 +20,15 @@ public:
     virtual void OnTapDelegateEvent(short what) {}
 
     virtual void OnTapRequesterRead(ZM_TAP_CTX* tap,  struct evbuffer* app_input,  size_t datalen);
-    virtual void OnTapDelegateBackEvent(ZM_TAP_CTX* tap, int errcode=0);
-        
+    virtual void OnTapDelegateBackEvent(ZM_TAP_CTX* tap);
+
+    void SetJrpcRequsetReadCB(TapDelegateJrpcRequsetReadCB cb);
+
 private:
     void WriteResponse(ZM_TAP_CTX* tap, const char* jstr, size_t dlen);
+
+private:
+    TapDelegateJrpcRequsetReadCB m_tapDelegateJrpcRequsetReadCB;
 };
 
 #endif  // ZM_NET_TAP_JRPC_H

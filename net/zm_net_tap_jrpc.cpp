@@ -37,24 +37,14 @@ void ZmTapDelegateJRPC::WriteResponse(ZM_TAP_CTX* tap, const char* jstr, size_t 
     ZmTapContext::SetDropTimer(tap, 30);
 }
 
-void ZmTapDelegateJRPC::OnTapDelegateBackEvent(ZM_TAP_CTX* tap, int errcode)
+void ZmTapDelegateJRPC::OnTapDelegateBackEvent(ZM_TAP_CTX* tap)
 {
     //SP_OPS_LOGT("%s[%p] errcode=%d, onback_eventid=%d, onback_data=%.1024s...", __SP_FUNC__,
     //    tap, errcode, tap->onback_eventid, jstr.c_str());
 
     tap->delegate = this;
-    // if ( tap->onback_eventid==xxx)
-    if ( errcode )
-    {
-        ZMJSON jrsp;
-        jrsp["error"]     = ZMJSON{{"code", errcode}};
-        std::string  jstr = ZMJSON(jrsp).dump();
-        WriteResponse(tap, jstr.data(), jstr.size());
-    }
-    else
-    {
-        WriteResponse(tap, (const char*)tap->onback_data, tap->onback_dlen);
-    }
+
+    WriteResponse(tap, (const char*)tap->onback_data, tap->onback_dlen);
 }
 
 void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app_input, size_t datalen)
@@ -93,21 +83,37 @@ void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app
             return;
         }
 
-        std::string jerr;
-        ZMJSON json = zm_json_parse((const char*)tap->requester_data, jerr);
-        if (jerr.empty())
+        if (m_tapDelegateJrpcRequsetReadCB)
         {
-            ZMJSON jrsp;
-            jrsp["error"] = ZMJSON{ {"code", 0} };
-            std::string  jstr = ZMJSON(jrsp).dump();
-            WriteResponse(tap, jstr.data(), jstr.size());
+            ZmTapContext::BackChainPush(tap, this);
+            m_tapDelegateJrpcRequsetReadCB(tap, (const char*)tap->requester_data);
         }
         else
         {
-            //SP_LOGT("[jrpc][%p] received error format json data: %s", tap, jerr.c_str());
-            tap->tap_context->Drop(tap);
+            ZMJSON jrsp;
+            jrsp["error"] = ZMJSON{ {"code", 32000}, {"message", "Internal portal does not have JRPC processing channel set up"}};
+            std::string  jstr = ZMJSON(jrsp).dump();
+            WriteResponse(tap, jstr.data(), jstr.size());
         }
-        return;
+
+        //std::string jerr;
+        //ZMJSON json = zm_json_parse((const char*)tap->requester_data, jerr);
+        //if (jerr.empty())
+        //{
+        //    ZMJSON jrsp;
+        //    jrsp["error"] = ZMJSON{ {"code", 0} };
+        //    std::string  jstr = ZMJSON(jrsp).dump();
+        //    WriteResponse(tap, jstr.data(), jstr.size());
+        //}
+        //else
+        //{
+        //    //SP_LOGT("[jrpc][%p] received error format json data: %s", tap, jerr.c_str());
+        //    tap->tap_context->Drop(tap);
+        //}
     }
 }
 
+void ZmTapDelegateJRPC::SetJrpcRequsetReadCB(TapDelegateJrpcRequsetReadCB cb)
+{
+    m_tapDelegateJrpcRequsetReadCB = cb;
+}

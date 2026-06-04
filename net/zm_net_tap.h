@@ -75,7 +75,7 @@ typedef struct ZM_TAP_CTX
     // the follow fields should not be free when free TAP
     ZmTapDelegate* delegate;       // [4/8] Delegate
     uint8_t        delegate_mode;  //mode
-    ZmTapDelegate* delegate_jrpc;
+    //ZmTapDelegate* delegate_jrpc;
 
 
     /** TODO: 需要修改成非指针方式，避免频繁申请内存，以提高效率 */
@@ -104,7 +104,7 @@ typedef struct ZM_TAP_CTX
         dns_async_resolver = nullptr;
         dns_async_request = nullptr;
         delegate = nullptr;
-        delegate_jrpc = nullptr;
+        //delegate_jrpc = nullptr;
         request = nullptr;
         requester_data = nullptr;
         memset(onback_chains, 0, sizeof(onback_chains));
@@ -255,7 +255,7 @@ public:
     virtual void OnTapDrop(ZM_TAP_CTX* tap) {}
     virtual void OnTapDelegateEvent(short what) = 0;
 
-    virtual void OnTapDelegateBackEvent(ZM_TAP_CTX* tap, int errcode = 0) {}
+    virtual void OnTapDelegateBackEvent(ZM_TAP_CTX* tap) {}
 
 protected:
     inline  void ActiveTapDelegateEvent(short what) { if (_evdelegate) { event_active(_evdelegate, what, 0); } }
