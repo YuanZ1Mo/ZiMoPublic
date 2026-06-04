@@ -208,7 +208,7 @@ bool ZmTapHubBase::Listen(ZM_HUB_LISTENER* listener, struct event_base* evbase, 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
 // ZmTapHubProxy
-ZmTapHubProxy::ZmTapHubProxy() : _dummies(8)
+ZmTapHubProxy::ZmTapHubProxy() : _dummies(8), _context(nullptr)
 {
     TapDelegateName("ZmTapHubProxy");
 }
@@ -322,7 +322,7 @@ bool ZmTapHubProxy::OnTapRequesterAccept(ZM_TAP_CTX* tap, evutil_socket_t fd, st
 
 void ZmTapHubProxy::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app_input, size_t datalen)
 {
-    if (tap->delegate_mode == _mode)
+    if (tap->delegate->TapDelegateMode() == _mode)
     {
         /** Probe the tunnel type */
         unsigned char* head = evbuffer_pullup(app_input, ZM_MIN(20, datalen));
@@ -332,7 +332,6 @@ void ZmTapHubProxy::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app_inp
             {
                 ZmTapContext::SetDropTimer(tap, 30);
                 evbuffer_drain(app_input, 4);
-                tap->delegate_mode = _delegate_jrpc->TapDelegateMode();
                 tap->delegate = _delegate_jrpc;
                 //tap->delegate_jrpc = _delegate_jrpc;
                 return tap->delegate->OnTapRequesterRead(tap, app_input, datalen - 4);

@@ -3,7 +3,7 @@
 #include "../util/zm_util_libevent.h"
 #include "zm_net_dns.h"
 #include "../spdlog/zm_logger.h"
-#include "zm_net_tap_dnr.h"
+#include "zm_net_tap_hub.h"
 
 
 #define ZM_BUF_SIZE_16K             0x3FF0              // 16k - 12 - 4
@@ -185,7 +185,7 @@ void ZmTapContext::SetDropTimer(ZM_TAP_CTX* tap, int seconds, int micros, uint32
 
         if (!tap->ev_timeout)
         {
-            tap->ev_timeout = evtimer_new(tap->ev_base, ZmTapContextEventHandler::OnDropTimerCB, tap);
+            tap->ev_timeout = evtimer_new(tap->delegate->TapDelegateEventBase(), ZmTapContextEventHandler::OnDropTimerCB, tap);
         }
 
         timeval tv = { seconds, micros * 1000 };
@@ -265,19 +265,45 @@ void ZmTapContext::RequestSetAddress(ZM_TAP_CTX* tap, const char* dst_host, uint
     tap->request->port = dst_port;
 }
 
-void ZmTapContext::CancelResolve(ZM_TAP_CTX* tap)
+void ZmTapContext::EvDnsResolve(ZM_TAP_CTX* tap, const char* hostname, uint16_t port)
 {
-    if (tap->dns_request)
+    PUBLIC_LOG_INFO("Tap: {}, EvDnsResolving HostName={}, port={}", (void*)tap, hostname, port);
+
+    if (!tap->delegate->TapDelegateEvdnsBase())
     {
-        evdns_getaddrinfo_cancel(tap->dns_request);
-        tap->dns_request = nullptr;
+        PUBLIC_LOG_ERROR("EvDnsResolve failed: evdns_base is null");
+        return;
     }
 
-    if (tap->dns_async_request && tap->dns_async_resolver)
+    CancelResolve(tap);
+
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%u", port);
+
+    struct evutil_addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_flags = EVUTIL_AI_CANONNAME;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    tap->dns_request = evdns_getaddrinfo(tap->delegate->TapDelegateEvdnsBase(), hostname, port_str, &hints,
+        ZmTapContextEventHandler::OnDnsResolvedCB, tap);
+
+    if (!tap->dns_request)
     {
-        tap->dns_async_resolver->Cancel(tap->dns_async_request);
-        tap->dns_async_request = nullptr;
+        // evdns_getaddrinfo 返回 NULL 表示立即完成了（命中缓存/hosts/或出错）
+        // 此时回调已在 evdns_getaddrinfo 内部被同步调用
+        PUBLIC_LOG_INFO("Tap: {}, EvDnsResolve completed immediately (cached or error)", (void*)tap);
     }
+}
+
+void ZmTapContext::CancelResolve(ZM_TAP_CTX* tap)
+{
+    PUBLIC_LOG_INFO("Tap: {}, CancelResolve", (void*)tap);
+
+    evdns_getaddrinfo_cancel(tap->dns_request);
+    tap->dns_request = nullptr;
 }
 
 size_t ZmTapContext::RequesterInputLen(ZM_TAP_CTX* tap)
@@ -297,11 +323,9 @@ void ZmTapContext::FreeTap(ZM_TAP_CTX* tap)
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
 // SPTapDelegate
-void ZmTapDelegate::StartTapDelegate(ZmTapContext* context, struct event_base* evbase, evdns_base* evdnsbase, int mode)
+void ZmTapDelegate::StartTapDelegate(struct event_base* evbase, int mode)
 {
-    _context = context;
     _evbase = evbase;
-    _evdnsbase = evdnsbase;
     _mode = mode;
 
     if (OnStartTap())
@@ -335,13 +359,21 @@ char* ZmTapDelegate::TapDelegateName(const char* name)
     return _name;
 }
 
-void ZmTapDelegate::AsyncResolve(ZM_TAP_CTX* tap, const char* hostname, uint16_t port)
+void ZmTapDelegate::SetEvDns(evdns_base* evdnsbase)
 {
-    PUBLIC_LOG_INFO("Tap: {}, AsyncResolving HostName={}, port={}", (void*)tap, hostname, port);
-    tap->dns_async_request = tap->dns_async_resolver->Resolve(tap->ev_base, hostname, port, ZmTapContextEventHandler::OnDnsAsyncResolvedCB, tap);
+    _evdnsbase = evdnsbase;
 }
 
-
+//void ZmTapDelegate::EvDnsResolve(ZM_TAP_CTX* tap, const char* hostname, uint16_t port)
+//{
+//
+//}
+//
+//void ZmTapDelegate::CancelResolve(ZM_TAP_CTX* tap)
+//{
+//    evdns_getaddrinfo_cancel(tap->dns_request);
+//    tap->dns_request = nullptr;
+//}
 
 
 
@@ -382,7 +414,7 @@ void ZmTapContextEventHandler::OnDropTimerCB(evutil_socket_t fd, short what, voi
 void ZmTapContextEventHandler::OnDnsResolvedCB(int errcode, struct evutil_addrinfo* addr, void* ctx)
 {
     ZM_TAP_CTX* tap = (ZM_TAP_CTX*)ctx;
-    tap->dns_request = NULL;
+    tap->dns_request = nullptr;
     if (errcode != EVUTIL_EAI_CANCEL && addr)
     {
         struct sockaddr_in6 sa6 = { 0 };
@@ -399,13 +431,6 @@ void ZmTapContextEventHandler::OnDnsResolvedCB(int errcode, struct evutil_addrin
     {
         evutil_freeaddrinfo(addr);
     }
-}
-
-void ZmTapContextEventHandler::OnDnsAsyncResolvedCB(ZM_TAP_CTX* tap, uint32_t option, const char* hostname,
-    int errcode, struct sockaddr_in6* sa6, socklen_t salen, const char* ipaddr)
-{
-    tap->dns_async_request = 0;
-    tap->delegate->OnTapDnsResolved(tap, sa6, salen, ipaddr, hostname);
 }
 
 void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* listener,
@@ -442,19 +467,17 @@ void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* li
         ZmNetIP::IPv4ToStr(((struct sockaddr_in*)address)->sin_addr.s_addr, ipstr, true);
     }
 
-    ZM_TAP_CTX* tap = delegate->TapContext()->Get();
+    ZM_TAP_CTX* tap = ((ZmTapHubProxy*)delegate)->TapContext()->Get();
     if (tap)
     {
-        tap->ev_base = delegate->TapDelegateEventBase();
-        tap->tap_context = delegate->TapContext();
+        //tap->ev_base = delegate->TapDelegateEventBase();
+        tap->tap_context = ((ZmTapHubProxy*)delegate)->TapContext();
         tap->delegate = delegate;
         tap->requester_bev = bev;
-        tap->delegate_mode = delegate->TapDelegateMode();
-        tap->dns_async_resolver = delegate->DomainNameResolver();
         memcpy(tap->requester_ip, ipstr, sizeof(tap->requester_ip));
         tap->requester_port = app_port;
 
-        PUBLIC_LOG_INFO("Accepted a incoming connection, Delegate: {}, mode: {}, Tap: {} from {}:{}; fd: {}, bev: {}", ctx, tap->delegate_mode, (void*)tap, ipstr, app_port, fd, (void*)bev);
+        PUBLIC_LOG_INFO("Accepted a incoming connection, Delegate: {}, mode: {}, Tap: {} from {}:{}; fd: {}, bev: {}", ctx, tap->delegate->TapDelegateMode(), (void*)tap, ipstr, app_port, fd, (void*)bev);
 
         if (delegate->OnTapRequesterAccept(tap, fd, address))
         {
@@ -465,7 +488,7 @@ void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* li
         }
         else
         {
-            delegate->TapContext()->Drop(tap, "On Accept Fail");
+            ((ZmTapHubProxy*)delegate)->TapContext()->Drop(tap, "On Accept Fail");
         }
     }
     else
@@ -494,7 +517,7 @@ void ZmTapContextEventHandler::OnRequesterEventCB(struct bufferevent* requester_
                 tap->delegate->OnTapRequesterEvent(tap, requester_bev, events);
             }
             // force close tunnel while EOF/ERROR occurs on app end.
-            tap->delegate->TapContext()->Drop(tap);
+            tap->tap_context->Drop(tap);
         }
         else if (events & BEV_EVENT_CONNECTED)
         {

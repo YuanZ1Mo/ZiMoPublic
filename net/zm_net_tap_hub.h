@@ -63,6 +63,12 @@ public:
     ZmTapHubProxy();
     virtual ~ZmTapHubProxy();
 
+    void    StartTapDelegate(ZmTapContext* context, struct event_base* evbase, int mode = ZM_DELEGATE_MODE_PROXY_INTERNAL_HUB)
+    {
+        _context = context;
+        ZmTapDelegate::StartTapDelegate(evbase, mode);
+    }
+
     virtual bool OnTapRequesterAccept(ZM_TAP_CTX* tap, evutil_socket_t fd, struct sockaddr* address);
     virtual void OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app_input, size_t datalen);
     virtual void OnTapDelegateEvent(short what);
@@ -72,6 +78,8 @@ public:
     void RemoveDummpy(uint16_t port, const char* host = nullptr);
     void SetJrpcDelegate(ZmTapDelegateJRPC* DelegateJRPC) { _delegate_jrpc = DelegateJRPC; }
 
+
+    ZmTapContext* TapContext() { return _context; }
 private:
 
 
@@ -83,6 +91,8 @@ private:
     ZmArrayList<ZM_HUB_LISTENER>    _dummies;
 
     ZmTapDelegateJRPC* _delegate_jrpc;
+
+    ZmTapContext* _context;
 };
 
 #endif  // ZM_NET_TAP_HUB_H

@@ -4,7 +4,6 @@
 //#include "../util/zm_util_thread.h"
 #include "../ssl/zm_ssl_ctx.h"
 #include "zm_net_http.h"
-#include "zm_net_tap_dnr.h"
 
 #include <mutex>
 #include <vector>
@@ -49,7 +48,8 @@ typedef enum
 
 typedef struct ZM_TAP_CTX
 {
-    event_base* ev_base;  //必须设置
+    //event_base* ev_base;  //必须设置
+
 
     ZmTapContext* tap_context;
 
@@ -68,13 +68,11 @@ typedef struct ZM_TAP_CTX
 
 
     evdns_getaddrinfo_request* dns_request;    // [4/8]
-    ZmTapDomainNameResolver* dns_async_resolver;
-    ZM_DNS_ASYNC_REQUEST* dns_async_request; // [4/8]
 
 
     // the follow fields should not be free when free TAP
     ZmTapDelegate* delegate;       // [4/8] Delegate
-    uint8_t        delegate_mode;  //mode
+    //uint8_t        delegate_mode;  //mode
     //ZmTapDelegate* delegate_jrpc;
 
 
@@ -96,13 +94,11 @@ typedef struct ZM_TAP_CTX
 
     void Clear()
     {
-        ev_base = nullptr;
+        //ev_base = nullptr;
         tap_context = nullptr;
         ev_timeout = nullptr;
         requester_bev = nullptr;
         dns_request = nullptr;
-        dns_async_resolver = nullptr;
-        dns_async_request = nullptr;
         delegate = nullptr;
         //delegate_jrpc = nullptr;
         request = nullptr;
@@ -111,7 +107,7 @@ typedef struct ZM_TAP_CTX
         onback_data = nullptr;
         onback_dlen = 0;
 
-        delegate_mode = ZM_DELEGATE_MODE_NONE;
+        //delegate_mode = ZM_DELEGATE_MODE_NONE;
         state = ZM_TAP_STATE_NONE;
         drop_timeout_error_code = 0;
         requester_data_len = 0;
@@ -165,6 +161,8 @@ public:
     static void SetOnBackData(ZM_TAP_CTX* tap, size_t dlen = 0, const void* data = nullptr);
     static void RequestCreate(ZM_TAP_CTX* tap);
     static void RequestSetAddress(ZM_TAP_CTX* tap, const char* dst_host, uint16_t dst_port);
+
+    static void EvDnsResolve(ZM_TAP_CTX* tap, const char* hostname, uint16_t port);
     static void CancelResolve(ZM_TAP_CTX* tap);
 
     // Back-Delegate chain
@@ -226,20 +224,20 @@ private:
 class ZmTapDelegate
 {
 public:
-    ZmTapDelegate() : _context(nullptr), _evbase(nullptr), _evdelegate(nullptr) { TapDelegateName("ZmTapDelegate"); }
+    ZmTapDelegate() : _evbase(nullptr), _evdnsbase(nullptr), _evdelegate(nullptr) { TapDelegateName("ZmTapDelegate"); }
     virtual ~ZmTapDelegate() {}
 
-    void    StartTapDelegate(ZmTapContext* context, struct event_base* evbase, evdns_base* evdnsbase, int mode = ZM_DELEGATE_MODE_NONE);
+    void    StartTapDelegate(struct event_base* evbase, int mode = ZM_DELEGATE_MODE_NONE);
     void    StopTapDelegate();
     char* TapDelegateName(const char* name = nullptr);
+    void SetEvDns(evdns_base* evdnsbase);
 
-    ZmTapContext* TapContext() { return _context; }
     int    TapDelegateMode() { return _mode; }
     event_base* TapDelegateEventBase() { return  _evbase; }
     evdns_base* TapDelegateEvdnsBase() { return  _evdnsbase; }
 
-    void SetDomainNameResolver(ZmTapDomainNameResolver* DomainNameResolver) { _dns_async_resolver = DomainNameResolver; }
-    ZmTapDomainNameResolver* DomainNameResolver() { return _dns_async_resolver; }
+    //void EvDnsResolve(ZM_TAP_CTX* tap, const char* hostname, uint16_t port);
+    //void CancelResolve(ZM_TAP_CTX* tap);
 
 public:
     virtual void OnTapRequesterEvent(ZM_TAP_CTX* tap, struct bufferevent* requester_bev, short events) {}
@@ -259,7 +257,8 @@ public:
 
 protected:
     inline  void ActiveTapDelegateEvent(short what) { if (_evdelegate) { event_active(_evdelegate, what, 0); } }
-    void         AsyncResolve(ZM_TAP_CTX* tap, const char* hostname, uint16_t port);
+
+
 
     /**
      * @return bool 是否需要创建 _evdelegate
@@ -268,8 +267,6 @@ protected:
     virtual void OnStopTap() {}
 
 protected:
-    ZmTapContext* _context;
-    ZmTapDomainNameResolver* _dns_async_resolver;
     struct event_base* _evbase;
     struct evdns_base* _evdnsbase;
     struct event* _evdelegate;
@@ -287,8 +284,6 @@ class ZmTapContextEventHandler
 public:
     static void OnTapDelegateEventCB(evutil_socket_t fd, short what, void* ctx);
     static void OnDnsResolvedCB(int errcode, struct evutil_addrinfo* addr, void* ctx);
-    static void OnDnsAsyncResolvedCB(ZM_TAP_CTX* tap, uint32_t option, const char* hostname,
-        int errcode, struct sockaddr_in6* sa6, socklen_t salen, const char* ipaddr);
     static void OnDropTimerCB(evutil_socket_t fd, short what, void* ctx);
 
 
