@@ -35,6 +35,14 @@ typedef struct SP_PACKED
     char     value[0];
 }ZM_EXT_TLV_HEAD;
 
+typedef struct ZM_TAP_CTX ZM_TAP_CTX;  // 前置声明，供 ZM_TAP_SLOT 使用
+
+/** Pool 中的槽位，扩容时地址不变（数组整体重分配后回指指针会被同步修正） */
+typedef struct ZM_TAP_SLOT
+{
+    ZM_TAP_CTX* tap;
+} ZM_TAP_SLOT;
+
 class ZmTapDelegate;
 class ZmTapContext;
 
@@ -100,6 +108,8 @@ typedef struct ZM_TAP_CTX
 
     char seq_num[16];       // 消息序号
 
+    ZM_TAP_SLOT* _slot;       // 回指 pool 中的槽位（扩容时由 ZmTapContext 同步更新，外部可通过此指针稳定引用槽位）
+
     void Clear()
     {
         //ev_base = nullptr;
@@ -117,6 +127,7 @@ typedef struct ZM_TAP_CTX
 
         //delegate_mode = ZM_DELEGATE_MODE_NONE;
         state = ZM_TAP_STATE_NONE;
+        _slot = nullptr;  // 由 ZmTapContext::Drop 后的回收逻辑统一处理
         drop_timeout_error_code = 0;
         requester_data_len = 0;
         requester_content_len = 0;
@@ -154,7 +165,7 @@ public:
         std::unique_lock<std::mutex> lock(_mutex);
         for (size_t i = 0; i < _count; i++)
         {
-            ZM_TAP_CTX* item = (ZM_TAP_CTX*)_taps[i];
+            ZM_TAP_CTX* item = _slots[i].tap;
             if (!fnmatches || fnmatches(item))
             {
                 fnaction(item);
@@ -220,8 +231,8 @@ private:
     void        FreeTap(ZM_TAP_CTX* tap);
 
 private:
-    enum { TAP_ITEM_SIZE = sizeof(ZM_TAP_CTX*) };
-    ZM_TAP_CTX**    _taps;
+    enum { TAP_ITEM_SIZE = sizeof(ZM_TAP_SLOT) };
+    ZM_TAP_SLOT*    _slots;
     size_t          _count;
     size_t          _capacity;
     std::mutex      _mutex;

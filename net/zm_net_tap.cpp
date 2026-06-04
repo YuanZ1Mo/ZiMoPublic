@@ -15,8 +15,8 @@ ZmTapContext::ZmTapContext()
 {
     _capacity = 0x400;
     _count = 0;
-    _taps = (ZM_TAP_CTX**)malloc(TAP_ITEM_SIZE * _capacity);
-    memset(_taps, 0, TAP_ITEM_SIZE * _capacity);
+    _slots = (ZM_TAP_SLOT*)malloc(TAP_ITEM_SIZE * _capacity);
+    memset(_slots, 0, TAP_ITEM_SIZE * _capacity);
     _seq_counter.store(0, std::memory_order_relaxed);
 }
 
@@ -31,11 +31,11 @@ void ZmTapContext::Clear()
 
     for (size_t i = 0; i < _count; i++)
     {
-        ZM_TAP_CTX* item = (ZM_TAP_CTX*)_taps[i];
+        ZM_TAP_CTX* item = _slots[i].tap;
         Drop(item, "By Clear");
         FreeTap(item);
     }
-    memset(_taps, 0, TAP_ITEM_SIZE * _capacity);
+    memset(_slots, 0, TAP_ITEM_SIZE * _capacity);
     _count = 0;
     _free_stack.clear();
 }
@@ -125,9 +125,8 @@ ZM_TAP_CTX* ZmTapContext::Get()
     PUBLIC_LOG_INFO("There are no available tap containers, try creating a new tap container");
 
     /**
-    * //TODO
-     * 这里存在隐患，扩容时，如果外部还存在指针，则扩容后，这些指针会变成野指针
-     * 目前的处理方式：禁止外部持久拥有 _taps 指针
+     * 扩容安全保障：通过 ZM_TAP_SLOT + ZM_TAP_CTX::_slot 回指指针，
+     * 扩容后同步修正所有 TAP 的 _slot，确保外部持有的槽位引用始终有效。
      */
     bool need_expand = false;
     size_t new_capacity = 0;
@@ -156,14 +155,14 @@ ZM_TAP_CTX* ZmTapContext::Get()
     }
 
     // 扩容：malloc 在锁外执行
-    ZM_TAP_CTX** new_taps = nullptr;
+    ZM_TAP_SLOT* new_slots = nullptr;
     if (need_expand)
     {
         PUBLIC_LOG_INFO("Tap container pool size is insufficient, try expanding it, Current size: {}", _count);
-        new_taps = (ZM_TAP_CTX**)malloc(TAP_ITEM_SIZE * new_capacity);
-        if (new_taps)
+        new_slots = (ZM_TAP_SLOT*)malloc(TAP_ITEM_SIZE * new_capacity);
+        if (new_slots)
         {
-            memset(new_taps, 0, TAP_ITEM_SIZE * new_capacity);
+            memset(new_slots, 0, TAP_ITEM_SIZE * new_capacity);
         }
     }
 
@@ -172,21 +171,32 @@ ZM_TAP_CTX* ZmTapContext::Get()
     {
         std::lock_guard<std::mutex> lock(_mutex);
         // 二次确认：锁间隙中可能已有其他线程完成扩容
-        if (new_taps && _count < _capacity)
+        if (new_slots && _count < _capacity)
         {
-            // 其他线程已扩容，丢弃本次准备的数组
-            free(new_taps);
-            new_taps = nullptr;
+            free(new_slots);
+            new_slots = nullptr;
         }
-        if (new_taps)
+        if (new_slots)
         {
-            memcpy(new_taps, _taps, TAP_ITEM_SIZE * _count);
-            free(_taps);
-            _taps = new_taps;
+            // 拷贝旧槽位 → 新数组
+            memcpy(new_slots, _slots, TAP_ITEM_SIZE * _count);
+            // 修正所有 TAP 的 _slot 回指指针，指向新数组中的对应位置
+            for (size_t i = 0; i < _count; i++)
+            {
+                if (new_slots[i].tap)
+                {
+                    new_slots[i].tap->_slot = &new_slots[i];
+                }
+            }
+            free(_slots);
+            _slots = new_slots;
             _capacity = new_capacity;
             PUBLIC_LOG_INFO("The total size of the tap pool after expansion: {}", _capacity);
         }
-        _taps[_count++] = tap;
+        // 将新 tap 放入槽位，建立双向关联
+        _slots[_count].tap = tap;
+        tap->_slot = &_slots[_count];
+        _count++;
     }
 
     tap->tap_context = this;
