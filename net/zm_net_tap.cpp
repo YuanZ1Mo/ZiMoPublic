@@ -64,7 +64,11 @@ void ZmTapContext::Drop(ZM_TAP_CTX* tap, const char* reason)
             tap->ev_timeout = nullptr;
         }
 
-        ZmHttpUtil::FreeRequest(tap->request);
+        // request 已改为内联存储，只需释放其内部的动态字符串
+        if (tap->request.host) { free(tap->request.host); tap->request.host = nullptr; }
+        if (tap->request.userinfo) { free(tap->request.userinfo); tap->request.userinfo = nullptr; }
+        if (tap->request.path) { free(tap->request.path); tap->request.path = nullptr; }
+        if (tap->request.useragent) { free(tap->request.useragent); tap->request.useragent = nullptr; }
 
         if (tap->requester_data)
         {
@@ -95,58 +99,99 @@ void ZmTapContext::FreeRequesterEnd(ZM_TAP_CTX* tap)
 
 ZM_TAP_CTX* ZmTapContext::Get()
 {
-    std::lock_guard<std::mutex> lock(_mutex);
     ZM_TAP_CTX* tap = nullptr;
 
-    // O(1) 从空闲栈取
-    if (!_free_stack.empty())
+    // 快速路径：从空闲栈 O(1) 取，锁仅保护栈操作
     {
-        tap = _free_stack.back();
-        _free_stack.pop_back();
-        tap->Clear();
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (!_free_stack.empty())
+        {
+            tap = _free_stack.back();
+            _free_stack.pop_back();
+        }
     }
 
-    if (!tap)
+    if (tap)
     {
-        PUBLIC_LOG_INFO("There are no available tap containers, try creating a new tap container");
+        // Clear / seq_num 无需锁：仅当前线程持有此 tap
+        tap->Clear();
+        tap->tap_context = this;
+        uint64_t sn = _seq_counter.fetch_add(1, std::memory_order_relaxed);
+        snprintf(tap->seq_num, sizeof(tap->seq_num), "%llu", (unsigned long long)sn);
+        return tap;
+    }
 
-        /**
-        * //TODO
-         * 这里存在隐患，扩容时，如果外部还存在指针，则扩容后，这些指针会变成野指针
-         * 目前的处理方式：禁止外部持久拥有 _taps 指针
-         * TODO: 正确的处理方式为
-         *          typedef struct { ZM_TAP_CTX* tap; } SP_TAP_CTX_ITEM;
-         *       容器中存放 SP_TAP_CTX_ITEM
-         *       如何从 ZM_TAP_CTX 推导 SP_TAP_CTX_ITEM ??
-         *          在 ZM_TAP_CTX 中新增成员 up_ptr，每次扩容时需更新此 up_ptr
-         */
-         // Expand
-        if (_count >= _capacity)
+    // 慢速路径：需要扩容或新建 — 将 malloc 和日志移出临界区
+    PUBLIC_LOG_INFO("There are no available tap containers, try creating a new tap container");
+
+    /**
+    * //TODO
+     * 这里存在隐患，扩容时，如果外部还存在指针，则扩容后，这些指针会变成野指针
+     * 目前的处理方式：禁止外部持久拥有 _taps 指针
+     */
+    bool need_expand = false;
+    size_t new_capacity = 0;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (!_free_stack.empty())
         {
-            PUBLIC_LOG_INFO("Tap container pool size is insufficient, try expanding it, Current size: {}", _count);
+            // 二次检查：上面的锁间隙中可能有 tap 被归还
+            tap = _free_stack.back();
+            _free_stack.pop_back();
+        }
+        else if (_count >= _capacity)
+        {
+            need_expand = true;
+            new_capacity = _capacity + _capacity / 2;
+        }
+    }
 
-            ZM_TAP_CTX** bak_taps = _taps;
-            size_t       bak_capacity = _capacity;
+    if (tap)
+    {
+        tap->Clear();
+        tap->tap_context = this;
+        uint64_t sn = _seq_counter.fetch_add(1, std::memory_order_relaxed);
+        snprintf(tap->seq_num, sizeof(tap->seq_num), "%llu", (unsigned long long)sn);
+        return tap;
+    }
 
-            _capacity += _capacity / 2;
-            _taps = (ZM_TAP_CTX**)malloc(TAP_ITEM_SIZE * _capacity);
-            memset(_taps, 0, TAP_ITEM_SIZE * _capacity);
-            memcpy(_taps, bak_taps, TAP_ITEM_SIZE * bak_capacity);
-            free(bak_taps);
+    // 扩容：malloc 在锁外执行
+    ZM_TAP_CTX** new_taps = nullptr;
+    if (need_expand)
+    {
+        PUBLIC_LOG_INFO("Tap container pool size is insufficient, try expanding it, Current size: {}", _count);
+        new_taps = (ZM_TAP_CTX**)malloc(TAP_ITEM_SIZE * new_capacity);
+        if (new_taps)
+        {
+            memset(new_taps, 0, TAP_ITEM_SIZE * new_capacity);
+        }
+    }
 
+    // 新建 tap + 更新数组（需锁）
+    tap = CreateTap();
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        // 二次确认：锁间隙中可能已有其他线程完成扩容
+        if (new_taps && _count < _capacity)
+        {
+            // 其他线程已扩容，丢弃本次准备的数组
+            free(new_taps);
+            new_taps = nullptr;
+        }
+        if (new_taps)
+        {
+            memcpy(new_taps, _taps, TAP_ITEM_SIZE * _count);
+            free(_taps);
+            _taps = new_taps;
+            _capacity = new_capacity;
             PUBLIC_LOG_INFO("The total size of the tap pool after expansion: {}", _capacity);
         }
-
-        tap = CreateTap();
-        _taps[_count++] = (ZM_TAP_CTX*)tap;
+        _taps[_count++] = tap;
     }
 
     tap->tap_context = this;
-
-    // 原子自增生成唯一 seq_num，O(1) 且保证不重复
     uint64_t sn = _seq_counter.fetch_add(1, std::memory_order_relaxed);
     snprintf(tap->seq_num, sizeof(tap->seq_num), "%llu", (unsigned long long)sn);
-
     return tap;
 }
 
@@ -219,25 +264,24 @@ void ZmTapContext::SetOnBackData(ZM_TAP_CTX* tap, size_t dlen, const void* data)
 
 void ZmTapContext::RequestCreate(ZM_TAP_CTX* tap)
 {
-    if (tap->request)
-    {
-        ZmHttpUtil::FreeRequest(tap->request);
-    }
-    tap->request = ZmHttpUtil::CreateRequest();
+    // request 已内联，只需释放内部动态字符串后重新初始化
+    if (tap->request.host) { free(tap->request.host); tap->request.host = nullptr; }
+    if (tap->request.userinfo) { free(tap->request.userinfo); tap->request.userinfo = nullptr; }
+    if (tap->request.path) { free(tap->request.path); tap->request.path = nullptr; }
+    if (tap->request.useragent) { free(tap->request.useragent); tap->request.useragent = nullptr; }
+    tap->request.Init();
+    tap->request.major = 1;
+    tap->request.minor = 1;
 }
 
 void ZmTapContext::RequestSetAddress(ZM_TAP_CTX* tap, const char* dst_host, uint16_t dst_port)
 {
-    if (nullptr == tap->request)
+    if (tap->request.host)
     {
-        tap->request = ZmHttpUtil::CreateRequest();
+        free(tap->request.host);
     }
-    else if (tap->request->host)
-    {
-        free(tap->request->host);
-    }
-    tap->request->host = _strdup(dst_host);
-    tap->request->port = dst_port;
+    tap->request.host = _strdup(dst_host);
+    tap->request.port = dst_port;
 }
 
 void ZmTapContext::EvDnsResolve(ZM_TAP_CTX* tap, const char* hostname, uint16_t port)
@@ -277,8 +321,11 @@ void ZmTapContext::CancelResolve(ZM_TAP_CTX* tap)
 {
     PUBLIC_LOG_INFO("Tap: {}, CancelResolve", (void*)tap);
 
-    evdns_getaddrinfo_cancel(tap->dns_request);
-    tap->dns_request = nullptr;
+    if (tap->dns_request)
+    {
+        evdns_getaddrinfo_cancel(tap->dns_request);
+        tap->dns_request = nullptr;
+    }
 }
 
 size_t ZmTapContext::RequesterInputLen(ZM_TAP_CTX* tap)

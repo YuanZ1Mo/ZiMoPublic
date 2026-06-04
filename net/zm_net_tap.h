@@ -85,8 +85,7 @@ typedef struct ZM_TAP_CTX
     //ZmTapDelegate* delegate_jrpc;
 
 
-    /** TODO: 需要修改成非指针方式，避免频繁申请内存，以提高效率 */
-    ZM_HTTP_REQ* request;        // [4/8] request params
+    ZM_HTTP_REQ request;             // 内联存储，避免每次 malloc
 
 
 
@@ -110,7 +109,7 @@ typedef struct ZM_TAP_CTX
         dns_request = nullptr;
         delegate = nullptr;
         //delegate_jrpc = nullptr;
-        request = nullptr;
+        request.Init();
         requester_data = nullptr;
         memset(onback_chains, 0, sizeof(onback_chains));
         onback_data = nullptr;
