@@ -49,7 +49,7 @@ void ZmTapDelegateJRPC::OnTapDelegateBackEvent(ZM_TAP_CTX* tap)
 
 void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app_input, size_t datalen)
 {
-    if (tap->delegate->TapDelegateMode() == _mode)
+    if (tap->delegate->TapDelegateMode() == m_mode)
     {
         // SP_DEV_LOGT("%s[jrpc][%p] datalen=%ld", __SP_FUNC__, tap, (long)datalen);
         /** 当数据长度超过 LibEvnet Socket 缓冲区大小时，无法接收完整数据，需要自建数据缓冲区 */

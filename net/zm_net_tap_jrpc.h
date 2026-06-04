@@ -14,20 +14,20 @@ class ZmTapDelegateJRPC : public ZmTapDelegate
 public:
     ZmTapDelegateJRPC();
     virtual ~ZmTapDelegateJRPC();
-    
-public:
-    virtual bool OnTapRequesterAccept(ZM_TAP_CTX* tap, evutil_socket_t fd, struct sockaddr* address) { return false; }
-    virtual void OnTapDelegateEvent(short what) {}
 
-    virtual void OnTapRequesterRead(ZM_TAP_CTX* tap,  struct evbuffer* app_input,  size_t datalen);
-    virtual void OnTapDelegateBackEvent(ZM_TAP_CTX* tap);
-
+    /** @brief 设置 JRPC 请求到达时的回调函数 */
     void SetJrpcRequestReadCB(TapDelegateJrpcRequestReadCB cb);
 
-private:
-    void WriteResponse(ZM_TAP_CTX* tap, const char* jstr, size_t dlen);
+    // ZmTapDelegate 接口实现
+    virtual bool OnTapRequesterAccept(ZM_TAP_CTX* tap, evutil_socket_t fd, struct sockaddr* address) override { return false; }
+    virtual void OnTapDelegateEvent(short what) override {}
+    virtual void OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app_input, size_t datalen) override;
+    virtual void OnTapDelegateBackEvent(ZM_TAP_CTX* tap) override;
 
 private:
+    /** @brief 向客户端写入 JSON-RPC 响应（长度前缀 + JSON） */
+    void WriteResponse(ZM_TAP_CTX* tap, const char* jstr, size_t dlen);
+
     TapDelegateJrpcRequestReadCB m_tapDelegateJrpcRequestReadCB;
 };
 

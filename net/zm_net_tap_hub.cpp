@@ -17,9 +17,9 @@
 // ZmTapHubBase
 ZmTapHubBase::ZmTapHubBase()
 {
-    _listener.port = 0;
-    _listener.v4 = nullptr;
-    _listener.v6 = nullptr;
+    m_listener.port = 0;
+    m_listener.v4 = nullptr;
+    m_listener.v6 = nullptr;
 }
 
 ZmTapHubBase::~ZmTapHubBase()
@@ -208,7 +208,7 @@ bool ZmTapHubBase::Listen(ZM_HUB_LISTENER* listener, struct event_base* evbase, 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
 // ZmTapHubProxy
-ZmTapHubProxy::ZmTapHubProxy() : _dummies(8), _context(nullptr)
+ZmTapHubProxy::ZmTapHubProxy() : m_dummies(8), m_context(nullptr)
 {
     TapDelegateName("ZmTapHubProxy");
 }
@@ -218,6 +218,26 @@ ZmTapHubProxy::~ZmTapHubProxy()
 
 }
 
+void ZmTapHubProxy::StartTapDelegate(ZmTapContext* context, struct event_base* evbase, int mode)
+{
+    m_context = context;
+    ZmTapDelegate::StartTapDelegate(evbase, mode);
+}
+
+ZmTapContext* ZmTapHubProxy::TapContext()
+{
+    return m_context;
+}
+
+void ZmTapHubProxy::SetJrpcDelegate(ZmTapDelegateJRPC* DelegateJRPC)
+{
+    m_delegate_jrpc = DelegateJRPC;
+}
+
+bool ZmTapHubProxy::IsCallbackSelfManaged()
+{
+    return true;
+}
 
 bool ZmTapHubProxy::OnStartTap()
 {
@@ -226,11 +246,11 @@ bool ZmTapHubProxy::OnStartTap()
 
 void ZmTapHubProxy::OnStopTap()
 {
-    for (size_t i = 0; i < _dummies.Count(); i++)
+    for (size_t i = 0; i < m_dummies.Count(); i++)
     {
-        CloseListener(_dummies.At(i));
+        CloseListener(m_dummies.At(i));
     }
-    CloseListener(&_listener);
+    CloseListener(&m_listener);
 }
 
 uint16_t ZmTapHubProxy::AddDummy(uint16_t port, const char* host, ZM_HUB_PROXY_PORT_TYPE type)
@@ -239,18 +259,18 @@ uint16_t ZmTapHubProxy::AddDummy(uint16_t port, const char* host, ZM_HUB_PROXY_P
     {
         if (port > 0)
         {
-            for (size_t i = 0; i < _dummies.Count(); i++)
+            for (size_t i = 0; i < m_dummies.Count(); i++)
             {
-                if (_dummies.At(i)->port == port && strcmp(_dummies.At(i)->host, ZmString::IsEmpty(host) ? ZM_PROXY_LISTEN_IP : host))
+                if (m_dummies.At(i)->port == port && strcmp(m_dummies.At(i)->host, ZmString::IsEmpty(host) ? ZM_PROXY_LISTEN_IP : host))
                 {
                     return port;
                 }
             }
         }
 
-        ZM_HUB_LISTENER* listener = _dummies.Add();
+        ZM_HUB_LISTENER* listener = m_dummies.Add();
 
-        if (_evbase)
+        if (m_evbase)
         {
             if (ZmString::IsEmpty(host))
             {
@@ -274,7 +294,7 @@ uint16_t ZmTapHubProxy::AddDummy(uint16_t port, const char* host, ZM_HUB_PROXY_P
             char pstr[16] = { 0 };
             bool bListen = false;
 
-            bListen = Listen(listener, _evbase, cb, this, listener->host,
+            bListen = Listen(listener, m_evbase, cb, this, listener->host,
                 false, ZmString::L_To_A(listener->port, pstr));
 
             if (bListen)
@@ -284,7 +304,7 @@ uint16_t ZmTapHubProxy::AddDummy(uint16_t port, const char* host, ZM_HUB_PROXY_P
             else
             {
                 CloseListener(listener);
-                _dummies.Remove(_dummies.OffsetOf(listener));
+                m_dummies.Remove(m_dummies.OffsetOf(listener));
                 PUBLIC_LOG_ERROR("AddDummy,Host: {}, Port: {}, Failed", listener->host, listener->port);
             }
 
@@ -297,12 +317,12 @@ uint16_t ZmTapHubProxy::AddDummy(uint16_t port, const char* host, ZM_HUB_PROXY_P
 
 void ZmTapHubProxy::RemoveDummy(uint16_t port, const char* host)
 {
-    for (size_t i = 0; i < _dummies.Count(); i++)
+    for (size_t i = 0; i < m_dummies.Count(); i++)
     {
-        if (_dummies.At(i)->port == port && !strcmp(_dummies.At(i)->host, host))
+        if (m_dummies.At(i)->port == port && !strcmp(m_dummies.At(i)->host, host))
         {
-            CloseListener(_dummies.At(i));
-            _dummies.Remove(i);
+            CloseListener(m_dummies.At(i));
+            m_dummies.Remove(i);
             return;
         }
     }
@@ -371,7 +391,7 @@ void ZmTapHubProxy::OnProbeReadCB(struct bufferevent* bev, void* ctx)
     // 识别协议魔数
     if (head[0] == 'J' || head[1] == 'R' || head[2] == 'P' || head[3] == 'C')
     {
-        if (!self->_delegate_jrpc)
+        if (!self->m_delegate_jrpc)
         {
             PUBLIC_LOG_ERROR("JRPC protocol detected but delegate not set, dropping Tap: {}", (void*)tap);
             self->TapContext()->Drop(tap, "JRPC delegation not set");
@@ -383,7 +403,7 @@ void ZmTapHubProxy::OnProbeReadCB(struct bufferevent* bev, void* ctx)
             evbuffer_drain(input, 4);
 
             // 切换到正式 delegate
-            self->SwitchDelegate(tap, self->_delegate_jrpc);
+            self->SwitchDelegate(tap, self->m_delegate_jrpc);
         }
     }
     else
@@ -451,7 +471,7 @@ void ZmTapHubProxy::SwitchDelegate(ZM_TAP_CTX* tap, ZmTapDelegate* new_delegate)
  */
 void ZmTapHubProxy::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app_input, size_t datalen)
 {
-    if (tap->delegate->TapDelegateMode() != _mode)
+    if (tap->delegate->TapDelegateMode() != m_mode)
     {
         // delegate 已切换，正常路径不应走到这里
         PUBLIC_LOG_ERROR("HubProxy OnTapRequesterRead called after delegate switch, dropping Tap: {}", (void*)tap);

@@ -5,19 +5,16 @@
 #include "../spdlog/zm_logger.h"
 #include "zm_net_tap_hub.h"
 
-
 #define ZM_EVENT_BEV_OPTIONS        BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS|BEV_OPT_THREADSAFE
-
-
 
 
 ZmTapContext::ZmTapContext()
 {
-    _capacity = 0x400;
-    _count = 0;
-    _slots = (ZM_TAP_SLOT*)malloc(TAP_ITEM_SIZE * _capacity);
-    memset(_slots, 0, TAP_ITEM_SIZE * _capacity);
-    _seq_counter.store(0, std::memory_order_relaxed);
+    m_capacity = 0x400;
+    m_count = 0;
+    m_slots = (ZM_TAP_SLOT*)malloc(TAP_ITEM_SIZE * m_capacity);
+    memset(m_slots, 0, TAP_ITEM_SIZE * m_capacity);
+    m_seq_counter.store(0, std::memory_order_relaxed);
 }
 
 ZmTapContext::~ZmTapContext()
@@ -29,15 +26,15 @@ void ZmTapContext::Clear()
 {
     PUBLIC_LOG_INFO("TapContext Clear");
 
-    for (size_t i = 0; i < _count; i++)
+    for (size_t i = 0; i < m_count; i++)
     {
-        ZM_TAP_CTX* item = _slots[i].tap;
+        ZM_TAP_CTX* item = m_slots[i].tap;
         Drop(item, "By Clear");
         FreeTap(item);
     }
-    memset(_slots, 0, TAP_ITEM_SIZE * _capacity);
-    _count = 0;
-    _free_stack.clear();
+    memset(m_slots, 0, TAP_ITEM_SIZE * m_capacity);
+    m_count = 0;
+    m_free_stack.clear();
 }
 
 void ZmTapContext::Drop(ZM_TAP_CTX* tap, const char* reason)
@@ -85,7 +82,7 @@ void ZmTapContext::Drop(ZM_TAP_CTX* tap, const char* reason)
         tap->Clear();
 
         // 回收到空闲栈，供 Get() 快速复用（O(1)）
-        _free_stack.push_back(tap);
+        m_free_stack.push_back(tap);
 
         PUBLIC_LOG_INFO("Drop Tap: {} Over", (void*)tap);
     }
@@ -103,11 +100,11 @@ ZM_TAP_CTX* ZmTapContext::Get()
 
     // 快速路径：从空闲栈 O(1) 取，锁仅保护栈操作
     {
-        std::lock_guard<std::mutex> lock(_mutex);
-        if (!_free_stack.empty())
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_free_stack.empty())
         {
-            tap = _free_stack.back();
-            _free_stack.pop_back();
+            tap = m_free_stack.back();
+            m_free_stack.pop_back();
         }
     }
 
@@ -116,7 +113,7 @@ ZM_TAP_CTX* ZmTapContext::Get()
         // Clear / seq_num 无需锁：仅当前线程持有此 tap
         tap->Clear();
         tap->tap_context = this;
-        uint64_t sn = _seq_counter.fetch_add(1, std::memory_order_relaxed);
+        uint64_t sn = m_seq_counter.fetch_add(1, std::memory_order_relaxed);
         snprintf(tap->seq_num, sizeof(tap->seq_num), "%llu", (unsigned long long)sn);
         return tap;
     }
@@ -131,17 +128,17 @@ ZM_TAP_CTX* ZmTapContext::Get()
     bool need_expand = false;
     size_t new_capacity = 0;
     {
-        std::lock_guard<std::mutex> lock(_mutex);
-        if (!_free_stack.empty())
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_free_stack.empty())
         {
             // 二次检查：上面的锁间隙中可能有 tap 被归还
-            tap = _free_stack.back();
-            _free_stack.pop_back();
+            tap = m_free_stack.back();
+            m_free_stack.pop_back();
         }
-        else if (_count >= _capacity)
+        else if (m_count >= m_capacity)
         {
             need_expand = true;
-            new_capacity = _capacity + _capacity / 2;
+            new_capacity = m_capacity + m_capacity / 2;
         }
     }
 
@@ -149,7 +146,7 @@ ZM_TAP_CTX* ZmTapContext::Get()
     {
         tap->Clear();
         tap->tap_context = this;
-        uint64_t sn = _seq_counter.fetch_add(1, std::memory_order_relaxed);
+        uint64_t sn = m_seq_counter.fetch_add(1, std::memory_order_relaxed);
         snprintf(tap->seq_num, sizeof(tap->seq_num), "%llu", (unsigned long long)sn);
         return tap;
     }
@@ -158,7 +155,7 @@ ZM_TAP_CTX* ZmTapContext::Get()
     ZM_TAP_SLOT* new_slots = nullptr;
     if (need_expand)
     {
-        PUBLIC_LOG_INFO("Tap container pool size is insufficient, try expanding it, Current size: {}", _count);
+        PUBLIC_LOG_INFO("Tap container pool size is insufficient, try expanding it, Current size: {}", m_count);
         new_slots = (ZM_TAP_SLOT*)malloc(TAP_ITEM_SIZE * new_capacity);
         if (new_slots)
         {
@@ -169,9 +166,9 @@ ZM_TAP_CTX* ZmTapContext::Get()
     // 新建 tap + 更新数组（需锁）
     tap = CreateTap();
     {
-        std::lock_guard<std::mutex> lock(_mutex);
+        std::lock_guard<std::mutex> lock(m_mutex);
         // 二次确认：锁间隙中可能已有其他线程完成扩容
-        if (new_slots && _count < _capacity)
+        if (new_slots && m_count < m_capacity)
         {
             free(new_slots);
             new_slots = nullptr;
@@ -179,28 +176,28 @@ ZM_TAP_CTX* ZmTapContext::Get()
         if (new_slots)
         {
             // 拷贝旧槽位 → 新数组
-            memcpy(new_slots, _slots, TAP_ITEM_SIZE * _count);
+            memcpy(new_slots, m_slots, TAP_ITEM_SIZE * m_count);
             // 修正所有 TAP 的 _slot 回指指针，指向新数组中的对应位置
-            for (size_t i = 0; i < _count; i++)
+            for (size_t i = 0; i < m_count; i++)
             {
                 if (new_slots[i].tap)
                 {
                     new_slots[i].tap->_slot = &new_slots[i];
                 }
             }
-            free(_slots);
-            _slots = new_slots;
-            _capacity = new_capacity;
-            PUBLIC_LOG_INFO("The total size of the tap pool after expansion: {}", _capacity);
+            free(m_slots);
+            m_slots = new_slots;
+            m_capacity = new_capacity;
+            PUBLIC_LOG_INFO("The total size of the tap pool after expansion: {}", m_capacity);
         }
         // 将新 tap 放入槽位，建立双向关联
-        _slots[_count].tap = tap;
-        tap->_slot = &_slots[_count];
-        _count++;
+        m_slots[m_count].tap = tap;
+        tap->_slot = &m_slots[m_count];
+        m_count++;
     }
 
     tap->tap_context = this;
-    uint64_t sn = _seq_counter.fetch_add(1, std::memory_order_relaxed);
+    uint64_t sn = m_seq_counter.fetch_add(1, std::memory_order_relaxed);
     snprintf(tap->seq_num, sizeof(tap->seq_num), "%llu", (unsigned long long)sn);
     return tap;
 }
@@ -351,22 +348,82 @@ void ZmTapContext::FreeTap(ZM_TAP_CTX* tap)
     }
 }
 
+ZM_TAP_CTX* ZmTapContext::CreateTap()
+{
+    ZM_TAP_CTX* tap = (ZM_TAP_CTX*)malloc(sizeof(ZM_TAP_CTX));
+
+    if (tap)
+    {
+        tap->Clear();
+    }
+
+    tap->state = ZM_TAP_STATE_INUSE;
+
+    return tap;
+}
+
+void ZmTapContext::ForEach(std::function<void(ZM_TAP_CTX*)> fnaction,
+    std::function<bool(const ZM_TAP_CTX*)> fnmatches)
+{
+    std::unique_lock<std::mutex> lock(m_mutex);
+    for (size_t i = 0; i < m_count; i++)
+    {
+        ZM_TAP_CTX* item = m_slots[i].tap;
+        if (!fnmatches || fnmatches(item))
+        {
+            fnaction(item);
+        }
+    }
+}
+
+ZmTapDelegate* ZmTapContext::BackChainPop(ZM_TAP_CTX* tap, bool remove)
+{
+    for (int i = (ZM_TAP_DELEGATE_CHAIN_MAX - 1); i >= 0; i--)
+    {
+        ZmTapDelegate* delegate = tap->onback_chains[i];
+        if (remove) { tap->onback_chains[i] = NULL; }
+        if (delegate) { return delegate; }
+    }
+    return NULL;
+}
+
+void ZmTapContext::BackChainPush(ZM_TAP_CTX* tap, ZmTapDelegate* delegate)
+{
+    if (delegate && delegate != BackChainPop(tap, false))
+    {
+        for (int i = 0; i < ZM_TAP_DELEGATE_CHAIN_MAX; i++)
+        {
+            if (NULL == tap->onback_chains[i])
+            {
+                tap->onback_chains[i] = delegate;
+                break;
+            }
+        }
+    }
+}
+
 
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
-// SPTapDelegate
+// ZmTapDelegate
+ZmTapDelegate::ZmTapDelegate()
+    : m_evbase(nullptr), m_evdnsbase(nullptr), m_evdelegate(nullptr)
+{
+    TapDelegateName("ZmTapDelegate");
+}
+
 void ZmTapDelegate::StartTapDelegate(struct event_base* evbase, int mode)
 {
-    _evbase = evbase;
-    _mode = mode;
+    m_evbase = evbase;
+    m_mode = mode;
 
     if (OnStartTap())
     {
-        if (!_evdelegate)
+        if (!m_evdelegate)
         {
-            _evdelegate = event_new(_evbase, -1, EV_PERSIST | EV_READ, ZmTapContextEventHandler::OnTapDelegateEventCB, this);
+            m_evdelegate = event_new(m_evbase, -1, EV_PERSIST | EV_READ, ZmTapContextEventHandler::OnTapDelegateEventCB, this);
         }
-        event_add(_evdelegate, NULL);
+        event_add(m_evdelegate, NULL);
     }
 }
 
@@ -374,10 +431,10 @@ void ZmTapDelegate::StartTapDelegate(struct event_base* evbase, int mode)
 void ZmTapDelegate::StopTapDelegate()
 {
     OnStopTap();
-    if (NULL != _evdelegate)
+    if (NULL != m_evdelegate)
     {
-        event_free(_evdelegate);
-        _evdelegate = NULL;
+        event_free(m_evdelegate);
+        m_evdelegate = NULL;
     }
 }
 
@@ -386,33 +443,20 @@ char* ZmTapDelegate::TapDelegateName(const char* name)
 {
     if (name)
     {
-        snprintf(_name, sizeof(_name), "%s", name);
+        snprintf(m_name, sizeof(m_name), "%s", name);
     }
-    return _name;
+    return m_name;
 }
 
 void ZmTapDelegate::SetEvDns(evdns_base* evdnsbase)
 {
-    _evdnsbase = evdnsbase;
+    m_evdnsbase = evdnsbase;
 }
-
-//void ZmTapDelegate::EvDnsResolve(ZM_TAP_CTX* tap, const char* hostname, uint16_t port)
-//{
-//
-//}
-//
-//void ZmTapDelegate::CancelResolve(ZM_TAP_CTX* tap)
-//{
-//    evdns_getaddrinfo_cancel(tap->dns_request);
-//    tap->dns_request = nullptr;
-//}
-
-
 
 
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
-// SPEventHandler
+// ZmTapContextEventHandler
 
 // Inner Events
 void ZmTapContextEventHandler::OnTapDelegateEventCB(evutil_socket_t fd, short what, void* ctx)
@@ -468,7 +512,7 @@ void ZmTapContextEventHandler::OnDnsResolvedCB(int errcode, struct evutil_addrin
 void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* listener,
     evutil_socket_t fd, struct sockaddr* address, int socklen, void* ctx)
 {
-    /* We got a new connection! Set up a bufferevent for it. */
+    /*HUB有了新的连接 为它设置一个缓冲区*/
     struct event_base* base = evconnlistener_get_base(listener);
     struct bufferevent* bev = bufferevent_socket_new(base, fd, ZM_EVENT_BEV_OPTIONS);
     if (!bev)
@@ -481,7 +525,6 @@ void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* li
         bufferevent_free(bev);
         return;
     }
-
 
     ZmTapDelegate* delegate = (ZmTapDelegate*)ctx;
 
@@ -514,7 +557,7 @@ void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* li
         {
             if (!delegate->IsCallbackSelfManaged())
             {
-                /** assign the read/write callback  */
+                /**分配读/写回调*/
                 bufferevent_setcb(tap->requester_bev, ZmTapContextEventHandler::OnRequesterReadCB, NULL, ZmTapContextEventHandler::OnRequesterEventCB, tap);
                 bufferevent_enable(tap->requester_bev, EV_READ | EV_WRITE);
                 bufferevent_setwatermark(tap->requester_bev, EV_READ, 0, ZM_BUF_WATERMARK_HIGH);
