@@ -26,7 +26,7 @@ public:
 
 private:
     /** @brief 向客户端写入 JSON-RPC 响应（长度前缀 + JSON） */
-    void WriteResponse(ZM_TAP_CTX* tap, const char* jstr, size_t dlen);
+    void WriteResponse(ZM_TAP_CTX* tap, const char* json_str, size_t data_len);
 
     TapDelegateJrpcRequestReadCB m_tapDelegateJrpcRequestReadCB;
 };

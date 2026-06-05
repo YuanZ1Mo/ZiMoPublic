@@ -431,11 +431,15 @@ void ZmTapContext::ForEach(std::function<void(ZM_TAP_CTX*)> fnaction,
 
 ZmTapDelegate* ZmTapContext::BackChainPop(ZM_TAP_CTX* tap, bool remove)
 {
+    /** 从链尾向链首遍历，LIFO 语义：最后压入的最先弹出 */
     for (int i = (ZM_TAP_DELEGATE_CHAIN_MAX - 1); i >= 0; i--)
     {
         ZmTapDelegate* delegate = tap->onback_chains[i];
-        if (remove) { tap->onback_chains[i] = NULL; }
-        if (delegate) { return delegate; }
+        if (delegate)
+        {
+            if (remove) { tap->onback_chains[i] = NULL; }
+            return delegate;
+        }
     }
     return NULL;
 }

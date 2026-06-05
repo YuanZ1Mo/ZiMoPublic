@@ -12,18 +12,18 @@ ZmTapDelegateJRPC::ZmTapDelegateJRPC() : ZmTapDelegate()
 ZmTapDelegateJRPC::~ZmTapDelegateJRPC()
 {}
 
-void ZmTapDelegateJRPC::WriteResponse(ZM_TAP_CTX* tap, const char* jstr, size_t dlen)
+void ZmTapDelegateJRPC::WriteResponse(ZM_TAP_CTX* tap, const char* json_str, size_t data_len)
 {
-    PUBLIC_LOG_INFO("Received JRPC Response, TAP:{}, content: {}", (void*)tap, jstr);
+    PUBLIC_LOG_INFO("Received JRPC Response, TAP:{}, content: {}", (void*)tap, json_str);
 
-    uint32_t rsp_len = htonl((uint32_t)dlen);
+    uint32_t rsp_len = htonl((uint32_t)data_len);
     int ret = 0;
     ret = evbuffer_add(bufferevent_get_output(tap->requester_bev), &rsp_len, 4);
     if(ret != 0)
     {
         PUBLIC_LOG_ERROR("evbuffer_add len failed, TAP:{}, ret:{}", (void*)tap, ret);
     }
-    ret = evbuffer_add(bufferevent_get_output(tap->requester_bev), jstr, dlen);
+    ret = evbuffer_add(bufferevent_get_output(tap->requester_bev), json_str, data_len);
     if(ret != 0)
     {
         PUBLIC_LOG_ERROR("evbuffer_add json failed, TAP:{}, ret:{}", (void*)tap, ret);
@@ -57,16 +57,22 @@ void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app
             if (datalen >= 4)
             {
                 // [4]len [*]JSON-Data
-                const uint32_t* plen = (const uint32_t*)evbuffer_pullup(app_input, 4);
-                if (!plen)
+                const uint32_t* p_msg_len = (const uint32_t*)evbuffer_pullup(app_input, 4);
+                if (!p_msg_len)
                 {
                     PUBLIC_LOG_ERROR("Tap: {}, evbuffer_pullup failed in JRPC header", (void*)tap);
                     tap->Drop("JRPC header pullup failed");
                     return;
                 }
-                uint32_t mlen = ntohl(*plen);
-                ZmTapContext::SetOptData(tap, mlen + 1);
-                tap->requester_data_len = mlen; /** 需要的数据长度 */
+                uint32_t msg_len = ntohl(*p_msg_len);
+                if (msg_len > ZM_BUF_SIZE_4M)
+                {
+                    PUBLIC_LOG_ERROR("Tap: {}, JRPC request too large: {} bytes (max {})", (void*)tap, msg_len, (size_t)ZM_BUF_SIZE_4M);
+                    tap->Drop("JRPC request too large");
+                    return;
+                }
+                ZmTapContext::SetOptData(tap, msg_len + 1);
+                tap->requester_data_len = msg_len; /** 需要的数据长度 */
                 tap->requester_received_len = 0;    /** 已经读取到的数据长度 */
                 evbuffer_drain(app_input, 4);
                 datalen -= 4;
@@ -77,18 +83,17 @@ void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app
             }
         }
 
-        /** 只读取需要的长度，防止越界 */
-        size_t rlen = ZM_MIN(datalen, tap->requester_data_len - tap->requester_received_len);
-        const void* pdata = evbuffer_pullup(app_input, rlen);
-        if (!pdata)
+        /** 只读取需要的长度，防止越界；使用 evbuffer_copyout 避免 pullup 的内部链表线性化开销 */
+        size_t read_len = ZM_MIN(datalen, tap->requester_data_len - tap->requester_received_len);
+        int copy_ret = evbuffer_copyout(app_input, tap->requester_data + tap->requester_received_len, read_len);
+        if (copy_ret < 0 || (size_t)copy_ret != read_len)
         {
-            PUBLIC_LOG_ERROR("Tap: {}, evbuffer_pullup failed in JRPC body", (void*)tap);
-            tap->Drop("JRPC body pullup failed");
+            PUBLIC_LOG_ERROR("Tap: {}, evbuffer_copyout failed in JRPC body, expected:{}, got:{}", (void*)tap, read_len, copy_ret);
+            tap->Drop("JRPC body copyout failed");
             return;
         }
-        memcpy(tap->requester_data + tap->requester_received_len, pdata, rlen);
-        tap->requester_received_len += (uint32_t)rlen;
-        evbuffer_drain(app_input, rlen);
+        tap->requester_received_len += (uint32_t)read_len;
+        evbuffer_drain(app_input, read_len);
         if (tap->requester_received_len < tap->requester_data_len)
         {
             return;
@@ -105,10 +110,10 @@ void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app
         {
             PUBLIC_LOG_INFO("Internal portal does not have JRPC processing channel set up, TAP:{}", (void*)tap);
 
-            ZMJSON jrsp;
-            jrsp["error"] = ZMJSON{ {"code", 32000}, {"message", "Internal portal does not have JRPC processing channel set up"}};
-            std::string  jstr = ZMJSON(jrsp).dump();
-            WriteResponse(tap, jstr.data(), jstr.size());
+            ZMJSON json_rsp;
+            json_rsp["error"] = ZMJSON{ {"code", 32000}, {"message", "Internal portal does not have JRPC processing channel set up"}};
+            std::string  json_str = ZMJSON(json_rsp).dump();
+            WriteResponse(tap, json_str.data(), json_str.size());
         }
     }
 }
