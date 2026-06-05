@@ -17,16 +17,18 @@ void ZmTapDelegateJRPC::WriteResponse(ZM_TAP_CTX* tap, const char* json_str, siz
     PUBLIC_LOG_INFO("Received JRPC Response, TAP:{}, content: {}", (void*)tap, json_str);
 
     uint32_t rsp_len = htonl((uint32_t)data_len);
-    int ret = 0;
-    ret = evbuffer_add(bufferevent_get_output(tap->requester_bev), &rsp_len, 4);
-    if(ret != 0)
+
+    /** 使用 iovec 将长度头与 JSON 体单次提交，减少锁获取和内部链表操作次数 */
+    struct evbuffer_iovec iov[2];
+    iov[0].iov_base = &rsp_len;
+    iov[0].iov_len = 4;
+    iov[1].iov_base = (void*)json_str;
+    iov[1].iov_len = data_len;
+
+    int ret = evbuffer_add_iovec(bufferevent_get_output(tap->requester_bev), iov, 2);
+    if (ret != 0)
     {
-        PUBLIC_LOG_ERROR("evbuffer_add len failed, TAP:{}, ret:{}", (void*)tap, ret);
-    }
-    ret = evbuffer_add(bufferevent_get_output(tap->requester_bev), json_str, data_len);
-    if(ret != 0)
-    {
-        PUBLIC_LOG_ERROR("evbuffer_add json failed, TAP:{}, ret:{}", (void*)tap, ret);
+        PUBLIC_LOG_ERROR("evbuffer_add_iovec failed, TAP:{}, ret:{}", (void*)tap, ret);
     }
     ret = bufferevent_flush(tap->requester_bev, EV_WRITE, BEV_FLUSH);
     if(ret != 1)
