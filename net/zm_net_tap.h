@@ -85,7 +85,7 @@ public:
     bufferevent*  requester_bev;              /** 请求端 bufferevent */
     BYTE*         requester_data;             /** 请求数据接收缓冲区（变长，堆分配） */
     uint32_t      requester_data_len;         /** 期望接收的请求数据总长度 */
-    uint32_t      requester_content_len;      /** 已接收的请求数据长度 */
+    uint32_t      requester_received_len;     /** 已接收的请求数据长度 */
     uint16_t      requester_port;             /** 请求来源端口 */
     char          requester_ip[64];           /** 请求来源 IP 地址字符串 */
 

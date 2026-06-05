@@ -475,6 +475,7 @@ void ZmTapHubProxy::OnProtocolDetectReadCB(struct bufferevent* bev, void* ctx)
         return;
     }
 
+    //此处默认超时时间为30s,当delegate切换成功时,下一个delegate可以重新设置超时值
     ZmTapContext::SetDropTimer(tap, 30);
     // 将魔数之后的数据交给新 delegate
     tap->delegate->OnTapRequesterRead(tap, input, datalen - 4);

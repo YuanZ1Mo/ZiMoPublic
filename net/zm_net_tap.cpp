@@ -23,7 +23,7 @@ void ZM_TAP_CTX::Clear()
     _slot = nullptr;
     drop_timeout_error_code = 0;
     requester_data_len = 0;
-    requester_content_len = 0;
+    requester_received_len = 0;
     requester_port = 0;
     memset(seq_num, 0, sizeof(seq_num));
     memset(requester_ip, 0, sizeof(requester_ip));
