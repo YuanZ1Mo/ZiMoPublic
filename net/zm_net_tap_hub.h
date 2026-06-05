@@ -6,10 +6,6 @@
 
 #include <event2/listener.h>
 
-
-
-
-
 class ZmTapHubBase : public ZmTapDelegate
 {
 public:
@@ -33,21 +29,16 @@ protected:
         struct evconnlistener*  v6;             /** IPv6 evconnlistener 句柄 */
     };
 
-    /** @brief 创建单个协议的 evconnlistener */
+    /** @brief 关闭监听器，释放 IPv4/IPv6 evconnlistener 资源 */
+    void            CloseListener(ZM_HUB_LISTENER* listener);
+    /** @brief 创建单个协议族的 evconnlistener */
     evconnlistener* ListenEV(struct event_base* evbase, evconnlistener_cb cb, void* ctx,
                              const char* addr, uint16_t family = AF_INET, const char* sock_name = NULL);
     /** @brief 同时创建 IPv4 + IPv6 双栈监听 */
     bool            Listen(ZM_HUB_LISTENER* listener, struct event_base* evbase,
                            evconnlistener_cb cb, void* ctx,
                            const char* addr, bool v4only = false, const char* sock_name = NULL);
-    /** @brief 关闭监听器 */
-    void            CloseListener(ZM_HUB_LISTENER* listener);
 };
-
-
-
-
-
 
 /** @brief 代理端口类型枚举（预留扩展） */
 typedef enum {
@@ -57,18 +48,23 @@ typedef enum {
 class ZmTapHubProxy : public ZmTapHubBase
 {
 public:
+    // --- 构造与析构 ---
     ZmTapHubProxy();
     virtual ~ZmTapHubProxy();
 
+    // --- 生命周期管理 ---
     /** @brief 启动 Hub 代理 delegate，关联 TAP 上下文池并绑定事件循环 */
     void StartTapDelegate(ZmTapContext* context, struct event_base* evbase, int mode = ZM_DELEGATE_MODE_PROXY_INTERNAL_HUB);
 
+    // --- 端口管理 ---
     /** @brief 添加一个代理监听端口，返回实际绑定的端口号 */
     uint16_t AddListenPort(uint16_t port, const char* host = nullptr, ZM_HUB_PROXY_PORT_TYPE type = PROXY_PORT_NOTYPE);
     /** @brief 移除指定的代理监听端口 */
     void     RemoveListenPort(uint16_t port, const char* host = nullptr);
+
+    // --- 配置 ---
     /** @brief 设置 JRPC 协议委托处理器 */
-    void     SetJrpcDelegate(ZmTapDelegateJRPC* DelegateJRPC);
+    void SetJrpcDelegate(ZmTapDelegateJRPC* DelegateJRPC);
 
     // --- ZmTapDelegate 接口实现 ---
     /** @brief 接受新连接，设置协议探测回调并等待首包到达 */
@@ -83,18 +79,22 @@ public:
     virtual ZmTapContext* TapContext() override;
 
 protected:
+    // --- 生命周期回调 ---
     virtual bool OnStartTap() override;
     virtual void OnStopTap() override;
 
+    // --- 协议探测回调 ---
     /** @brief 协议探测读取回调 — 连接建立后首次触发，识别协议魔数 */
     static void OnProtocolDetectReadCB(struct bufferevent* bev, void* ctx);
     /** @brief 协议探测事件回调 — 处理探测阶段的连接异常 */
     static void OnProtocolDetectEventCB(struct bufferevent* bev, short events, void* ctx);
 
 private:
+    // --- 内部方法 ---
     /** @brief 执行 delegate 切换并替换 bufferevent 回调 */
     void SwitchDelegate(ZM_TAP_CTX* tap, ZmTapDelegate* new_delegate);
 
+    // --- 成员变量 ---
     ZmArrayList<ZM_HUB_LISTENER> m_proxy_listeners;  /** 代理监听端口列表 */
     ZmTapDelegateJRPC*           m_delegate_jrpc;      /** JRPC 协议委托处理器 */
     ZmTapContext*                m_context;            /** 关联的 TAP 上下文池 */

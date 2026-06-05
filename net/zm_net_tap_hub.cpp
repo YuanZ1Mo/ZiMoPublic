@@ -1,6 +1,5 @@
 #include "zm_net_tap_hub.h"
 
-
 #include "zm_net_ip.h"
 #include "../util/zm_util_libevent.h"
 #include "../spdlog/zm_logger.h"
@@ -16,24 +15,25 @@
  */
 ////////////////////////////////////////////////////////////////////////////////////////////////
 // ZmTapHubBase
+
 ZmTapHubBase::ZmTapHubBase()
 {
-
 }
 
 ZmTapHubBase::~ZmTapHubBase()
-{}
+{
+}
 
 void ZmTapHubBase::CloseListener(ZM_HUB_LISTENER* listener)
 {
-    if (listener )
+    if (listener)
     {
-        if ( listener->v4 )
+        if (listener->v4)
         {
             evconnlistener_disable(listener->v4);
             evconnlistener_free(listener->v4);
         }
-        if ( listener->v6 )
+        if (listener->v6)
         {
             evconnlistener_disable(listener->v6);
             evconnlistener_free(listener->v6);
@@ -49,31 +49,27 @@ struct evconnlistener* ZmTapHubBase::ListenEV(struct event_base* evbase, evconnl
     ZmByteBuffer     heap(128);
     struct sockaddr* sin     = (struct sockaddr*)heap.Head();
     size_t           socklen = 0;
-    uint16_t         port    = sock_name? htons(atoi(sock_name)&0x00FFFF) : 0;
-    
+    uint16_t         port    = sock_name ? htons(atoi(sock_name) & 0x00FFFF) : 0;
+
     PUBLIC_LOG_INFO("ListenEV family={}, addr={}:{}", family, addr, sock_name);
 
-    if ( family==AF_INET6 )
+    if (family == AF_INET6)
     {
         struct sockaddr_in6* sin6 = (struct sockaddr_in6*)heap.Head();
         socklen = sizeof(struct sockaddr_in6);
 
         sin6->sin6_family = AF_INET6;
         sin6->sin6_port   = port;
-        // in6addr_loopback / IN6ADDR_LOOPBACK_INIT / in6addr_any /IN6ADDR_ANY_INIT
-        if ( 1!= evutil_inet_pton(AF_INET6, addr, &(sin6->sin6_addr)) )
+        // in6addr_loopback / IN6ADDR_LOOPBACK_INIT / in6addr_any / IN6ADDR_ANY_INIT
+        if (1 != evutil_inet_pton(AF_INET6, addr, &(sin6->sin6_addr)))
         {
-            if ( 0== _stricmp("any", addr) || 0== _stricmp("0.0.0.0", addr)
-                || 0== _stricmp("::", addr) || 0== _stricmp("[::]", addr) )
+            if (0 == _stricmp("any", addr) || 0 == _stricmp("0.0.0.0", addr)
+                || 0 == _stricmp("::", addr) || 0 == _stricmp("[::]", addr))
             {
-                // sp_inet_pton(AF_INET6, "::", &(sin6->sin6_addr));
-                // sin6->sin6_addr = in6addr_any;
                 memcpy(&sin6->sin6_addr, &in6addr_any, sizeof(struct in6_addr));
             }
             else
             {
-                // sp_inet_pton(AF_INET6, "::1", &(sin6->sin6_addr));
-                // sin6->sin6_addr = in6addr_loopback;
                 memcpy(&sin6->sin6_addr, &in6addr_loopback, sizeof(struct in6_addr));
             }
         }
@@ -84,29 +80,24 @@ struct evconnlistener* ZmTapHubBase::ListenEV(struct event_base* evbase, evconnl
         socklen = sizeof(struct sockaddr_in);
 
         // 使用前清零 sockaddr，防止平台特定字段干扰
-        // memset(&sin, 0, sizeof(struct sockaddr_in));
         /** 设置为 INET 地址族 */
-        sin4->sin_family      = AF_INET;
-        sin4->sin_port        = port;
+        sin4->sin_family = AF_INET;
+        sin4->sin_port   = port;
         // INADDR_LOOPBACK / INADDR_ANY
-        if ( 1!= evutil_inet_pton(AF_INET, addr, &(sin4->sin_addr)) )
+        if (1 != evutil_inet_pton(AF_INET, addr, &(sin4->sin_addr)))
         {
-            if ( 0== _stricmp("any", addr) || 0== _stricmp("0.0.0.0", addr) )
+            if (0 == _stricmp("any", addr) || 0 == _stricmp("0.0.0.0", addr))
             {
-                // in4addr_any.s_addr
-                // sin4->sin_addr.s_addr = htonl(0);
                 sin4->sin_addr.s_addr = INADDR_ANY;
             }
             else
             {
                 /** 未识别的地址回退到本地回环（INADDR_LOOPBACK = 127.0.0.1） */
-                // in4addr_loopback.s_addr
-                // sin4->sin_addr.s_addr = htonl(0x7F000001);
                 sin4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
             }
         }
     }
-    if ( socklen>0 )
+    if (socklen > 0)
     {
         return evconnlistener_new_bind(evbase, (nullptr == cb) ? ZmTapContextEventHandler::OnRequesterAcceptConnCB : cb, ctx,
             ZM_EVENT_LISTEN_FLAGS, SOMAXCONN,
@@ -116,27 +107,22 @@ struct evconnlistener* ZmTapHubBase::ListenEV(struct event_base* evbase, evconnl
 }
 
 /**
- * Winsock 双栈 https://msdn.microsoft.com/en-us/library/windows/desktop/bb513665(v=vs.85).aspx
- *  1. 只侦听 IPv6
- *  2. 如果是低于 Vista 版本则自动双栈，否则 需通过 setsockopt 设置 IPV6_V6ONLY 为 0 启用自动双栈
- * 
- * https://stackoverflow.com/a/20658285
- *      Windows by default requires that you explicitly bind on IPv4 and IPv6. 
- *   Binding only to IPv6 will not implicitly bind to IPv4 as well.
- *      Linux by default will implicitly bind to IPv4 as well when you bind on IPv6, 
- *   only if the net.ipv6.bindv6only sysctl is set to 0. 
- *   Distributions such as Debian change this default to 1, breaking your assumption.
- *      I can't remember what Mac OS X does here (someone chirp in the comments please?),
- *   but the point is that explicitly binding to both protocols leaves no surprises.
- *
- *  https://stackoverflow.com/questions/30184377/how-to-detect-if-dual-stack-socket-is-supported/30198991
+ * Winsock 双栈说明：
+ *   - Windows 需要显式分别绑定 IPv4 和 IPv6，仅绑定 IPv6 不会隐式绑定 IPv4
+ *   - Vista 以下自动双栈，Vista+ 需通过 setsockopt(IPV6_V6ONLY, 0) 启用
+ *   - Linux 默认 net.ipv6.bindv6only=0 时绑定 IPv6 会隐式绑定 IPv4，部分发行版改为 1
+ *   - 跨平台最稳妥做法：显式同时绑定 IPv4 + IPv6
+ * 参考：
+ *   https://msdn.microsoft.com/en-us/library/windows/desktop/bb513665(v=vs.85).aspx
+ *   https://stackoverflow.com/a/20658285
+ *   https://stackoverflow.com/questions/30184377/how-to-detect-if-dual-stack-socket-is-supported/30198991
  */
 bool ZmTapHubBase::Listen(ZM_HUB_LISTENER* listener, struct event_base* evbase, evconnlistener_cb cb,
                           void* ctx, const char* addr, bool v4only, const char* sock_name)
 {
     CloseListener(listener);
 
-    if ( ZmString::IsEmpty(sock_name) || ZmString::IsNumeric(sock_name) )
+    if (ZmString::IsEmpty(sock_name) || ZmString::IsNumeric(sock_name))
     {
         listener->v4 = ListenEV(evbase, cb, ctx, addr, AF_INET, sock_name);
     }
@@ -145,14 +131,14 @@ bool ZmTapHubBase::Listen(ZM_HUB_LISTENER* listener, struct event_base* evbase, 
         listener->v4 = ListenEV(evbase, cb, ctx, addr, AF_UNIX, sock_name);
     }
 
-    if ( listener->v4 )
+    if (listener->v4)
     {
         sockaddr_in     sa      = { 0 };
         socklen_t       socklen = sizeof(sa);
         evutil_socket_t fd4     = evconnlistener_get_fd(listener->v4);
-        if ( 0==getsockname(fd4, (struct sockaddr*)&sa, &socklen) )
+        if (0 == getsockname(fd4, (struct sockaddr*)&sa, &socklen))
         {
-            if ( sa.sin_family==AF_UNIX )
+            if (sa.sin_family == AF_UNIX)
             {
                 PUBLIC_LOG_INFO("Listening on local: {}", sock_name);
             }
@@ -161,19 +147,17 @@ bool ZmTapHubBase::Listen(ZM_HUB_LISTENER* listener, struct event_base* evbase, 
                 listener->port = ntohs(sa.sin_port);
                 PUBLIC_LOG_INFO("Listening tcpv4 succeeded: {}:{}", addr, listener->port);
 
-                if ( !v4only )
+                if (!v4only)
                 {
                     // macOS 查看监听端口：lsof -n -iTCP:$PORT | grep LISTEN
                     /** 监听 0.0.0.0 时自动启用 IPv4+IPv6 双栈 */
-                    // 在同一端口上监听 IPv6 回环地址
                     char portstr[8] = {0};
-                    memset(portstr, 0, sizeof(portstr));
                     const char* addrv6 = addr;
-                    if ( ZmString::IsEmpty(addr) || 0==strcmp("127.0.0.1", addr) )
+                    if (ZmString::IsEmpty(addr) || 0 == strcmp("127.0.0.1", addr))
                     {
                         addrv6 = "::1";
                     }
-                    else if ( 0==strcmp("0.0.0.0", addr) )
+                    else if (0 == strcmp("0.0.0.0", addr))
                     {
                         addrv6 = "::";
                     }
@@ -181,11 +165,10 @@ bool ZmTapHubBase::Listen(ZM_HUB_LISTENER* listener, struct event_base* evbase, 
                     if (nullptr != listener->v6)
                     {
                         PUBLIC_LOG_INFO("Listening tcpv6 succeeded: {}:{}", addrv6, listener->port);
-
                     }
                     else
                     {
-                        PUBLIC_LOG_ERROR("Listening tcpv6 on '{}:{} failed, errMsg={}", addrv6, portstr, ZmSystem::ErrMsg(-1));
+                        PUBLIC_LOG_ERROR("Listening tcpv6 on {}:{} failed, errMsg={}", addrv6, portstr, ZmSystem::ErrMsg(-1));
                     }
                 }
             }
@@ -204,18 +187,16 @@ bool ZmTapHubBase::Listen(ZM_HUB_LISTENER* listener, struct event_base* evbase, 
 }
 
 
-
-
-
-
-
 ////////////////////////////////////////////////////////////////////////////////////////////////
-// ZmTapHubProxy
+// ZmTapHubProxy —— 构造与析构
 
 /**
- * @brief 构造 Hub 代理，初始化 8 容量的监听器列表
+ * @brief 构造 Hub 代理，初始化监听器列表和成员变量
  */
-ZmTapHubProxy::ZmTapHubProxy() : m_proxy_listeners(ZM_DEFAULT_PROXY_LISTENER_NUM), m_delegate_jrpc(nullptr), m_context(nullptr)
+ZmTapHubProxy::ZmTapHubProxy()
+    : m_proxy_listeners(ZM_DEFAULT_PROXY_LISTENER_NUM)
+    , m_delegate_jrpc(nullptr)
+    , m_context(nullptr)
 {
     TapDelegateName("ZmTapHubProxy");
 }
@@ -225,8 +206,9 @@ ZmTapHubProxy::ZmTapHubProxy() : m_proxy_listeners(ZM_DEFAULT_PROXY_LISTENER_NUM
  */
 ZmTapHubProxy::~ZmTapHubProxy()
 {
-
 }
+
+// --- 生命周期管理 ---
 
 /**
  * @brief 启动 Hub 代理，关联 TAP 上下文池并绑定到事件循环
@@ -240,52 +222,7 @@ void ZmTapHubProxy::StartTapDelegate(ZmTapContext* context, struct event_base* e
     ZmTapDelegate::StartTapDelegate(evbase, mode);
 }
 
-/**
- * @brief 获取关联的 TAP 上下文池
- * @return ZmTapContext 指针
- */
-ZmTapContext* ZmTapHubProxy::TapContext()
-{
-    return m_context;
-}
-
-/**
- * @brief 设置 JRPC 协议委托处理器，用于协议探测成功后的 delegate 切换
- * @param DelegateJRPC JRPC delegate 指针
- */
-void ZmTapHubProxy::SetJrpcDelegate(ZmTapDelegateJRPC* DelegateJRPC)
-{
-    m_delegate_jrpc = DelegateJRPC;
-}
-
-/**
- * @brief 标记为自行管理 bufferevent 回调，禁止上层 OnRequesterAcceptConnCB 覆盖
- * @return 始终返回 true
- */
-bool ZmTapHubProxy::IsCallbackSelfManaged()
-{
-    return true;
-}
-
-/**
- * @brief delegate 启动回调（当前无需额外初始化）
- * @return 始终返回 true
- */
-bool ZmTapHubProxy::OnStartTap()
-{
-    return true;
-}
-
-/**
- * @brief delegate 停止回调，关闭所有代理监听端口
- */
-void ZmTapHubProxy::OnStopTap()
-{
-    for (size_t i = 0; i < m_proxy_listeners.Count(); i++)
-    {
-        CloseListener(m_proxy_listeners.At(i));
-    }
-}
+// --- 端口管理 ---
 
 /**
  * @brief 添加一个代理监听端口
@@ -306,7 +243,8 @@ uint16_t ZmTapHubProxy::AddListenPort(uint16_t port, const char* host, ZM_HUB_PR
     {
         for (size_t i = 0; i < m_proxy_listeners.Count(); i++)
         {
-            if (m_proxy_listeners.At(i)->port == port && !strcmp(m_proxy_listeners.At(i)->host, ZmString::IsEmpty(host) ? ZM_PROXY_LISTEN_IP : host))
+            if (m_proxy_listeners.At(i)->port == port
+                && !strcmp(m_proxy_listeners.At(i)->host, ZmString::IsEmpty(host) ? ZM_PROXY_LISTEN_IP : host))
             {
                 return port;
             }
@@ -333,7 +271,7 @@ uint16_t ZmTapHubProxy::AddListenPort(uint16_t port, const char* host, ZM_HUB_PR
 
     evconnlistener_cb cb = nullptr;
 
-    //回调分类
+    // 回调分类（预留 SOCK5 等协议扩展）
     //if (type == PROXY_PORT_SOCK5) {
     //    cb = ZmTapContextEventHandler::OnRequesterSOCK5AcceptConnCB;
     //}
@@ -346,13 +284,13 @@ uint16_t ZmTapHubProxy::AddListenPort(uint16_t port, const char* host, ZM_HUB_PR
 
     if (bListen)
     {
-        PUBLIC_LOG_INFO("AddListenPort,Host: {}, Port: {}, Success", host, listener->host, listener->port);
+        PUBLIC_LOG_INFO("AddListenPort, Host: {}, Port: {}, Success", host, listener->host, listener->port);
     }
     else
     {
         CloseListener(listener);
         m_proxy_listeners.Remove(m_proxy_listeners.OffsetOf(listener));
-        PUBLIC_LOG_ERROR("AddListenPort,Host: {}, Port: {}, Failed", listener->host, listener->port);
+        PUBLIC_LOG_ERROR("AddListenPort, Host: {}, Port: {}, Failed", listener->host, listener->port);
     }
 
     return (bListen) ? listener->port : 0;
@@ -377,15 +315,18 @@ void ZmTapHubProxy::RemoveListenPort(uint16_t port, const char* host)
     }
 }
 
+// --- 配置 ---
 
 /**
- * @brief delegate 内部事件回调（当前无内部事件需要处理）
- * @param what 事件标志位
+ * @brief 设置 JRPC 协议委托处理器，用于协议探测成功后的 delegate 切换
+ * @param DelegateJRPC JRPC delegate 指针
  */
-void ZmTapHubProxy::OnTapDelegateEvent(short what)
+void ZmTapHubProxy::SetJrpcDelegate(ZmTapDelegateJRPC* DelegateJRPC)
 {
-
+    m_delegate_jrpc = DelegateJRPC;
 }
+
+// --- ZmTapDelegate 接口实现 ---
 
 /**
  * @brief accept 阶段设置探测回调，等待首包到达后识别协议类型
@@ -405,6 +346,77 @@ bool ZmTapHubProxy::OnTapRequesterAccept(ZM_TAP_CTX* tap, evutil_socket_t fd, st
 
     return true;
 }
+
+/**
+ * @brief 正常数据读取 — HubProxy 不应该收到此回调
+ *
+ * 正常情况下协议探测在 OnProtocolDetectReadCB 中完成并切换 delegate 后，
+ * 后续数据会直接路由到新 delegate。如果走到这里说明状态异常。
+ */
+void ZmTapHubProxy::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app_input, size_t datalen)
+{
+    if (tap->delegate->TapDelegateMode() != m_mode)
+    {
+        // delegate 已切换，正常路径不应走到这里
+        PUBLIC_LOG_ERROR("HubProxy OnTapRequesterRead called after delegate switch, dropping Tap: {}", (void*)tap);
+        tap->Drop("HubProxy unexpected read after probe");
+        return;
+    }
+
+    // 走到这里说明 IsCallbackSelfManaged 未生效或 probe 未触发
+    PUBLIC_LOG_ERROR("HubProxy OnTapRequesterRead called in HUB mode (probe should have handled this), dropping Tap: {}", (void*)tap);
+    tap->Drop("HubProxy unexpected read");
+}
+
+/**
+ * @brief delegate 内部事件回调（当前无内部事件需要处理）
+ * @param what 事件标志位
+ */
+void ZmTapHubProxy::OnTapDelegateEvent(short what)
+{
+}
+
+/**
+ * @brief 标记为自行管理 bufferevent 回调，禁止上层 OnRequesterAcceptConnCB 覆盖
+ * @return 始终返回 true
+ */
+bool ZmTapHubProxy::IsCallbackSelfManaged()
+{
+    return true;
+}
+
+/**
+ * @brief 获取关联的 TAP 上下文池
+ * @return ZmTapContext 指针
+ */
+ZmTapContext* ZmTapHubProxy::TapContext()
+{
+    return m_context;
+}
+
+// --- 生命周期回调 ---
+
+/**
+ * @brief delegate 启动回调（当前无需额外初始化）
+ * @return 始终返回 true
+ */
+bool ZmTapHubProxy::OnStartTap()
+{
+    return true;
+}
+
+/**
+ * @brief delegate 停止回调，关闭所有代理监听端口
+ */
+void ZmTapHubProxy::OnStopTap()
+{
+    for (size_t i = 0; i < m_proxy_listeners.Count(); i++)
+    {
+        CloseListener(m_proxy_listeners.At(i));
+    }
+}
+
+// --- 协议探测回调 ---
 
 /**
  * @brief 协议探测读取回调 — 仅在连接建立后首次触发
@@ -450,14 +462,11 @@ void ZmTapHubProxy::OnProtocolDetectReadCB(struct bufferevent* bev, void* ctx)
             self->TapContext()->Drop(tap, "JRPC delegation not set");
             return;
         }
-        else
-        {
-            PUBLIC_LOG_INFO("HubProxy probe detected JRPC protocol, switching delegate for Tap: {}", (void*)tap);
-            evbuffer_drain(input, 4);
 
-            // 切换到正式 delegate
-            self->SwitchDelegate(tap, self->m_delegate_jrpc);
-        }
+        PUBLIC_LOG_INFO("HubProxy probe detected JRPC protocol, switching delegate for Tap: {}", (void*)tap);
+        evbuffer_drain(input, 4);
+        // 切换到正式 delegate
+        self->SwitchDelegate(tap, self->m_delegate_jrpc);
     }
     else
     {
@@ -487,6 +496,8 @@ void ZmTapHubProxy::OnProtocolDetectEventCB(struct bufferevent* bev, short event
     }
 }
 
+// --- 内部方法 ---
+
 /**
  * @brief 执行 delegate 切换后的回调替换
  *
@@ -509,25 +520,4 @@ void ZmTapHubProxy::SwitchDelegate(ZM_TAP_CTX* tap, ZmTapDelegate* new_delegate)
 
     PUBLIC_LOG_INFO("SwitchDelegate: {} -> {}, Tap: {}",
         old_delegate->TapDelegateName(), new_delegate->TapDelegateName(), (void*)tap);
-}
-
-/**
- * @brief 正常数据读取 — HubProxy 不应该收到此回调
- *
- * 正常情况下协议探测在 OnProtocolDetectReadCB 中完成并切换 delegate 后，
- * 后续数据会直接路由到新 delegate。如果走到这里说明状态异常。
- */
-void ZmTapHubProxy::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app_input, size_t datalen)
-{
-    if (tap->delegate->TapDelegateMode() != m_mode)
-    {
-        // delegate 已切换，正常路径不应走到这里
-        PUBLIC_LOG_ERROR("HubProxy OnTapRequesterRead called after delegate switch, dropping Tap: {}", (void*)tap);
-        tap->Drop("HubProxy unexpected read after probe");
-        return;
-    }
-
-    // 走到这里说明 IsCallbackSelfManaged 未生效或 probe 未触发
-    PUBLIC_LOG_ERROR("HubProxy OnTapRequesterRead called in HUB mode (probe should have handled this), dropping Tap: {}", (void*)tap);
-    tap->Drop("HubProxy unexpected read");
 }
