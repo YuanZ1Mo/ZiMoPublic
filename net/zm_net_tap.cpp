@@ -3,9 +3,52 @@
 #include "../util/zm_util_libevent.h"
 #include "zm_net_dns.h"
 #include "../spdlog/zm_logger.h"
-#include "zm_net_tap_hub.h"
 
 #define ZM_EVENT_BEV_OPTIONS        BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS|BEV_OPT_THREADSAFE
+
+
+void ZM_TAP_CTX::Clear()
+{
+    tap_context = nullptr;
+    ev_timeout = nullptr;
+    requester_bev = nullptr;
+    dns_request = nullptr;
+    delegate = nullptr;
+    request.Init();
+    requester_data = nullptr;
+    memset(onback_chains, 0, sizeof(onback_chains));
+    onback_data = nullptr;
+    onback_dlen = 0;
+    state = ZM_TAP_STATE_NONE;
+    _slot = nullptr;
+    drop_timeout_error_code = 0;
+    requester_data_len = 0;
+    requester_content_len = 0;
+    requester_port = 0;
+    memset(seq_num, 0, sizeof(seq_num));
+    memset(requester_ip, 0, sizeof(requester_ip));
+}
+
+void ZM_TAP_CTX::SetTapContext(ZmTapContext* pTapContext)
+{
+    if (!tap_context)
+    {
+        tap_context = pTapContext;
+    }
+}
+
+const ZmTapContext* ZM_TAP_CTX::TapContext()
+{
+    return tap_context;
+}
+
+void ZM_TAP_CTX::Drop(const char* reason)
+{
+    if (tap_context)
+    {
+        tap_context->Drop(this, reason);
+    }
+}
 
 
 ZmTapContext::ZmTapContext()
@@ -79,10 +122,20 @@ void ZmTapContext::Drop(ZM_TAP_CTX* tap, const char* reason)
             tap->onback_data = nullptr;
         }
 
+        // 保存槽位引用后清除 TAP 状态
+        ZM_TAP_SLOT* slot = tap->_slot;
         tap->Clear();
 
         // 回收到空闲栈，供 Get() 快速复用（O(1)）
-        m_free_stack.push_back(tap);
+        // 同时清除槽位回指，防止 ForEach 遍历到已回收的 TAP
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (slot)
+            {
+                slot->tap = nullptr;
+            }
+            m_free_stack.push_back(tap);
+        }
 
         PUBLIC_LOG_INFO("Drop Tap: {} Over", (void*)tap);
     }
@@ -112,7 +165,7 @@ ZM_TAP_CTX* ZmTapContext::Get()
     {
         // Clear / seq_num 无需锁：仅当前线程持有此 tap
         tap->Clear();
-        tap->tap_context = this;
+        tap->SetTapContext(this);
         uint64_t sn = m_seq_counter.fetch_add(1, std::memory_order_relaxed);
         snprintf(tap->seq_num, sizeof(tap->seq_num), "%llu", (unsigned long long)sn);
         return tap;
@@ -145,7 +198,7 @@ ZM_TAP_CTX* ZmTapContext::Get()
     if (tap)
     {
         tap->Clear();
-        tap->tap_context = this;
+        tap->SetTapContext(this);
         uint64_t sn = m_seq_counter.fetch_add(1, std::memory_order_relaxed);
         snprintf(tap->seq_num, sizeof(tap->seq_num), "%llu", (unsigned long long)sn);
         return tap;
@@ -196,7 +249,7 @@ ZM_TAP_CTX* ZmTapContext::Get()
         m_count++;
     }
 
-    tap->tap_context = this;
+    tap->SetTapContext(this);
     uint64_t sn = m_seq_counter.fetch_add(1, std::memory_order_relaxed);
     snprintf(tap->seq_num, sizeof(tap->seq_num), "%llu", (unsigned long long)sn);
     return tap;
@@ -481,7 +534,7 @@ void ZmTapContextEventHandler::OnDropTimerCB(evutil_socket_t fd, short what, voi
         }
         else
         {
-            tap->tap_context->Drop(tap, "On Timer");;
+            tap->Drop("On Timer");;
         }
     }
 }
@@ -542,10 +595,16 @@ void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* li
         ZmNetIP::IPv4ToStr(((struct sockaddr_in*)address)->sin_addr.s_addr, ipstr, true);
     }
 
-    ZM_TAP_CTX* tap = ((ZmTapHubProxy*)delegate)->TapContext()->Get();
+    ZmTapContext* context = delegate->TapContext();
+    if (!context)
+    {
+        bufferevent_free(bev);
+        return;
+    }
+
+    ZM_TAP_CTX* tap = context->Get();
     if (tap)
     {
-        tap->tap_context = ((ZmTapHubProxy*)delegate)->TapContext();
         tap->delegate = delegate;
         tap->requester_bev = bev;
         memcpy(tap->requester_ip, ipstr, sizeof(tap->requester_ip));
@@ -565,7 +624,7 @@ void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* li
         }
         else
         {
-            ((ZmTapHubProxy*)delegate)->TapContext()->Drop(tap, "On Accept Fail");
+            context->Drop(tap, "On Accept Fail");
         }
     }
     else
@@ -594,7 +653,7 @@ void ZmTapContextEventHandler::OnRequesterEventCB(struct bufferevent* requester_
                 tap->delegate->OnTapRequesterEvent(tap, requester_bev, events);
             }
             // force close tunnel while EOF/ERROR occurs on app end.
-            tap->tap_context->Drop(tap);
+            tap->Drop("force close tunnel while EOF/ERROR occurs on app end");
         }
         else if (events & BEV_EVENT_CONNECTED)
         {

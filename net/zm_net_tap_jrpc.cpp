@@ -63,7 +63,7 @@ void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app
                 if (!plen)
                 {
                     PUBLIC_LOG_ERROR("Tap: {}, evbuffer_pullup failed in JRPC header", (void*)tap);
-                    tap->tap_context->Drop(tap, "JRPC header pullup failed");
+                    tap->Drop("JRPC header pullup failed");
                     return;
                 }
                 uint32_t mlen = ntohl(*plen);
@@ -85,7 +85,7 @@ void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app
         if (!pdata)
         {
             PUBLIC_LOG_ERROR("Tap: {}, evbuffer_pullup failed in JRPC body", (void*)tap);
-            tap->tap_context->Drop(tap, "JRPC body pullup failed");
+            tap->Drop("JRPC body pullup failed");
             return;
         }
         memcpy(tap->requester_data + tap->requester_content_len, pdata, rlen);

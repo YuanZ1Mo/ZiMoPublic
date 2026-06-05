@@ -7,19 +7,18 @@
 #include "../util/zm_util_sys.h"
 
 #define ZM_PROXY_LISTEN_IP   "127.0.0.1"
+#define ZM_DEFAULT_PROXY_LISTENER_NUM  8
 
-//
-// Jumping from IPv4 to IPv6
-// http://beej.us/guide/bgnet/output/html/multipage/ip4to6.html
-// http://osr600doc.sco.com/en/SDK_netapi/sockC.PortIPv4appIPv6.html
-//
+/**
+ * IPv4 到 IPv6 双栈参考：
+ * http://beej.us/guide/bgnet/output/html/multipage/ip4to6.html
+ * http://osr600doc.sco.com/en/SDK_netapi/sockC.PortIPv4appIPv6.html
+ */
 ////////////////////////////////////////////////////////////////////////////////////////////////
 // ZmTapHubBase
 ZmTapHubBase::ZmTapHubBase()
 {
-    m_listener.port = 0;
-    m_listener.v4 = nullptr;
-    m_listener.v6 = nullptr;
+
 }
 
 ZmTapHubBase::~ZmTapHubBase()
@@ -84,10 +83,9 @@ struct evconnlistener* ZmTapHubBase::ListenEV(struct event_base* evbase, evconnl
         struct sockaddr_in* sin4 = (struct sockaddr_in*)heap.Head();
         socklen = sizeof(struct sockaddr_in);
 
-        // Clear the sockaddr before using it, in case there are extra
-        // platform-specific fields that can mess us up.
+        // 使用前清零 sockaddr，防止平台特定字段干扰
         // memset(&sin, 0, sizeof(struct sockaddr_in));
-        /* This is an INET address */
+        /** 设置为 INET 地址族 */
         sin4->sin_family      = AF_INET;
         sin4->sin_port        = port;
         // INADDR_LOOPBACK / INADDR_ANY
@@ -101,7 +99,7 @@ struct evconnlistener* ZmTapHubBase::ListenEV(struct event_base* evbase, evconnl
             }
             else
             {
-                /* Listen on 0.0.0.0 or htonl(0x7F000001) or inet_addr("127.0.0.1") */
+                /** 未识别的地址回退到本地回环（INADDR_LOOPBACK = 127.0.0.1） */
                 // in4addr_loopback.s_addr
                 // sin4->sin_addr.s_addr = htonl(0x7F000001);
                 sin4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -162,12 +160,12 @@ bool ZmTapHubBase::Listen(ZM_HUB_LISTENER* listener, struct event_base* evbase, 
             {
                 listener->port = ntohs(sa.sin_port);
                 PUBLIC_LOG_INFO("Listening tcpv4 succeeded: {}:{}", addr, listener->port);
-                
+
                 if ( !v4only )
                 {
-                    // macOS: lsof -n -iTCP:$PORT | grep LISTEN
-                    /** auto IPv4+IPv6 while listen at 0.0.0.0 ? */
-                    // listen the same port on ipv6 [::1]
+                    // macOS 查看监听端口：lsof -n -iTCP:$PORT | grep LISTEN
+                    /** 监听 0.0.0.0 时自动启用 IPv4+IPv6 双栈 */
+                    // 在同一端口上监听 IPv6 回环地址
                     char portstr[8] = {0};
                     memset(portstr, 0, sizeof(portstr));
                     const char* addrv6 = addr;
@@ -192,6 +190,11 @@ bool ZmTapHubBase::Listen(ZM_HUB_LISTENER* listener, struct event_base* evbase, 
                 }
             }
         }
+        else
+        {
+            listener->port = 0;
+            PUBLIC_LOG_ERROR("getsockname failed for listener v4, fd={}, errMsg={}", fd4, ZmSystem::ErrMsg(-1));
+        }
     }
     else
     {
@@ -208,125 +211,177 @@ bool ZmTapHubBase::Listen(ZM_HUB_LISTENER* listener, struct event_base* evbase, 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
 // ZmTapHubProxy
-ZmTapHubProxy::ZmTapHubProxy() : m_dummies(8), m_context(nullptr)
+
+/**
+ * @brief 构造 Hub 代理，初始化 8 容量的监听器列表
+ */
+ZmTapHubProxy::ZmTapHubProxy() : m_proxy_listeners(ZM_DEFAULT_PROXY_LISTENER_NUM), m_delegate_jrpc(nullptr), m_context(nullptr)
 {
     TapDelegateName("ZmTapHubProxy");
 }
 
+/**
+ * @brief 析构（资源由 OnStopTap 和基类 StopTapDelegate 释放）
+ */
 ZmTapHubProxy::~ZmTapHubProxy()
 {
 
 }
 
+/**
+ * @brief 启动 Hub 代理，关联 TAP 上下文池并绑定到事件循环
+ * @param context TAP 上下文池指针
+ * @param evbase  libevent 事件循环基
+ * @param mode    工作模式（默认内部 Hub 代理）
+ */
 void ZmTapHubProxy::StartTapDelegate(ZmTapContext* context, struct event_base* evbase, int mode)
 {
     m_context = context;
     ZmTapDelegate::StartTapDelegate(evbase, mode);
 }
 
+/**
+ * @brief 获取关联的 TAP 上下文池
+ * @return ZmTapContext 指针
+ */
 ZmTapContext* ZmTapHubProxy::TapContext()
 {
     return m_context;
 }
 
+/**
+ * @brief 设置 JRPC 协议委托处理器，用于协议探测成功后的 delegate 切换
+ * @param DelegateJRPC JRPC delegate 指针
+ */
 void ZmTapHubProxy::SetJrpcDelegate(ZmTapDelegateJRPC* DelegateJRPC)
 {
     m_delegate_jrpc = DelegateJRPC;
 }
 
+/**
+ * @brief 标记为自行管理 bufferevent 回调，禁止上层 OnRequesterAcceptConnCB 覆盖
+ * @return 始终返回 true
+ */
 bool ZmTapHubProxy::IsCallbackSelfManaged()
 {
     return true;
 }
 
+/**
+ * @brief delegate 启动回调（当前无需额外初始化）
+ * @return 始终返回 true
+ */
 bool ZmTapHubProxy::OnStartTap()
 {
     return true;
 }
 
+/**
+ * @brief delegate 停止回调，关闭所有代理监听端口
+ */
 void ZmTapHubProxy::OnStopTap()
 {
-    for (size_t i = 0; i < m_dummies.Count(); i++)
+    for (size_t i = 0; i < m_proxy_listeners.Count(); i++)
     {
-        CloseListener(m_dummies.At(i));
+        CloseListener(m_proxy_listeners.At(i));
     }
-    CloseListener(&m_listener);
 }
 
-uint16_t ZmTapHubProxy::AddDummy(uint16_t port, const char* host, ZM_HUB_PROXY_PORT_TYPE type)
+/**
+ * @brief 添加一个代理监听端口
+ * @param port 期望端口号（0 表示由系统自动分配）
+ * @param host 监听地址（为空时默认 127.0.0.1）
+ * @param type 端口类型（预留扩展，当前仅 PROXY_PORT_NOTYPE）
+ * @return 实际绑定的端口号，失败返回 0
+ */
+uint16_t ZmTapHubProxy::AddListenPort(uint16_t port, const char* host, ZM_HUB_PROXY_PORT_TYPE type)
 {
+    if (!m_evbase)
+    {
+        PUBLIC_LOG_ERROR("AddListenPort failed: event base not ready, Host: {}, Port: {}", host, port);
+        return 0;
+    }
+
     if (port > 0)
     {
-        for (size_t i = 0; i < m_dummies.Count(); i++)
+        for (size_t i = 0; i < m_proxy_listeners.Count(); i++)
         {
-            if (m_dummies.At(i)->port == port && !strcmp(m_dummies.At(i)->host, ZmString::IsEmpty(host) ? ZM_PROXY_LISTEN_IP : host))
+            if (m_proxy_listeners.At(i)->port == port && !strcmp(m_proxy_listeners.At(i)->host, ZmString::IsEmpty(host) ? ZM_PROXY_LISTEN_IP : host))
             {
                 return port;
             }
         }
     }
 
-    ZM_HUB_LISTENER* listener = m_dummies.Add();
-
-    if (m_evbase)
+    ZM_HUB_LISTENER* listener = m_proxy_listeners.Add();
+    if (!listener)
     {
-        if (ZmString::IsEmpty(host))
-        {
-            strncpy_s(listener->host, ZM_PROXY_LISTEN_IP, sizeof(listener->host));
-            listener->host[sizeof(listener->host) - 1] = '\0';
-        }
-        else
-        {
-            strncpy_s(listener->host, host, sizeof(listener->host));
-            listener->host[sizeof(listener->host) - 1] = '\0';
-        }
-
-        evconnlistener_cb cb = nullptr;
-
-        //回调分类
-        //if (type == PROXY_PORT_SOCK5) {
-        //    cb = ZmTapContextEventHandler::OnRequesterSOCK5AcceptConnCB;
-        //}
-
-        int failed_count = 0;
-        char pstr[16] = { 0 };
-        bool bListen = false;
-
-        bListen = Listen(listener, m_evbase, cb, this, listener->host,
-            false, ZmString::L_To_A(listener->port, pstr));
-
-        if (bListen)
-        {
-            PUBLIC_LOG_INFO("AddDummy,Host: {}, Port: {}, Success", host, listener->host, listener->port);
-        }
-        else
-        {
-            CloseListener(listener);
-            m_dummies.Remove(m_dummies.OffsetOf(listener));
-            PUBLIC_LOG_ERROR("AddDummy,Host: {}, Port: {}, Failed", listener->host, listener->port);
-        }
-
-        return (bListen) ? listener->port : 0;
+        PUBLIC_LOG_ERROR("AddListenPort failed: m_proxy_listeners.Add() returned nullptr, Host: {}, Port: {}", host, port);
+        return 0;
     }
 
-    //start listenning port failed
-    return 0;
+    if (ZmString::IsEmpty(host))
+    {
+        strncpy_s(listener->host, ZM_PROXY_LISTEN_IP, sizeof(listener->host));
+        listener->host[sizeof(listener->host) - 1] = '\0';
+    }
+    else
+    {
+        strncpy_s(listener->host, host, sizeof(listener->host));
+        listener->host[sizeof(listener->host) - 1] = '\0';
+    }
+
+    evconnlistener_cb cb = nullptr;
+
+    //回调分类
+    //if (type == PROXY_PORT_SOCK5) {
+    //    cb = ZmTapContextEventHandler::OnRequesterSOCK5AcceptConnCB;
+    //}
+
+    char pstr[16] = { 0 };
+    bool bListen = false;
+
+    bListen = Listen(listener, m_evbase, cb, this, listener->host,
+        false, ZmString::L_To_A(listener->port, pstr));
+
+    if (bListen)
+    {
+        PUBLIC_LOG_INFO("AddListenPort,Host: {}, Port: {}, Success", host, listener->host, listener->port);
+    }
+    else
+    {
+        CloseListener(listener);
+        m_proxy_listeners.Remove(m_proxy_listeners.OffsetOf(listener));
+        PUBLIC_LOG_ERROR("AddListenPort,Host: {}, Port: {}, Failed", listener->host, listener->port);
+    }
+
+    return (bListen) ? listener->port : 0;
 }
 
-void ZmTapHubProxy::RemoveDummy(uint16_t port, const char* host)
+/**
+ * @brief 移除指定的代理监听端口
+ * @param port 要移除的端口号
+ * @param host 要移除的监听地址（为空时默认 127.0.0.1，与 AddListenPort 保持一致）
+ */
+void ZmTapHubProxy::RemoveListenPort(uint16_t port, const char* host)
 {
-    for (size_t i = 0; i < m_dummies.Count(); i++)
+    const char* cmp_host = ZmString::IsEmpty(host) ? ZM_PROXY_LISTEN_IP : host;
+    for (size_t i = 0; i < m_proxy_listeners.Count(); i++)
     {
-        if (m_dummies.At(i)->port == port && !strcmp(m_dummies.At(i)->host, host))
+        if (m_proxy_listeners.At(i)->port == port && 0 == strcmp(m_proxy_listeners.At(i)->host, cmp_host))
         {
-            CloseListener(m_dummies.At(i));
-            m_dummies.Remove(i);
+            CloseListener(m_proxy_listeners.At(i));
+            m_proxy_listeners.Remove(i);
             return;
         }
     }
 }
 
 
+/**
+ * @brief delegate 内部事件回调（当前无内部事件需要处理）
+ * @param what 事件标志位
+ */
 void ZmTapHubProxy::OnTapDelegateEvent(short what)
 {
 
@@ -336,7 +391,7 @@ void ZmTapHubProxy::OnTapDelegateEvent(short what)
  * @brief accept 阶段设置探测回调，等待首包到达后识别协议类型
  *
  * IsCallbackSelfManaged() 返回 true，上层 OnRequesterAcceptConnCB 不会覆盖
- * 此处设置的回调。首包到达时 OnProbeReadCB 执行协议探测，根据魔数切换 delegate。
+ * 此处设置的回调。首包到达时 OnProtocolDetectReadCB 执行协议探测，根据魔数切换 delegate。
  */
 bool ZmTapHubProxy::OnTapRequesterAccept(ZM_TAP_CTX* tap, evutil_socket_t fd, struct sockaddr* address)
 {
@@ -344,8 +399,8 @@ bool ZmTapHubProxy::OnTapRequesterAccept(ZM_TAP_CTX* tap, evutil_socket_t fd, st
 
     // 设置 4 字节水位线，确保首包至少包含协议魔数
     bufferevent_setwatermark(tap->requester_bev, EV_READ, 4, 0);
-    bufferevent_setcb(tap->requester_bev, ZmTapHubProxy::OnProbeReadCB,
-        NULL, ZmTapHubProxy::OnProbeEventCB, tap);
+    bufferevent_setcb(tap->requester_bev, ZmTapHubProxy::OnProtocolDetectReadCB,
+        NULL, ZmTapHubProxy::OnProtocolDetectEventCB, tap);
     bufferevent_enable(tap->requester_bev, EV_READ | EV_WRITE);
 
     return true;
@@ -360,7 +415,7 @@ bool ZmTapHubProxy::OnTapRequesterAccept(ZM_TAP_CTX* tap, evutil_socket_t fd, st
  *   3. 替换 bufferevent 回调为标准读写回调
  *   4. 将剩余数据交给新 delegate 处理
  */
-void ZmTapHubProxy::OnProbeReadCB(struct bufferevent* bev, void* ctx)
+void ZmTapHubProxy::OnProtocolDetectReadCB(struct bufferevent* bev, void* ctx)
 {
     ZM_TAP_CTX* tap = (ZM_TAP_CTX*)ctx;
     if (!tap || !tap->delegate)
@@ -419,21 +474,16 @@ void ZmTapHubProxy::OnProbeReadCB(struct bufferevent* bev, void* ctx)
 /**
  * @brief 协议探测事件回调 — 处理探测阶段的连接异常
  */
-void ZmTapHubProxy::OnProbeEventCB(struct bufferevent* bev, short events, void* ctx)
+void ZmTapHubProxy::OnProtocolDetectEventCB(struct bufferevent* bev, short events, void* ctx)
 {
     ZM_TAP_CTX* tap = (ZM_TAP_CTX*)ctx;
     if (!tap || !tap->delegate) return;
 
-    ZmTapHubProxy* self = static_cast<ZmTapHubProxy*>(tap->delegate);
-
     if (events & (BEV_EVENT_EOF | BEV_EVENT_ERROR))
     {
         PUBLIC_LOG_INFO("Probe connection closed/error, dropping Tap: {}", (void*)tap);
-        if (tap->delegate)
-        {
-            tap->delegate->OnTapRequesterEvent(tap, bev, events);
-        }
-        self->TapContext()->Drop(tap, "Probe connection closed");
+        tap->delegate->OnTapRequesterEvent(tap, bev, events);
+        tap->Drop("Probe connection closed");
     }
 }
 
@@ -464,7 +514,7 @@ void ZmTapHubProxy::SwitchDelegate(ZM_TAP_CTX* tap, ZmTapDelegate* new_delegate)
 /**
  * @brief 正常数据读取 — HubProxy 不应该收到此回调
  *
- * 正常情况下协议探测在 OnProbeReadCB 中完成并切换 delegate 后，
+ * 正常情况下协议探测在 OnProtocolDetectReadCB 中完成并切换 delegate 后，
  * 后续数据会直接路由到新 delegate。如果走到这里说明状态异常。
  */
 void ZmTapHubProxy::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app_input, size_t datalen)
@@ -473,11 +523,11 @@ void ZmTapHubProxy::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app_inp
     {
         // delegate 已切换，正常路径不应走到这里
         PUBLIC_LOG_ERROR("HubProxy OnTapRequesterRead called after delegate switch, dropping Tap: {}", (void*)tap);
-        tap->tap_context->Drop(tap, "HubProxy unexpected read after probe");
+        tap->Drop("HubProxy unexpected read after probe");
         return;
     }
 
     // 走到这里说明 IsCallbackSelfManaged 未生效或 probe 未触发
     PUBLIC_LOG_ERROR("HubProxy OnTapRequesterRead called in HUB mode (probe should have handled this), dropping Tap: {}", (void*)tap);
-    tap->tap_context->Drop(tap, "HubProxy unexpected read");
+    tap->Drop("HubProxy unexpected read");
 }

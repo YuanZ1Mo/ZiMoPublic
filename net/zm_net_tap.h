@@ -74,7 +74,10 @@ typedef enum
  */
 typedef struct ZM_TAP_CTX
 {
-    ZmTapContext* tap_context;                /** 所属的 TAP 池 */
+private:
+    ZmTapContext* tap_context;                /** 所属的 TAP 池，暂定每个ZM_TAP_CTX对象在未收回前有且只有一个唯一值  */
+
+public:
 
     event*        ev_timeout;                 /** 超时定时器事件 */
     uint32_t      drop_timeout_error_code;    /** 超时错误码 */
@@ -102,31 +105,18 @@ typedef struct ZM_TAP_CTX
     char           seq_num[16];               /** 消息序号（原子自增生成，唯一标识） */
     ZM_TAP_SLOT*   _slot;                     /** 回指 pool 中的槽位，扩容时被 ZmTapContext 同步更新 */
 
+public:
     /**
      * @brief 重置所有字段到初始状态
      * @note 不清除 _slot 指向的槽位关系，仅将 _slot 置空
      */
-    void Clear()
-    {
-        tap_context = nullptr;
-        ev_timeout = nullptr;
-        requester_bev = nullptr;
-        dns_request = nullptr;
-        delegate = nullptr;
-        request.Init();
-        requester_data = nullptr;
-        memset(onback_chains, 0, sizeof(onback_chains));
-        onback_data = nullptr;
-        onback_dlen = 0;
-        state = ZM_TAP_STATE_NONE;
-        _slot = nullptr;
-        drop_timeout_error_code = 0;
-        requester_data_len = 0;
-        requester_content_len = 0;
-        requester_port = 0;
-        memset(seq_num, 0, sizeof(seq_num));
-        memset(requester_ip, 0, sizeof(requester_ip));
-    }
+    void Clear();
+
+    void SetTapContext(ZmTapContext* pTapContext);
+
+    const ZmTapContext* TapContext();
+
+    void Drop(const char* reason = "");
 } ZM_TAP_CTX;
 
 /**
@@ -249,6 +239,9 @@ public:
      *  @return true  OnTapRequesterAccept 中已设置回调，上层不再覆盖
      *          false 使用默认的 OnRequesterReadCB / OnRequesterEventCB */
     virtual bool IsCallbackSelfManaged() { return false; }
+    /** @brief 获取关联的 TAP 上下文池
+     *  @return ZmTapContext 指针，默认返回 nullptr（非 Hub 模式） */
+    virtual ZmTapContext* TapContext() { return nullptr; }
 
 protected:
     /** @brief 触发 delegate 内部事件 */
