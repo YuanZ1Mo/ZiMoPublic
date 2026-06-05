@@ -255,62 +255,60 @@ void ZmTapHubProxy::OnStopTap()
 
 uint16_t ZmTapHubProxy::AddDummy(uint16_t port, const char* host, ZM_HUB_PROXY_PORT_TYPE type)
 {
-    if (port >= 0)
+    if (port > 0)
     {
-        if (port > 0)
+        for (size_t i = 0; i < m_dummies.Count(); i++)
         {
-            for (size_t i = 0; i < m_dummies.Count(); i++)
+            if (m_dummies.At(i)->port == port && !strcmp(m_dummies.At(i)->host, ZmString::IsEmpty(host) ? ZM_PROXY_LISTEN_IP : host))
             {
-                if (m_dummies.At(i)->port == port && strcmp(m_dummies.At(i)->host, ZmString::IsEmpty(host) ? ZM_PROXY_LISTEN_IP : host))
-                {
-                    return port;
-                }
+                return port;
             }
-        }
-
-        ZM_HUB_LISTENER* listener = m_dummies.Add();
-
-        if (m_evbase)
-        {
-            if (ZmString::IsEmpty(host))
-            {
-                strncpy_s(listener->host, ZM_PROXY_LISTEN_IP, sizeof(listener->host));
-                listener->host[sizeof(listener->host) - 1] = '\0';
-            }
-            else
-            {
-                strncpy_s(listener->host, host, sizeof(listener->host));
-                listener->host[sizeof(listener->host) - 1] = '\0';
-            }
-
-            evconnlistener_cb cb = nullptr;
-
-            //回调分类
-            //if (type == PROXY_PORT_SOCK5) {
-            //    cb = ZmTapContextEventHandler::OnRequesterSOCK5AcceptConnCB;
-            //}
-
-            int failed_count = 0;
-            char pstr[16] = { 0 };
-            bool bListen = false;
-
-            bListen = Listen(listener, m_evbase, cb, this, listener->host,
-                false, ZmString::L_To_A(listener->port, pstr));
-
-            if (bListen)
-            {
-                PUBLIC_LOG_INFO("AddDummy,Host: {}, Port: {}, Success", host, listener->host, listener->port);
-            }
-            else
-            {
-                CloseListener(listener);
-                m_dummies.Remove(m_dummies.OffsetOf(listener));
-                PUBLIC_LOG_ERROR("AddDummy,Host: {}, Port: {}, Failed", listener->host, listener->port);
-            }
-
-            return (bListen) ? listener->port : 0;
         }
     }
+
+    ZM_HUB_LISTENER* listener = m_dummies.Add();
+
+    if (m_evbase)
+    {
+        if (ZmString::IsEmpty(host))
+        {
+            strncpy_s(listener->host, ZM_PROXY_LISTEN_IP, sizeof(listener->host));
+            listener->host[sizeof(listener->host) - 1] = '\0';
+        }
+        else
+        {
+            strncpy_s(listener->host, host, sizeof(listener->host));
+            listener->host[sizeof(listener->host) - 1] = '\0';
+        }
+
+        evconnlistener_cb cb = nullptr;
+
+        //回调分类
+        //if (type == PROXY_PORT_SOCK5) {
+        //    cb = ZmTapContextEventHandler::OnRequesterSOCK5AcceptConnCB;
+        //}
+
+        int failed_count = 0;
+        char pstr[16] = { 0 };
+        bool bListen = false;
+
+        bListen = Listen(listener, m_evbase, cb, this, listener->host,
+            false, ZmString::L_To_A(listener->port, pstr));
+
+        if (bListen)
+        {
+            PUBLIC_LOG_INFO("AddDummy,Host: {}, Port: {}, Success", host, listener->host, listener->port);
+        }
+        else
+        {
+            CloseListener(listener);
+            m_dummies.Remove(m_dummies.OffsetOf(listener));
+            PUBLIC_LOG_ERROR("AddDummy,Host: {}, Port: {}, Failed", listener->host, listener->port);
+        }
+
+        return (bListen) ? listener->port : 0;
+    }
+
     //start listenning port failed
     return 0;
 }
@@ -375,7 +373,7 @@ void ZmTapHubProxy::OnProbeReadCB(struct bufferevent* bev, void* ctx)
     struct evbuffer* input = bufferevent_get_input(bev);
     size_t datalen = evbuffer_get_length(input);
 
-    if (datalen <= 4)
+    if (datalen < 4)
     {
         // 数据不足，继续等待（水位线已保证不应走到这里）
         return;
@@ -389,7 +387,7 @@ void ZmTapHubProxy::OnProbeReadCB(struct bufferevent* bev, void* ctx)
     }
 
     // 识别协议魔数
-    if (head[0] == 'J' || head[1] == 'R' || head[2] == 'P' || head[3] == 'C')
+    if (head[0] == 'J' && head[1] == 'R' && head[2] == 'P' && head[3] == 'C')
     {
         if (!self->m_delegate_jrpc)
         {
