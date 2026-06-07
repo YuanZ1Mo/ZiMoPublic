@@ -613,6 +613,7 @@ void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* li
         tap->requester_bev = bev;
         memcpy(tap->requester_ip, ipstr, sizeof(tap->requester_ip));
         tap->requester_port = app_port;
+        tap->state = ZM_TAP_STATE_INUSE;
 
         PUBLIC_LOG_INFO("Accepted a incoming connection, Delegate: {}, mode: {}, Tap: {} from {}:{}; fd: {}, bev: {}", ctx, tap->delegate->TapDelegateMode(), (void*)tap, ipstr, app_port, fd, (void*)bev);
 
@@ -685,6 +686,7 @@ bool ZmTapContextEventHandler::OnPairAcceptConn(void* ctx, evutil_socket_t fd)
     tap->requester_bev = bev;
     strncpy_s(tap->requester_ip, "127.0.0.1", sizeof(tap->requester_ip));
     tap->requester_port = 0;
+    tap->state = ZM_TAP_STATE_INUSE;
 
     // 4. 调用 delegate 的 Accept 设置协议探测回调
     struct sockaddr_in addr = {};
