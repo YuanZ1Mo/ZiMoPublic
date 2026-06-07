@@ -30,12 +30,17 @@
 #define ZM_BUF_WATERMARK_LOW        ZM_BUF_SIZE_16K
 
 /** @brief TLV 扩展头结构体（SP_PACKED 紧凑布局） */
+/** TLV 扩展头结构体（SP_PACKED 紧凑布局）
+ *  value[0] 为柔性数组成员，用于定位 TLV 头后的载荷数据，不占空间（sizeof=8） */
+#pragma warning(push)
+#pragma warning(disable: 4200)  // char value[0] 是 MSVC 柔性数组成员扩展，不占空间
 typedef struct SP_PACKED
 {
     char     tag[4];       /** 标签标识 */
     uint32_t len;          /** 数据长度 */
-    char     value[0];     /** 柔性数组，实际数据紧跟其后 */
+    char     value[0];     /** 柔性数组标记，实际数据紧跟其后 */
 }ZM_EXT_TLV_HEAD;
+#pragma warning(pop)
 
 /** @brief ZM_TAP_CTX 前置声明，供 ZM_TAP_SLOT 使用 */
 typedef struct ZM_TAP_CTX ZM_TAP_CTX;

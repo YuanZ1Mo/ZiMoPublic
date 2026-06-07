@@ -72,7 +72,7 @@ void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app
 
         /** 使用 evbuffer_copyout 避免 pullup 的内部链表线性化开销，只读取尚缺的长度 */
         size_t read_len = ZM_MIN(datalen, tap->requester_data_len - tap->requester_received_len);
-        int copy_ret = evbuffer_copyout(app_input, tap->requester_data + tap->requester_received_len, read_len);
+        ev_ssize_t copy_ret = evbuffer_copyout(app_input, tap->requester_data + tap->requester_received_len, read_len);
         if (copy_ret < 0 || (size_t)copy_ret != read_len)
         {
             PUBLIC_LOG_ERROR("Tap: {}, evbuffer_copyout failed in JRPC body, expected:{}, got:{}",
@@ -152,7 +152,8 @@ void ZmTapDelegateJRPC::WriteResponse(ZM_TAP_CTX* tap, const char* json_str, siz
     iov[1].iov_base = (void*)json_str;
     iov[1].iov_len = data_len;
 
-    int ret = evbuffer_add_iovec(bufferevent_get_output(tap->requester_bev), iov, 2);
+    // evbuffer_add_iovec 返回 size_t，但 JRPC 响应体大小有限（<4MB），int 足够容纳
+    int ret = (int)evbuffer_add_iovec(bufferevent_get_output(tap->requester_bev), iov, 2);
     if (ret != 0)
     {
         PUBLIC_LOG_ERROR("evbuffer_add_iovec failed, TAP:{}, ret:{}", (void*)tap, ret);
