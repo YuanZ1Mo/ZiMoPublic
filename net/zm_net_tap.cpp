@@ -645,19 +645,28 @@ void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* li
  *
  * @note 调用后 fd 由 bufferevent 接管（BEV_OPT_CLOSE_ON_FREE），调用者不应再操作 fd
  */
-bool ZmTapContextEventHandler::OnPairAcceptConn(struct event_base* evbase, ZmTapContext* context,
-                                                ZmTapDelegate* delegate, evutil_socket_t fd)
+bool ZmTapContextEventHandler::OnPairAcceptConn(void* ctx, evutil_socket_t fd)
 {
-    if (!evbase || !context || !delegate)
+    ZmTapDelegate* delegate = (ZmTapDelegate*)ctx;
+
+    if (!delegate)
     {
         if (fd >= 0) evutil_closesocket(fd);
         return false;
     }
 
     // 1. 为 pair fd 创建 bufferevent
-    struct bufferevent* bev = bufferevent_socket_new(evbase, fd, ZM_EVENT_BEV_OPTIONS);
+    struct bufferevent* bev = bufferevent_socket_new(delegate->TapDelegateEventBase(), fd, ZM_EVENT_BEV_OPTIONS);
     if (!bev)
     {
+        evutil_closesocket(fd);
+        return false;
+    }
+
+    ZmTapContext* context = delegate->TapContext();
+    if (!context)
+    {
+        bufferevent_free(bev);
         evutil_closesocket(fd);
         return false;
     }
@@ -667,6 +676,7 @@ bool ZmTapContextEventHandler::OnPairAcceptConn(struct event_base* evbase, ZmTap
     if (!tap)
     {
         bufferevent_free(bev);
+        evutil_closesocket(fd);
         return false;
     }
 
@@ -681,7 +691,17 @@ bool ZmTapContextEventHandler::OnPairAcceptConn(struct event_base* evbase, ZmTap
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    if (!delegate->OnTapRequesterAccept(tap, fd, (struct sockaddr*)&addr))
+    if (delegate->OnTapRequesterAccept(tap, fd, (struct sockaddr*)&addr))
+    {
+        if (!delegate->IsCallbackSelfManaged())
+        {
+            /**分配读/写回调*/
+            bufferevent_setcb(tap->requester_bev, ZmTapContextEventHandler::OnRequesterReadCB, NULL, ZmTapContextEventHandler::OnRequesterEventCB, tap);
+            bufferevent_enable(tap->requester_bev, EV_READ | EV_WRITE);
+            bufferevent_setwatermark(tap->requester_bev, EV_READ, 0, ZM_BUF_WATERMARK_HIGH);
+        }
+    }
+    else
     {
         context->Drop(tap, "OnPairAcceptConn: delegate accept failed");
         return false;

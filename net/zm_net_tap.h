@@ -273,14 +273,12 @@ public:
     static void OnRequesterAcceptConnCB(struct evconnlistener* listener,
         evutil_socket_t fd, struct sockaddr* address, int socklen, void* ctx);
     /** @brief 接受 socket pair 连接 — 与 OnRequesterAcceptConnCB 对应但用于进程内 pair 注入
-     *  @param evbase   libevent 事件循环基
-     *  @param context  TAP 上下文池
-     *  @param delegate Hub 代理 delegate
-     *  @param fd       pair 中交付给事件循环端的 socket 描述符（成功后由 bufferevent 接管）
+     *  @param ctx Hub 代理 delegate
+     *  @param fd pair 中交付给事件循环端的 socket 描述符（成功后由 bufferevent 接管）
      *  @return true 成功创建 TAP 并触发协议探测，false 失败（fd 已关闭）
-     *  @note  必须在事件循环线程中调用 */
-    static bool OnPairAcceptConn(struct event_base* evbase, ZmTapContext* context,
-        ZmTapDelegate* delegate, evutil_socket_t fd);
+     *  @note  必须在事件循环线程中调用
+     *  @note  一般由HUB回调,所以使用HUB的evtbase和context池 */
+    static bool OnPairAcceptConn(void* ctx, evutil_socket_t fd);
     static void OnRequesterEventCB(struct bufferevent* requester_bev, short events, void* ctx);
     static void OnRequesterReadCB(struct bufferevent* requester_bev, void* ctx);
     static void OnRequesterWriteCB(struct bufferevent* requester_bev, void* ctx);

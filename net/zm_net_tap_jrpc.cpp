@@ -160,7 +160,7 @@ void ZmTapDelegateJRPC::WriteResponse(ZM_TAP_CTX* tap, const char* json_str, siz
     ret = bufferevent_flush(tap->requester_bev, EV_WRITE, BEV_FLUSH);
     if (ret != 1)
     {
-        PUBLIC_LOG_ERROR("bufferevent_flush failed, TAP:{}, ret:{}", (void*)tap, ret);
+        PUBLIC_LOG_ERROR("bufferevent_flush success, TAP:{}, ret:{}", (void*)tap, ret);
     }
     ZmTapContext::SetDropTimer(tap, 30);
 }

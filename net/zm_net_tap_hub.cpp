@@ -336,6 +336,8 @@ void ZmTapHubProxy::SetJrpcDelegate(ZmTapDelegateJRPC* DelegateJRPC)
  */
 bool ZmTapHubProxy::OnTapRequesterAccept(ZM_TAP_CTX* tap, evutil_socket_t fd, struct sockaddr* address)
 {
+    ZM_UNUSED(address);
+
     PUBLIC_LOG_INFO("HubProxy setting up probe callbacks for Tap: {}", (void*)tap);
 
     // 设置 4 字节水位线，确保首包至少包含协议魔数
