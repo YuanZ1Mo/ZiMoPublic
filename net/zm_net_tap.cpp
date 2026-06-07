@@ -637,6 +637,59 @@ void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* li
     }
 }
 
+/**
+ * @brief 接受 socket pair 连接 — 与 OnRequesterAcceptConnCB 对应但无 evconnlistener 依赖
+ *
+ * 为 pair 的 fd 创建 bufferevent + TAP，注入 delegate 的协议探测链。
+ * 用于进程内跨线程交付（如 Worker 线程 → 事件循环线程），替代 TCP 短连接。
+ *
+ * @note 调用后 fd 由 bufferevent 接管（BEV_OPT_CLOSE_ON_FREE），调用者不应再操作 fd
+ */
+bool ZmTapContextEventHandler::OnPairAcceptConn(struct event_base* evbase, ZmTapContext* context,
+                                                ZmTapDelegate* delegate, evutil_socket_t fd)
+{
+    if (!evbase || !context || !delegate)
+    {
+        if (fd >= 0) evutil_closesocket(fd);
+        return false;
+    }
+
+    // 1. 为 pair fd 创建 bufferevent
+    struct bufferevent* bev = bufferevent_socket_new(evbase, fd, ZM_EVENT_BEV_OPTIONS);
+    if (!bev)
+    {
+        evutil_closesocket(fd);
+        return false;
+    }
+
+    // 2. 从池中获取 TAP
+    ZM_TAP_CTX* tap = context->Get();
+    if (!tap)
+    {
+        bufferevent_free(bev);
+        return false;
+    }
+
+    // 3. 设置 TAP 字段（与 OnRequesterAcceptConnCB 一致，但 IP 固定为 127.0.0.1）
+    tap->delegate = delegate;
+    tap->requester_bev = bev;
+    strncpy_s(tap->requester_ip, "127.0.0.1", sizeof(tap->requester_ip));
+    tap->requester_port = 0;
+
+    // 4. 调用 delegate 的 Accept 设置协议探测回调
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    if (!delegate->OnTapRequesterAccept(tap, fd, (struct sockaddr*)&addr))
+    {
+        context->Drop(tap, "OnPairAcceptConn: delegate accept failed");
+        return false;
+    }
+
+    return true;
+}
+
 void ZmTapContextEventHandler::OnRequesterEventCB(struct bufferevent* requester_bev, short events, void* ctx)
 {
     if (ctx)
