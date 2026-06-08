@@ -9,6 +9,7 @@
 
 void ZM_TAP_CTX::Clear()
 {
+    ev_base = nullptr;
     tap_context = nullptr;
     ev_timeout = nullptr;
     requester_bev = nullptr;
@@ -31,7 +32,7 @@ void ZM_TAP_CTX::Clear()
 
 void ZM_TAP_CTX::SetTapContext(ZmTapContext* pTapContext)
 {
-    if (!tap_context)
+    if (pTapContext && !tap_context)
     {
         tap_context = pTapContext;
     }
@@ -40,6 +41,19 @@ void ZM_TAP_CTX::SetTapContext(ZmTapContext* pTapContext)
 const ZmTapContext* ZM_TAP_CTX::TapContext()
 {
     return tap_context;
+}
+
+void ZM_TAP_CTX::SetEventBase(event_base* evbase)
+{
+    if (evbase && !ev_base)
+    {
+        ev_base = evbase;
+    }
+}
+
+const event_base* ZM_TAP_CTX::EventBase()
+{
+    return ev_base;
 }
 
 void ZM_TAP_CTX::Drop(const char* reason)
@@ -265,7 +279,7 @@ void ZmTapContext::SetDropTimer(ZM_TAP_CTX* tap, int seconds, int micros, uint32
 
         if (!tap->ev_timeout)
         {
-            tap->ev_timeout = evtimer_new(tap->delegate->TapDelegateEventBase(), ZmTapContextEventHandler::OnDropTimerCB, tap);
+            tap->ev_timeout = evtimer_new(const_cast<event_base*>(tap->EventBase()), ZmTapContextEventHandler::OnDropTimerCB, tap);
         }
 
         timeval tv = { seconds, micros * 1000 };
@@ -610,6 +624,7 @@ void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* li
     if (tap)
     {
         tap->delegate = delegate;
+        tap->SetEventBase(delegate->TapDelegateEventBase());
         tap->requester_bev = bev;
         memcpy(tap->requester_ip, ipstr, sizeof(tap->requester_ip));
         tap->requester_port = app_port;
@@ -683,6 +698,7 @@ bool ZmTapContextEventHandler::OnPairAcceptConn(void* ctx, evutil_socket_t fd)
 
     // 3. 设置 TAP 字段（与 OnRequesterAcceptConnCB 一致，但 IP 固定为 127.0.0.1）
     tap->delegate = delegate;
+    tap->SetEventBase(delegate->TapDelegateEventBase());
     tap->requester_bev = bev;
     strncpy_s(tap->requester_ip, "127.0.0.1", sizeof(tap->requester_ip));
     tap->requester_port = 0;

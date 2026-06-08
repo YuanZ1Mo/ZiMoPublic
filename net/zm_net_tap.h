@@ -81,6 +81,7 @@ typedef struct ZM_TAP_CTX
 {
 private:
     ZmTapContext* tap_context;                /** 所属的 TAP 池，暂定每个ZM_TAP_CTX对象在未收回前有且只有一个唯一值  */
+    event_base*   ev_base;                     /** libevent 事件循环基, 暂定evbase仅挂靠在创建时的HUB上且中途无法更改 */
 
 public:
 
@@ -120,6 +121,10 @@ public:
     void SetTapContext(ZmTapContext* pTapContext);
 
     const ZmTapContext* TapContext();
+
+    void SetEventBase(event_base* evbase);
+
+    const event_base* EventBase();
 
     void Drop(const char* reason = "");
 } ZM_TAP_CTX;
