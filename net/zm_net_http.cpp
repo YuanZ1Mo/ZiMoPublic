@@ -474,7 +474,7 @@ void ZmHttpdTask::SetReplyBuf(struct evbuffer* buf)
 // ============================ ZmHttpServer internals ============================
 
 /**
- * @brief HTTP 请求工作线程，继承 ZmThread（线程能力）和 ZmHttpdTask（请求上下文）
+ * @brief HTTP 请求处理任务，由线程池调度执行（不再继承 ZmThread）
  *
  * 生命周期:
  *   1. 事件循环线程创建 ZmHttpdDoer 并启动工作线程
@@ -484,23 +484,18 @@ void ZmHttpdTask::SetReplyBuf(struct evbuffer* buf)
  *
  * @note 此类仅在 cpp 内部使用，不对外暴露
  */
-class ZmHttpdDoer : public ZmThread, public ZmHttpdTask
+class ZmHttpdDoer : public ZmHttpdTask
 {
 public:
     /**
-     * @brief 构造工作线程
+     * @brief 构造请求处理任务（不再继承 ZmThread，由线程池调度）
      * @param httpd    所属的 HTTP 服务器实例
      * @param request  libevent HTTP 请求对象
-     *
-     * @note 创建 m_reply_event 用于接收工作线程的"回复就绪"信号，
-     *       该事件绑定到 HTTP 服务器的 event_base 上，由事件循环线程监听
      */
     ZmHttpdDoer(ZmHttpServer* httpd, struct evhttp_request* request)
-        : ZmThread("httpd-doer"), ZmHttpdTask(request), m_httpd(httpd)
+        : ZmHttpdTask(request), m_httpd(httpd)
     {
         m_remove_event = NULL;
-        // 创建一个没有真实 fd 的持久事件，通过 event_active 手动触发
-        // 工作线程处理完请求后调用 event_active 通知事件循环线程发送响应
         m_reply_event = event_new(m_httpd->EventBase(), -1, EV_PERSIST | EV_READ,
             ZmHttpServer::OnEvent_Control, this);
         event_add(m_reply_event, NULL);
@@ -575,18 +570,13 @@ public:
         delete this;
     }
 
-protected:
     /**
-     * @brief 工作线程入口，执行请求处理并通过 event_active 通知事件循环线程
-     *
-     * 执行流程:
-     *   1. 调用 m_httpd->Perform(this) 执行业务逻辑（耗时操作在此完成）
-     *   2. 调用 event_active 发送 REPLY 信号，通知事件循环线程发送响应
+     * @brief 由线程池调用的处理入口，执行请求处理并通知事件循环线程
      */
-    virtual void Run()
+public:
+    void Process()
     {
         m_httpd->Perform(this);
-        // 通过手动激活事件通知事件循环线程，what 参数携带控制类型
         event_active(m_reply_event, ZmHttpServer::ZM_HTTPD_CONTROL_REPLY, 0);
     }
 
@@ -817,7 +807,7 @@ void ZmHttpHead::SetHostField(const char* scheme, const char* host, uint16_t por
 // ============================ ZmHttpServer ============================
 
 ZmHttpServer::ZmHttpServer(uint16_t local_port) : ZmThread("HTTPD"),
-    m_evbase(NULL), m_evhttpd(NULL), m_ctrl_event(NULL),
+    m_evbase(NULL), m_evhttpd(NULL), m_ctrl_event(NULL), m_pool(nullptr),
     m_local_port(local_port), m_port_bind_failed(false), m_shutdown_requested(false)
 {}
 
@@ -905,14 +895,9 @@ void ZmHttpServer::OnHttp_RequestCB(struct evhttp_request* request, void* arg)
     const char* uri = evhttp_request_get_uri(request);
     if (uri && arg)
     {
-        // 为每个请求创建独立的工作线程，避免耗时请求阻塞事件循环
-        ZmHttpdDoer* doer = new ZmHttpdDoer((ZmHttpServer*)arg, request);
-        if (!doer->Start())
-        {
-            // 线程启动失败，释放资源并返回 503
-            delete doer;
-            evhttp_send_error(request, 503, "Service Unavailable");
-        }
+        ZmHttpServer* server = (ZmHttpServer*)arg;
+        ZmHttpdDoer* doer = new ZmHttpdDoer(server, request);
+        server->m_pool->Submit([doer]() { doer->Process(); });
     }
     else
     {
@@ -973,7 +958,9 @@ void ZmHttpServer::Run()
     // 检查 m_shutdown_requested 防止在 BindEventBase 完成前收到 Shutdown 导致进入事件循环
     if (bindRet && !m_shutdown_requested)
     {
-        // event_base_dispatch 阻塞运行事件循环，直到 loopbreak 或无活跃事件
+        // 创建工作线程池（线程复用，替代 thread-per-request）
+        m_pool = new ZmThreadPool(
+            (uint16_t)std::thread::hardware_concurrency());
         event_base_dispatch(m_evbase);
     }
 
@@ -1056,8 +1043,14 @@ void ZmHttpServer::OnControlClose()
 
 void ZmHttpServer::FreeEventObjects()
 {
+    // 先停线程池（join 所有 worker，确保不再有任务访问 evbase）
+    if (m_pool)
+    {
+        delete m_pool;
+        m_pool = nullptr;
+    }
+
     // 释放顺序: ctrl_event → evhttpd → evbase
-    // 必须先释放 ctrl_event 和 evhttpd，因为它们持有对 evbase 的引用
     if (m_ctrl_event)
     {
         event_free(m_ctrl_event);

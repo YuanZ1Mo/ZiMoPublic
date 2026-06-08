@@ -487,6 +487,9 @@ private:
     /** @brief 用于接收外部线程控制信号的事件（关闭、响应等） */
     struct event*      m_ctrl_event;
 
+    /** @brief 工作线程池（复用线程处理请求，替代 thread-per-request） */
+    ZmThreadPool*      m_pool;
+
     /** @brief 监听端口号 */
     uint16_t           m_local_port;
 
