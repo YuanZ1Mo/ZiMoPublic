@@ -1,5 +1,6 @@
 #include "zm_net_tap_jrpc.h"
 #include "../spdlog/zm_logger.h"
+#include "../util/zm_util_thread.h"
 
 ///////////////////////////////////////////////////////////////////////////////////////////////
 // ZmTapDelegateJRPC
@@ -95,7 +96,13 @@ void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app
         if (m_tapDelegateJrpcRequestReadCB)
         {
             ZmTapContext::BackChainPush(tap, this);
-            m_tapDelegateJrpcRequestReadCB(tap, (const char*)tap->requester_data);
+            // 拷贝请求数据后投递到线程池处理，避免阻塞 libevent 事件循环
+            // 业务层必须使用 ResponseAsync / SetDropTimerAsync / DropAsync 操作 TAP
+            std::string reqCopy((const char*)tap->requester_data);
+            auto cb = m_tapDelegateJrpcRequestReadCB;
+            ZmThreadPool::InvokeLater([tap, reqCopy, cb]() {
+                cb(tap, reqCopy.c_str());
+            });
         }
         else
         {
@@ -154,7 +161,8 @@ void ZmTapDelegateJRPC::WriteResponse(ZM_TAP_CTX* tap, const char* json_str, siz
     iov[1].iov_len = data_len;
 
     // evbuffer_add_iovec 成功返回写入字节数，失败返回 -1
-    int ret = evbuffer_add_iovec(bufferevent_get_output(tap->requester_bev), iov, 2);
+    // JRPC 响应体大小有限（<4MB），返回值在 int 范围内，显式转换消除 x64 截断警告
+    int ret = (int)evbuffer_add_iovec(bufferevent_get_output(tap->requester_bev), iov, 2);
     if (ret < 0)
     {
         PUBLIC_LOG_ERROR("evbuffer_add_iovec failed, TAP:{}, ret:{}", (void*)tap, ret);
