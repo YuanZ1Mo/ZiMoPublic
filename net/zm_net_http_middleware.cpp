@@ -38,6 +38,8 @@ ZmHttpRouter::Middleware ZmHttpMiddlewareRecovery()
         {
             PUBLIC_LOG_ERROR("HTTP 请求异常: {}，URI: {}",
                 e.what(), task->Uri() ? task->Uri() : "(null)");
+            // 清空 handler 可能已部分写入的脏数据
+            task->ClearReplyBody();
             task->PutReplyHeader("Content-type", "application/json; charset=utf-8");
             task->SetReply(500, "Internal Server Error");
             std::string body = "{\"error\":\"Internal Server Error\"}";
@@ -47,6 +49,7 @@ ZmHttpRouter::Middleware ZmHttpMiddlewareRecovery()
         {
             PUBLIC_LOG_ERROR("HTTP 请求未知异常，URI: {}",
                 task->Uri() ? task->Uri() : "(null)");
+            task->ClearReplyBody();
             task->PutReplyHeader("Content-type", "application/json; charset=utf-8");
             task->SetReply(500, "Internal Server Error");
             std::string body = "{\"error\":\"Internal Server Error\"}";

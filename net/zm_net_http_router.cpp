@@ -175,25 +175,23 @@ ZmHttpRouter& ZmHttpRouter::Group(const char* prefix)
 }
 
 // ============================================================================
-// 路由匹配
+// 路由匹配（单次遍历，同时返回 handlers 和中间件）
 // ============================================================================
 
-const std::map<std::string, ZmHttpRouter::Handler>*
-ZmHttpRouter::FindRoute(const std::string& path,
-                        std::map<std::string, std::string>& outParams) const
+ZmHttpRouter::MatchResult
+ZmHttpRouter::MatchRoute(const std::string& path,
+                          std::map<std::string, std::string>& outParams) const
 {
+    MatchResult result;
     auto segs = SplitPath(path.c_str());
     const Node* node = m_root.get();
-
-    // 收集沿途节点的中间件
-    // (outside this function, via returned node)
 
     for (size_t i = 0; i < segs.size(); i++)
     {
         const auto& seg = segs[i];
-        const Node* matched = nullptr;
+        const Node* matched  = nullptr;
         const Node* wildcard = nullptr;
-        const Node* param = nullptr;
+        const Node* param    = nullptr;
 
         for (const auto& c : node->children)
         {
@@ -205,39 +203,55 @@ ZmHttpRouter::FindRoute(const std::string& path,
                 param = c.get();
         }
 
-        // 优先级：精确 > 参数 > 通配符
         if (matched)
         {
             node = matched;
+            if (!matched->middlewares.empty())
+                result.nodeMWs.insert(result.nodeMWs.end(),
+                    matched->middlewares.begin(), matched->middlewares.end());
         }
         else if (param)
         {
-            outParams[param->segment.substr(1)] = seg;  // ":id" → "id" = value
+            outParams[param->segment.substr(1)] = seg;
             node = param;
+            if (!param->middlewares.empty())
+                result.nodeMWs.insert(result.nodeMWs.end(),
+                    param->middlewares.begin(), param->middlewares.end());
         }
         else if (wildcard)
         {
-            // 通配符匹配所有剩余段
-            return &wildcard->handlers;
+            if (!wildcard->middlewares.empty())
+                result.nodeMWs.insert(result.nodeMWs.end(),
+                    wildcard->middlewares.begin(), wildcard->middlewares.end());
+            result.handlers = &wildcard->handlers;
+            return result;
         }
         else
         {
-            return nullptr;  // 无匹配
+            return result;  // 无匹配，handlers 为 nullptr
         }
     }
 
-    // 所有段匹配完成，当前节点若无处理器则检查通配符子节点
-    //（如 "/*" 匹配 "/" 时请求段为空，需从根节点找 * 子节点）
+    // 所有段匹配完成
     if (node->handlers.empty())
     {
+        // 检查通配符子节点（如 "/*" 匹配 "/" 时请求段为空）
         for (const auto& c : node->children)
         {
             if (c->segment == "*")
-                return &c->handlers;
+            {
+                if (!c->middlewares.empty())
+                    result.nodeMWs.insert(result.nodeMWs.end(),
+                        c->middlewares.begin(), c->middlewares.end());
+                result.handlers = &c->handlers;
+                return result;
+            }
         }
-        return nullptr;
+        return result;  // handlers 为 nullptr
     }
-    return &node->handlers;
+
+    result.handlers = &node->handlers;
+    return result;
 }
 
 // ============================================================================
@@ -256,10 +270,10 @@ int ZmHttpRouter::Serve(ZmHttpdTask* task, const BYTE* data, size_t dlen)
     if (q != std::string::npos)
         path = path.substr(0, q);
 
-    // 路径参数
+    // 一次遍历完成路径匹配 + 中间件收集
     t_params.clear();
-    const auto* handlers = FindRoute(path, t_params);
-    if (!handlers)
+    auto matched = MatchRoute(path, t_params);
+    if (!matched.handlers)
         return 404;
 
     // 匹配 HTTP 方法
@@ -274,87 +288,47 @@ int ZmHttpRouter::Serve(ZmHttpdTask* task, const BYTE* data, size_t dlen)
     }
 
     Handler handler = nullptr;
-    auto it = handlers->find(methodStr);
-    if (it != handlers->end())
+    auto it = matched.handlers->find(methodStr);
+    if (it != matched.handlers->end())
         handler = it->second;
     else
     {
-        // 尝试 "*" 通配方法
-        auto itAny = handlers->find("*");
-        if (itAny != handlers->end())
+        auto itAny = matched.handlers->find("*");
+        if (itAny != matched.handlers->end())
             handler = itAny->second;
     }
 
     if (!handler)
         return 404;
 
-    // 收集节点中间件：遍历路由树收集沿途 middlewares
-    std::vector<Middleware> nodeMWs;
-
-    // 重新遍历以收集中间件
-    auto segs = SplitPath(path.c_str());
-    const Node* node = m_root.get();
-
-    auto collectMWs = [&](const Node* n) {
-        if (n && !n->middlewares.empty())
-            nodeMWs.insert(nodeMWs.end(), n->middlewares.begin(), n->middlewares.end());
-    };
-
-    for (size_t i = 0; i < segs.size(); i++)
-    {
-        const auto& seg = segs[i];
-        const Node* matched = nullptr;
-        const Node* wildcard = nullptr;
-        const Node* param = nullptr;
-
-        for (const auto& c : node->children)
-        {
-            if (c->segment == seg)
-                matched = c.get();
-            else if (c->segment == "*")
-                wildcard = c.get();
-            else if (!c->segment.empty() && c->segment[0] == ':')
-                param = c.get();
-        }
-
-        if (matched)       { node = matched;  collectMWs(matched); }
-        else if (param)    { node = param;    collectMWs(param); break; }
-        else if (wildcard) { collectMWs(wildcard); break; }
-        else               { break; }
-    }
-
-    // 空路径（如 "/" 匹配 "/*"）需检查根节点的通配符子节点
-    if (segs.empty())
-    {
-        for (const auto& c : node->children)
-        {
-            if (c->segment == "*") { collectMWs(c.get()); break; }
-        }
-    }
-
-    return ExecuteChain(task, data, dlen, nodeMWs, handler);
+    return ExecuteChain(task, data, dlen, matched.nodeMWs, handler);
 }
 
 int ZmHttpRouter::ExecuteChain(ZmHttpdTask* task, const BYTE* data, size_t dlen,
                                 const std::vector<Middleware>& nodeMWs, Handler handler)
 {
-    // 合并链：全局中间件 + 节点中间件 + 处理器
-    // 使用 shared_ptr 让 lambda 捕获存活到链执行完
     struct ChainFrame {
         std::vector<Middleware> chain;
-        int index = 0;
+        int  index = 0;
+        int  depth = 0;
         bool shortCircuited = false;
-        int handlerResult = 0;
+        int  handlerResult = 0;
+        static constexpr int MAX_DEPTH = 64;  ///< 防止中间件递归死循环导致栈溢出
     };
     auto frame = std::make_shared<ChainFrame>();
 
-    // 构建链
     frame->chain = m_globalMiddlewares;
     frame->chain.insert(frame->chain.end(), nodeMWs.begin(), nodeMWs.end());
 
-    // next() 递归函数：推进到下一个中间件，链尾执行处理器
+    // next() 递归：推进到下一个中间件，链尾执行处理器
     std::function<void()> next;
     next = [this, task, data, dlen, handler, frame, &next]() {
+        if (++frame->depth > ChainFrame::MAX_DEPTH)
+        {
+            frame->shortCircuited = true;
+            return;  // 深度超限，强制终止
+        }
+
         while (frame->index < (int)frame->chain.size())
         {
             auto mw = frame->chain[frame->index++];
@@ -368,7 +342,7 @@ int ZmHttpRouter::ExecuteChain(ZmHttpdTask* task, const BYTE* data, size_t dlen,
                 frame->shortCircuited = true;
                 return;  // 中间件短路
             }
-            return;  // 中间件已调用 next()，等递归回来
+            return;  // 中间件已调用 next()，等待递归返回
         }
         // 链尾：执行处理器
         frame->handlerResult = handler(task, data, dlen);
@@ -377,7 +351,7 @@ int ZmHttpRouter::ExecuteChain(ZmHttpdTask* task, const BYTE* data, size_t dlen,
     next();
 
     if (frame->shortCircuited)
-        return 0;  // 中间件短路，无返回值
+        return 0;  // 中间件短路或深度超限
 
     return frame->handlerResult;
 }

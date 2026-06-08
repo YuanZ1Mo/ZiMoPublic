@@ -251,6 +251,18 @@ public:
      */
     void SetReplyBuf(struct evbuffer* buf = NULL);
 
+    /**
+     * @brief 清空已写入的响应体数据（保留状态码和响应头）
+     *
+     * 适用于异常恢复场景：handler 部分写入后抛异常，
+     * 中间件可清空脏数据后重写错误响应。
+     */
+    void ClearReplyBody()
+    {
+        if (m_reply_buf)
+            evbuffer_drain(m_reply_buf, evbuffer_get_length(m_reply_buf));
+    }
+
 protected:
     /** @brief 底层 libevent HTTP 请求对象 */
     struct evhttp_request*              m_request;

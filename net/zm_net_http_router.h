@@ -135,6 +135,12 @@ private:
         std::vector<Middleware> middlewares;   ///< 本节点及子路由共享的中间件
     };
 
+    /** @brief 路由匹配结果 */
+    struct MatchResult {
+        const std::map<std::string, Handler>* handlers = nullptr;
+        std::vector<Middleware>              nodeMWs;
+    };
+
     /** @brief 内部路由注册
      *  @param method    HTTP 方法（"GET"/"POST"/"*"）
      *  @param pattern   路径模式（"/api/users/:id"）
@@ -144,13 +150,13 @@ private:
                   const std::vector<Middleware>& groupMWs = {});
 
     /**
-     * @brief 在路由树中查找匹配的节点
-     * @param path 请求路径（如 "/api/users/42"）
-     * @param outParams 输出：捕获的路径参数
-     * @return 匹配节点的处理器映射，未匹配返回 nullptr
+     * @brief 遍历路由树匹配路径，同时收集沿途中间件
+     * @param path       请求路径（如 "/api/users/42"）
+     * @param outParams  输出：捕获的路径参数
+     * @return           匹配结果（handlers + 节点中间件），未匹配时 handlers 为 nullptr
      */
-    const std::map<std::string, Handler>* FindRoute(
-        const std::string& path, std::map<std::string, std::string>& outParams) const;
+    MatchResult MatchRoute(const std::string& path,
+                           std::map<std::string, std::string>& outParams) const;
 
     /** @brief 构建并执行中间件链 + 处理器 */
     int ExecuteChain(ZmHttpdTask* task, const BYTE* data, size_t dlen,
