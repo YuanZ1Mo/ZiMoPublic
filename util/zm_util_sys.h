@@ -398,6 +398,28 @@ public:
      *   printf("Path: %ls\n", path.c_str());
      */
     static std::wstring GetCurrentProcessPath();
+
+    // ---- System Load ----
+
+    /**
+     * @brief 获取系统实时负载（CPU/内存/GPU）
+     * @return ZmSystemLoad 结构体，包含百分比和绝对值
+     * @note CPU 采样需两次调用间隔 ≥ 100ms 才准确，内部自动处理
+     */
+    static struct ZmSystemLoad GetSystemLoad();
+};
+
+/**
+ * @brief 系统实时负载信息
+ */
+struct ZmSystemLoad
+{
+    double    cpu_percent;          ///< CPU 总占用率 0-100
+    double    memory_percent;       ///< 内存占用率 0-100
+    uint64_t  total_memory_mb;      ///< 物理内存总量 (MB)
+    uint64_t  used_memory_mb;       ///< 已用物理内存 (MB)
+    bool      has_gpu;              ///< GPU 信息是否可用
+    double    gpu_percent;          ///< GPU 占用率 0-100（不可用时为 -1）
 };
 
 #endif /* ZM_UTIL_SYS_H */

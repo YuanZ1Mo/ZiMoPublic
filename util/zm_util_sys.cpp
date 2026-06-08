@@ -5,6 +5,9 @@
 #include <cstring>
 #include <shlobj.h>
 #include <tlhelp32.h>
+#include <pdh.h>
+#include <vector>
+#pragma comment(lib, "pdh.lib")
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
 // ZmSingleInstance
@@ -472,4 +475,96 @@ std::wstring ZmSystem::GetCurrentProcessPath()
     // 传入 NULL 表示获取当前进程的主模块路径（即 exe 自身）
     GetModuleFileNameW(NULL, buf, MAX_PATH);
     return buf;
+}
+
+// ============================================================================
+// 系统负载
+// ============================================================================
+
+#include <thread>
+#include <chrono>
+
+ZmSystemLoad ZmSystem::GetSystemLoad()
+{
+    ZmSystemLoad load = {};
+
+    // --- CPU ---
+    // 两次采样间隔 100ms 计算差值
+    static thread_local FILETIME s_lastIdle = {}, s_lastKernel = {}, s_lastUser = {};
+    static thread_local bool s_firstCall = true;
+
+    FILETIME idle, kernel, user;
+    if (GetSystemTimes(&idle, &kernel, &user))
+    {
+        if (!s_firstCall)
+        {
+            auto toU64 = [](const FILETIME& ft) -> uint64_t {
+                return ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+            };
+            uint64_t dIdle   = toU64(idle)   - toU64(s_lastIdle);
+            uint64_t dKernel = toU64(kernel) - toU64(s_lastKernel);
+            uint64_t dUser   = toU64(user)   - toU64(s_lastUser);
+            uint64_t dTotal  = dKernel + dUser;
+            if (dTotal > 0)
+                load.cpu_percent = (double)(dTotal - dIdle) * 100.0 / (double)dTotal;
+        }
+        s_lastIdle   = idle;
+        s_lastKernel = kernel;
+        s_lastUser   = user;
+        s_firstCall  = false;
+    }
+
+    // --- 内存 ---
+    MEMORYSTATUSEX mem = { sizeof(mem) };
+    if (GlobalMemoryStatusEx(&mem))
+    {
+        load.total_memory_mb = mem.ullTotalPhys / (1024 * 1024);
+        uint64_t availMB     = mem.ullAvailPhys / (1024 * 1024);
+        load.used_memory_mb  = load.total_memory_mb - availMB;
+        load.memory_percent  = (double)load.used_memory_mb * 100.0 / (double)load.total_memory_mb;
+    }
+
+    // --- GPU（PDH 性能计数器，不可用时静默回退）---
+    load.has_gpu     = false;
+    load.gpu_percent = -1.0;
+
+    // 枚举 \GPU Engine(*)\Utilization Percentage 计数器，取最大值
+    HQUERY hQuery = nullptr;
+    HCOUNTER hCounter = nullptr;
+    PDH_STATUS pdhStatus = PdhOpenQueryW(nullptr, 0, &hQuery);
+    if (pdhStatus == ERROR_SUCCESS)
+    {
+        // 获取 GPU 引擎计数器列表（通配符路径，让 PDH 展开所有实例）
+        pdhStatus = PdhAddCounterW(hQuery, L"\\GPU Engine(*)\\Utilization Percentage", 0, &hCounter);
+        if (pdhStatus == ERROR_SUCCESS)
+        {
+            PdhCollectQueryData(hQuery);
+            // 需要两次采集才能拿到有效值
+            Sleep(100);
+            PdhCollectQueryData(hQuery);
+
+            DWORD bufSize = 0, itemCount = 0;
+            PdhGetFormattedCounterArrayW(hCounter, PDH_FMT_DOUBLE, &bufSize, &itemCount, nullptr);
+            if (bufSize > 0)
+            {
+                std::vector<BYTE> buf(bufSize);
+                auto* items = (PDH_FMT_COUNTERVALUE_ITEM_W*)buf.data();
+                if (PdhGetFormattedCounterArrayW(hCounter, PDH_FMT_DOUBLE, &bufSize, &itemCount, items) == ERROR_SUCCESS)
+                {
+                    // 遍历所有 GPU 引擎实例，取最大利用率
+                    double maxUtil = 0.0;
+                    for (DWORD i = 0; i < itemCount; i++)
+                    {
+                        if (items[i].FmtValue.doubleValue > maxUtil)
+                            maxUtil = items[i].FmtValue.doubleValue;
+                    }
+                    load.has_gpu     = true;
+                    load.gpu_percent = maxUtil;
+                }
+            }
+        }
+        PdhCloseQuery(hQuery);
+    }
+
+    return load;
 }
