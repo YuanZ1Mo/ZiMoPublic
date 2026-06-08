@@ -313,7 +313,7 @@ int ZmHttpRouter::ExecuteChain(ZmHttpdTask* task, const BYTE* data, size_t dlen,
         int  depth = 0;
         bool shortCircuited = false;
         int  handlerResult = 0;
-        static constexpr int MAX_DEPTH = 64;  ///< 防止中间件递归死循环导致栈溢出
+        enum : int { MAX_DEPTH = 64 };  ///< 防止中间件递归死循环导致栈溢出
     };
     auto frame = std::make_shared<ChainFrame>();
 
