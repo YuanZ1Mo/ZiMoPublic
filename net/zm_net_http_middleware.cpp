@@ -23,7 +23,7 @@ ZmHttpRouter::Middleware ZmHttpMiddlewareLogging()
 
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
-        PUBLIC_LOG_INFO("HTTP {} {} → {}ms", method, uri, ms);
+        PUBLIC_LOG_INFO("[#{}] HTTP {} {} → {}ms", task->Id(), method, uri, ms);
     };
 }
 
@@ -36,8 +36,8 @@ ZmHttpRouter::Middleware ZmHttpMiddlewareRecovery()
         }
         catch (const std::exception& e)
         {
-            PUBLIC_LOG_ERROR("HTTP 请求异常: {}，URI: {}",
-                e.what(), task->Uri() ? task->Uri() : "(null)");
+            PUBLIC_LOG_ERROR("[#{}] HTTP 请求异常: {}，URI: {}",
+                task->Id(), e.what(), task->Uri() ? task->Uri() : "(null)");
             // 清空 handler 可能已部分写入的脏数据
             task->ClearReplyBody();
             task->PutReplyHeader("Content-type", "application/json; charset=utf-8");

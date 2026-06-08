@@ -11,6 +11,7 @@
 #include "../spdlog/zm_logger.h"
 
 #include <event2/bufferevent.h>
+#include <atomic>
 
 
 
@@ -342,7 +343,10 @@ int ZmHttpUtil::ParseStatusCode(const char* statusLine, const char* limit)
 
 // ============================ ZmHttpdTask ============================
 
-ZmHttpdTask::ZmHttpdTask(struct evhttp_request* request) : m_request(request), m_status_code(0)
+/** @brief 全局请求 ID 计数器，线程安全自增 */
+static std::atomic<uint64_t> g_httpd_task_id{0};
+
+ZmHttpdTask::ZmHttpdTask(struct evhttp_request* request) : m_request(request), m_status_code(0), m_id(++g_httpd_task_id)
 {
     const struct evhttp_uri* uri = evhttp_request_get_evhttp_uri(request);
     if (uri)
@@ -410,6 +414,11 @@ ev_uint16_t ZmHttpdTask::Port()
         evhttp_connection_get_peer(con, &address, &port);
     }
     return port;
+}
+
+uint64_t ZmHttpdTask::Id()
+{
+    return m_id;
 }
 
 const char* ZmHttpdTask::GetQueryValue(const char* name, const char* defv)
@@ -544,6 +553,10 @@ public:
         }
         evhttp_send_reply(m_request, m_status_code, m_reason.empty() ? NULL : m_reason.c_str(), m_reply_buf);
 
+        // 打印响应返回日志，包含追踪 ID 便于关联请求和响应
+        PUBLIC_LOG_INFO("[响应#{}] ← {} {}", m_id, m_status_code,
+            m_reason.empty() ? "(no reason)" : m_reason.c_str());
+
         // 创建 1 秒一次性定时器，到期后由 OnEvent_Timer 回调触发 SendReplyEnd
         struct timeval tv = { 1, 0 };
         if (m_remove_event)
@@ -590,41 +603,6 @@ private:
     /** @brief 响应发送后的延迟释放定时器事件 */
     struct event* m_remove_event;
 };
-
-/**
- * @brief 将 HTTP 请求信息格式化输出到日志（当前日志输出已注释）
- * @param req  libevent HTTP 请求对象
- *
- * @note 此函数为 cpp 内部使用的调试辅助函数
- */
-static void YDumpHttpRequest(const struct evhttp_request* req)
-{
-    const char* method = NULL;
-    switch (evhttp_request_get_command(req))
-    {
-    case EVHTTP_REQ_GET:        method = "GET";        break;
-    case EVHTTP_REQ_POST:       method = "POST";       break;
-    case EVHTTP_REQ_HEAD:       method = "HEAD";       break;
-    case EVHTTP_REQ_PUT:        method = "PUT";        break;
-    case EVHTTP_REQ_DELETE:     method = "DELETE";     break;
-    case EVHTTP_REQ_OPTIONS:    method = "OPTIONS";    break;
-    case EVHTTP_REQ_TRACE:      method = "TRACE";      break;
-    case EVHTTP_REQ_CONNECT:    method = "CONNECT";    break;
-    case EVHTTP_REQ_PATCH:      method = "PATCH";      break;
-    default:                    method = "unknown";    break;
-    }
-
-    struct evkeyvalq* headers = evhttp_request_get_input_headers(const_cast<struct evhttp_request*>(req));
-    int i = 1;
-    for (struct evkeyval* header = headers->tqh_first; header; header = header->next.tqe_next, i++)
-    {
-    }
-
-    struct evbuffer* inbuf = evhttp_request_get_input_buffer((evhttp_request*)req);
-    size_t           dlen = evbuffer_get_length(inbuf);
-    ZmByteBuffer buf(dlen, evbuffer_pullup(inbuf, dlen));
-}
-
 
 ZmHttpHead::ZmHttpHead() : _entries(16)
 {
@@ -865,7 +843,23 @@ void ZmHttpServer::Perform(ZmHttpdTask* task)
         }
     }
 
-    YDumpHttpRequest(task->Request());
+    // 打印请求接收日志，包含追踪 ID 便于关联请求和响应
+    {
+        const char* method = nullptr;
+        switch (task->Method())
+        {
+        case EVHTTP_REQ_GET:     method = "GET";     break;
+        case EVHTTP_REQ_POST:    method = "POST";    break;
+        case EVHTTP_REQ_PUT:     method = "PUT";     break;
+        case EVHTTP_REQ_DELETE:  method = "DELETE";  break;
+        case EVHTTP_REQ_OPTIONS: method = "OPTIONS"; break;
+        case EVHTTP_REQ_PATCH:   method = "PATCH";   break;
+        case EVHTTP_REQ_HEAD:    method = "HEAD";    break;
+        default:                 method = "UNKNOWN"; break;
+        }
+        PUBLIC_LOG_INFO("[请求#{}] → {} {} 来自 {}", task->Id(), method,
+            task->Uri() ? task->Uri() : "(null)", task->Ip() ? task->Ip() : "(null)");
+    }
 
     // 自动添加 CORS 跨域响应头，允许所有来源访问
     task->PutReplyHeader("Access-Control-Allow-Origin", "*");

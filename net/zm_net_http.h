@@ -19,6 +19,8 @@
 #include "../util/zm_util_str.h"
 #include "../util/zm_util_thread.h"
 
+#include <stdint.h>
+
 #include <event2/http.h>
 #include <event2/keyvalq_struct.h>
 #include <event2/event.h>
@@ -184,6 +186,9 @@ public:
     const char* Ip();
     ev_uint16_t Port();
 
+    /** @brief 获取请求的唯一追踪 ID（自增序号，从 1 开始，进程内唯一） */
+    uint64_t    Id();
+
     /**
      * @brief 获取 URI query string 中指定参数的值
      * @param name   参数名
@@ -266,6 +271,9 @@ public:
 protected:
     /** @brief 底层 libevent HTTP 请求对象 */
     struct evhttp_request*              m_request;
+
+    /** @brief 请求追踪 ID（构造时自增分配，进程内唯一，用于日志关联请求和响应） */
+    uint64_t                            m_id;
 
     /** @brief URI query string 解析后的键值对表（由 evhttp_parse_query_str 填充） */
     struct evkeyvalq                    m_query;

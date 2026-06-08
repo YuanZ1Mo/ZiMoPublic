@@ -7,6 +7,7 @@
 ZmTapDelegateJRPC::ZmTapDelegateJRPC()
     : ZmTapDelegate()
 {
+    TapDelegateName("ZmTapDelegateJRPC");
 }
 
 ZmTapDelegateJRPC::~ZmTapDelegateJRPC()
@@ -152,16 +153,16 @@ void ZmTapDelegateJRPC::WriteResponse(ZM_TAP_CTX* tap, const char* json_str, siz
     iov[1].iov_base = (void*)json_str;
     iov[1].iov_len = data_len;
 
-    // evbuffer_add_iovec 返回 size_t，但 JRPC 响应体大小有限（<4MB），int 足够容纳
-    int ret = (int)evbuffer_add_iovec(bufferevent_get_output(tap->requester_bev), iov, 2);
-    if (ret != 0)
+    // evbuffer_add_iovec 成功返回写入字节数，失败返回 -1
+    int ret = evbuffer_add_iovec(bufferevent_get_output(tap->requester_bev), iov, 2);
+    if (ret < 0)
     {
         PUBLIC_LOG_ERROR("evbuffer_add_iovec failed, TAP:{}, ret:{}", (void*)tap, ret);
     }
     ret = bufferevent_flush(tap->requester_bev, EV_WRITE, BEV_FLUSH);
-    if (ret != 1)
+    if (ret < 0)
     {
-        PUBLIC_LOG_ERROR("bufferevent_flush success, TAP:{}, ret:{}", (void*)tap, ret);
+        PUBLIC_LOG_ERROR("bufferevent_flush failed, TAP:{}, ret:{}", (void*)tap, ret);
     }
     ZmTapContext::SetDropTimer(tap, 30);
 }
