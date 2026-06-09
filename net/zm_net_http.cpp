@@ -508,6 +508,11 @@ public:
         m_reply_event = event_new(m_httpd->EventBase(), -1, EV_PERSIST | EV_READ,
             ZmHttpServer::OnEvent_Control, this);
         event_add(m_reply_event, NULL);
+
+        // 设置延迟回复回调：异步处理完成后由业务层调用 SendDeferredReply() 触发
+        SetDeferredReplyCallback([this] {
+            event_active(m_reply_event, ZmHttpServer::ZM_HTTPD_CONTROL_REPLY, 0);
+        });
     }
 
     /**
@@ -590,7 +595,9 @@ public:
     void Process()
     {
         m_httpd->Perform(this);
-        event_active(m_reply_event, ZmHttpServer::ZM_HTTPD_CONTROL_REPLY, 0);
+        // 若业务层调用了 DeferReply()，跳过自动回复，等待 SendDeferredReply() 异步触发
+        if (!m_deferred)
+            event_active(m_reply_event, ZmHttpServer::ZM_HTTPD_CONTROL_REPLY, 0);
     }
 
 private:
@@ -1107,6 +1114,11 @@ void ZmJsonRpcServer::SetJsonRpcCBEx(OnJsonRpcRequestCBEx oncall_ex)
     m_on_jsonrpc_call_ex = oncall_ex;
 }
 
+void ZmJsonRpcServer::SetJsonRpcCBAsync(OnJsonRpcRequestCBAsync oncall_async)
+{
+    m_on_jsonrpc_async = oncall_async;
+}
+
 int ZmJsonRpcServer::OnJsonRpcRequest(ZmHttpdTask* task, const char* method, const ZMJSON& params,
     ZMJSON& result, ZMJSON& error)
 {
@@ -1183,6 +1195,36 @@ int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
                 // JSON-RPC 2.0: params 必须是对象
                 errcode = -32602;
                 errmsg = "Invalid params";
+            }
+            // 异步路径优先：设置了异步回调则忽略同步回调
+            else if (m_on_jsonrpc_async)
+            {
+                // 阻止 Worker 线程自动触发 REPLY 信号，等待异步处理完成
+                task->DeferReply();
+
+                // 构造响应信封的基础部分（jsonrpc / id / method），捕获给 reply 闭包
+                ZMJSON rsp_envelope;
+                rsp_envelope["jsonrpc"] = "2.0";
+                if (!request["id"].is_null())
+                    rsp_envelope["id"] = request["id"];
+                rsp_envelope["method"] = method;
+
+                // 异步回调：业务层在完成处理后调用 reply(result, error) 发送响应
+                m_on_jsonrpc_async(task, method, params,
+                    [task, rsp_envelope](const ZMJSON& result, const ZMJSON& error) {
+                        ZMJSON rsp = rsp_envelope;
+                        if (!result.is_null()) rsp["result"] = result;
+                        if (!error.is_null())  rsp["error"] = error;
+
+                        std::string body = rsp.dump();
+                        task->SetReply(200);
+                        task->PutReplyHeader("Content-type", "application/json; charset=utf-8");
+                        task->SetReplyData((const BYTE*)body.c_str(), body.size());
+                        // 投递 REPLY 信号到 HTTP 服务器的 event loop → SendReply → evhttp_send_reply
+                        task->SendDeferredReply();
+                    });
+
+                return 200; // 异步处理中，响应稍后到达
             }
             else if (OnJsonRpcRequest(task, method.c_str(), params, rsp_result, rsp_error) < 0)
             {

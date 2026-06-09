@@ -22,7 +22,8 @@ struct ZmNetRequestItem
 {
     uint64_t                  seq_id;           ///< 请求序列号（递增，用于日志追踪）
     std::string               request_json;     ///< 请求数据字符串
-    std::promise<std::string> response_promise; ///< 响应 promise（移动语义，不可拷贝）
+    std::promise<std::string> response_promise; ///< 响应 promise（Submit 路径使用）
+    std::function<void(std::string)> direct_callback; ///< 直接响应回调（SubmitAsync 路径使用，在事件循环线程调用）
 };
 
 /**
@@ -99,7 +100,7 @@ public:
     void Close(struct event_base* evbase);
 
     /**
-     * @brief 提交请求（任意线程调用）
+     * @brief 提交请求（任意线程调用），返回 future 供同步等待
      * @param request_json 请求数据字符串
      * @return 响应的 future，调用线程通过 wait_for / get 获取结果
      *
@@ -107,6 +108,18 @@ public:
      * 提交成功后通过 event_active 唤醒事件循环线程。
      */
     std::future<std::string> Submit(const std::string& request_json);
+
+    /**
+     * @brief 提交请求并注册直接回调（任意线程调用），不阻塞任何线程
+     * @param request_json 请求数据字符串
+     * @param callback     响应回调，在事件循环线程中调用（空字符串表示错误）
+     *
+     * 与 Submit 不同，callback 直接从事件循环线程的 Drain 调用链中触发，
+     * 无需额外的等待线程。适合异步回调场景。
+     *
+     * 若通道已关闭（m_closed == true），回调在当前线程立即触发（空字符串）。
+     */
+    void SubmitAsync(const std::string& request_json, std::function<void(std::string)> callback);
 
     /**
      * @brief 排空并异步处理所有待处理请求（仅事件循环线程调用）

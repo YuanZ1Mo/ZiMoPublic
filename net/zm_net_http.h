@@ -268,7 +268,42 @@ public:
             evbuffer_drain(m_reply_buf, evbuffer_get_length(m_reply_buf));
     }
 
+    /**
+     * @brief 延迟自动回复，用于异步处理场景
+     *
+     * 调用后 ZmHttpdDoer::Process 不会自动触发 REPLY 信号。
+     * 业务层在异步处理完成后调用 SendDeferredReply() 发送响应。
+     *
+     * @note 必须在 Perform() 返回之前调用（即 OnHttpdRequest 回调内）
+     */
+    void DeferReply() { m_deferred = true; }
+
+    /**
+     * @brief 发送被延迟的 HTTP 响应
+     *
+     * 通过 event_active 将 REPLY 信号投递到 HTTP 服务器的 event loop 线程，
+     * 由 event loop 调用 SendReply() 实际发送 evhttp_send_reply。
+     *
+     * @note 可在任意线程调用（event_active 线程安全）。
+     *       调用前需确保已通过 SetReply / SetReplyData / PutReplyHeader 设置好响应内容。
+     */
+    void SendDeferredReply()
+    {
+        if (m_on_deferred_reply)
+            m_on_deferred_reply();
+    }
+
 protected:
+    /** @brief 设置延迟回复回调（由 ZmHttpdDoer 在构造时调用） */
+    void SetDeferredReplyCallback(std::function<void()> cb)
+    {
+        m_on_deferred_reply = std::move(cb);
+    }
+
+    friend class ZmHttpdDoer;
+
+    bool                  m_deferred = false;        ///< 是否延迟自动回复
+    std::function<void()> m_on_deferred_reply;       ///< 延迟回复信号回调
     /** @brief 底层 libevent HTTP 请求对象 */
     struct evhttp_request*              m_request;
 
@@ -560,6 +595,25 @@ public:
         ZMJSON&, ZMJSON&)> OnJsonRpcRequestCB;
 
     /**
+     * @brief JSON-RPC 异步请求处理回调（优先级最高）
+     * @param task    请求上下文对象
+     * @param method  RPC 方法名
+     * @param params  RPC 参数对象
+     * @param reply   响应回调，业务层处理完成后调用 reply(result, error) 发送响应
+     *
+     * 与同步回调不同，本回调立即返回（不阻塞 Worker 线程）。业务层在异步处理
+     * 完成后调用 reply 函数，reply 内部构造 JSON-RPC 2.0 响应并通过
+     * SendDeferredReply 发送回 HTTP 客户端。
+     *
+     * @note 设置了异步回调后，同步回调（CBEx / CB）被忽略。
+     * @note reply 可在任意线程调用（内部通过 event_active 安全投递到 HTTP event loop）。
+     */
+    typedef std::function<void(ZmHttpdTask* task, const std::string& method,
+        const ZMJSON& params,
+        std::function<void(const ZMJSON& result, const ZMJSON& error)> reply)>
+        OnJsonRpcRequestCBAsync;
+
+    /**
      * @brief 构造 JSON-RPC 服务器
      * @param root_uri     RPC 请求的 URI 前缀，仅匹配此前缀的请求走 RPC 流程，为空或 NULL 时所有请求走 RPC
      * @param local_port   监听端口号
@@ -595,6 +649,16 @@ public:
      * @note 同时设置了 CBEx 和 CB 时，优先使用 CBEx
      */
     void SetJsonRpcCBEx(OnJsonRpcRequestCBEx oncall_ex);
+
+    /**
+     * @brief 设置 JSON-RPC 异步请求回调（优先级最高）
+     * @param oncall_async  异步回调函数
+     *
+     * @note 设置后同步回调（CBEx / CB）被忽略，所有匹配 root_uri 的请求走异步路径。
+     *       异步回调中业务层调用 reply(result, error) 发送响应，框架自动构造
+     *       JSON-RPC 2.0 标准响应信封并通过 task->SendDeferredReply() 发送。
+     */
+    void SetJsonRpcCBAsync(OnJsonRpcRequestCBAsync oncall_async);
 
 protected:
     /**
@@ -635,6 +699,9 @@ private:
 
     /** @brief JSON-RPC 请求回调（带 task 参数，优先使用） */
     OnJsonRpcRequestCBEx    m_on_jsonrpc_call_ex;
+
+    /** @brief JSON-RPC 异步请求回调（优先级最高，设置后忽略同步回调） */
+    OnJsonRpcRequestCBAsync m_on_jsonrpc_async;
 
     /** @brief RPC 请求的 URI 前缀，匹配此前缀的请求走 RPC 流程 */
     char                    m_root_uri[128];

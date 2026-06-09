@@ -49,13 +49,18 @@ void ZmNetRequestChannel::Close(struct event_base* evbase)
 
         for (auto& req : m_queue)
         {
-            try
+            if (req->direct_callback)
             {
-                req->response_promise.set_value(std::string());
+                // SubmitAsync 路径：直接回调通知错误
+                req->direct_callback(std::string());
             }
-            catch (const std::future_error&)
+            else
             {
-                // promise 已被设置（不应发生，兜底）
+                try
+                {
+                    req->response_promise.set_value(std::string());
+                }
+                catch (const std::future_error&) {}
             }
         }
         m_queue.clear();
@@ -108,6 +113,28 @@ std::future<std::string> ZmNetRequestChannel::Submit(const std::string& request_
     return future;
 }
 
+void ZmNetRequestChannel::SubmitAsync(const std::string& request_json,
+                                       std::function<void(std::string)> callback)
+{
+    auto req = std::make_shared<ZmNetRequestItem>();
+    req->seq_id = m_seq.fetch_add(1, std::memory_order_relaxed);
+    req->request_json = request_json;
+    req->direct_callback = std::move(callback);
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_closed)
+        {
+            req->direct_callback(std::string());
+            return;
+        }
+        m_queue.push_back(std::move(req));
+    }
+
+    if (m_notifyEvent)
+        event_active(m_notifyEvent, 0, 0);
+}
+
 void ZmNetRequestChannel::Drain()
 {
     // 原子地取出所有待处理请求（交换 deque 避免长期持锁）
@@ -123,20 +150,31 @@ void ZmNetRequestChannel::Drain()
     for (auto& req : pending)
     {
         // 按值捕获 shared_ptr 确保异步回调触发前 ZmNetRequestItem 存活
-        // shared_ptr 可拷贝，满足 std::function 的 CopyConstructible 要求
         auto requestJson = req->request_json;
 
-        m_handler(requestJson,
-            [req](std::string response) {
-                try
-                {
-                    req->response_promise.set_value(std::move(response));
-                }
-                catch (const std::future_error&)
-                {
-                    // promise 已被设置（如通道关闭），忽略
-                }
-            });
+        if (req->direct_callback)
+        {
+            // SubmitAsync 路径：直接回调（在事件循环线程中触发，零额外线程）
+            // 用 shared_ptr 包装避免 move-only lambda 导致 std::function 构造失败
+            auto direct_cb = std::make_shared<std::function<void(std::string)>>(
+                std::move(req->direct_callback));
+            m_handler(requestJson,
+                [direct_cb](std::string response) {
+                    (*direct_cb)(std::move(response));
+                });
+        }
+        else
+        {
+            // Submit 路径：通过 promise/future 通知等待线程
+            m_handler(requestJson,
+                [req](std::string response) {
+                    try
+                    {
+                        req->response_promise.set_value(std::move(response));
+                    }
+                    catch (const std::future_error&) {}
+                });
+        }
     }
 }
 
