@@ -1139,8 +1139,8 @@ int ZmJsonRpcServer::OnJsonRpcRequest(ZmHttpdTask* task, const char* method, con
 */
 int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t dlen)
 {
-    // URI 不以 root_uri 开头时，回退到父类的通用 HTTP 请求处理
-    if (ZmString::IsEmpty(m_root_uri) || !ZmString::StartsWith(task->Uri(), m_root_uri))
+    // 暂定JRPC请求的rui一律使用完全匹配
+    if (ZmString::IsEmpty(m_root_uri) || !ZmString::Equals(task->Uri(), m_root_uri))
     {
         return ZmHttpServer::OnHttpdRequest(task, data, dlen);
     }
