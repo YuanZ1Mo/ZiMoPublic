@@ -451,7 +451,7 @@ void ZmTapHubProxy::OnProtocolDetectReadCB(struct bufferevent* bev, void* ctx)
     unsigned char* head = evbuffer_pullup(input, 4);
     if (!head)
     {
-        self->TapContext()->Drop(tap, "Probe pullup failed");
+        tap->Drop("Probe pullup failed");
         return;
     }
 
@@ -461,7 +461,7 @@ void ZmTapHubProxy::OnProtocolDetectReadCB(struct bufferevent* bev, void* ctx)
         if (!self->m_delegate_jrpc)
         {
             PUBLIC_LOG_ERROR("JRPC protocol detected but delegate not set, dropping Tap: {}", (void*)tap);
-            self->TapContext()->Drop(tap, "JRPC delegation not set");
+            tap->Drop("JRPC delegation not set");
             return;
         }
 
@@ -473,7 +473,7 @@ void ZmTapHubProxy::OnProtocolDetectReadCB(struct bufferevent* bev, void* ctx)
     else
     {
         PUBLIC_LOG_INFO("Unrecognized protocol magic in probe, dropping Tap: {}", (void*)tap);
-        self->TapContext()->Drop(tap, "Unrecognized message type");
+        tap->Drop("Unrecognized message type");
         return;
     }
 
@@ -493,7 +493,11 @@ void ZmTapHubProxy::OnProtocolDetectEventCB(struct bufferevent* bev, short event
     {
         PUBLIC_LOG_INFO("Probe connection closed/error, dropping Tap: {}", (void*)tap);
         tap->delegate->OnTapRequesterEvent(tap, bev, events);
-        tap->Drop("Probe connection closed");
+
+        if (ZmTapContext::IsBackChainEmpty(tap))
+        {
+            tap->Drop("Probe connection closed");
+        }
     }
 }
 
@@ -514,7 +518,7 @@ void ZmTapHubProxy::SwitchDelegate(ZM_TAP_CTX* tap, ZmTapDelegate* new_delegate)
     // 替换回调为标准读写回调
     bufferevent_setcb(tap->requester_bev,
         ZmTapContextEventHandler::OnRequesterReadCB,
-        NULL,
+        nullptr,
         ZmTapContextEventHandler::OnRequesterEventCB,
         tap);
     bufferevent_setwatermark(tap->requester_bev, EV_READ, 0, ZM_BUF_WATERMARK_HIGH);

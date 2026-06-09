@@ -385,7 +385,7 @@ void ZmTapContext::EvDnsResolve(ZM_TAP_CTX* tap, const char* hostname, uint16_t 
 
     if (!tap->dns_request)
     {
-        // evdns_getaddrinfo 返回 NULL 表示立即完成了（命中缓存/hosts/或出错）
+        // evdns_getaddrinfo 返回 nullptr 表示立即完成了（命中缓存/hosts/或出错）
         // 此时回调已在 evdns_getaddrinfo 内部被同步调用
         PUBLIC_LOG_INFO("Tap: {}, EvDnsResolve completed immediately (cached or error)", (void*)tap);
     }
@@ -451,11 +451,11 @@ ZmTapDelegate* ZmTapContext::BackChainPop(ZM_TAP_CTX* tap, bool remove)
         ZmTapDelegate* delegate = tap->onback_chains[i];
         if (delegate)
         {
-            if (remove) { tap->onback_chains[i] = NULL; }
+            if (remove) { tap->onback_chains[i] = nullptr; }
             return delegate;
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 void ZmTapContext::BackChainPush(ZM_TAP_CTX* tap, ZmTapDelegate* delegate)
@@ -464,7 +464,7 @@ void ZmTapContext::BackChainPush(ZM_TAP_CTX* tap, ZmTapDelegate* delegate)
     {
         for (int i = 0; i < ZM_TAP_DELEGATE_CHAIN_MAX; i++)
         {
-            if (NULL == tap->onback_chains[i])
+            if (nullptr == tap->onback_chains[i])
             {
                 tap->onback_chains[i] = delegate;
                 break;
@@ -473,6 +473,18 @@ void ZmTapContext::BackChainPush(ZM_TAP_CTX* tap, ZmTapDelegate* delegate)
     }
 }
 
+bool ZmTapContext::IsBackChainEmpty(ZM_TAP_CTX* tap)
+{
+    for (int i = (ZM_TAP_DELEGATE_CHAIN_MAX - 1); i >= 0; i--)
+    {
+        ZmTapDelegate* delegate = tap->onback_chains[i];
+        if (delegate)
+        {
+            return false;
+        }
+    }
+    return true;
+}
 
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
@@ -494,7 +506,7 @@ void ZmTapDelegate::StartTapDelegate(struct event_base* evbase, int mode)
         {
             m_evdelegate = event_new(m_evbase, -1, EV_PERSIST | EV_READ, ZmTapContextEventHandler::OnTapDelegateEventCB, this);
         }
-        event_add(m_evdelegate, NULL);
+        event_add(m_evdelegate, nullptr);
     }
 }
 
@@ -502,10 +514,10 @@ void ZmTapDelegate::StartTapDelegate(struct event_base* evbase, int mode)
 void ZmTapDelegate::StopTapDelegate()
 {
     OnStopTap();
-    if (NULL != m_evdelegate)
+    if (nullptr != m_evdelegate)
     {
         event_free(m_evdelegate);
-        m_evdelegate = NULL;
+        m_evdelegate = nullptr;
     }
 }
 
@@ -523,7 +535,6 @@ void ZmTapDelegate::SetEvDns(evdns_base* evdnsbase)
 {
     m_evdnsbase = evdnsbase;
 }
-
 
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
@@ -637,7 +648,7 @@ void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* li
             if (!delegate->IsCallbackSelfManaged())
             {
                 /**分配读/写回调*/
-                bufferevent_setcb(tap->requester_bev, ZmTapContextEventHandler::OnRequesterReadCB, NULL, ZmTapContextEventHandler::OnRequesterEventCB, tap);
+                bufferevent_setcb(tap->requester_bev, ZmTapContextEventHandler::OnRequesterReadCB, nullptr, ZmTapContextEventHandler::OnRequesterEventCB, tap);
                 bufferevent_enable(tap->requester_bev, EV_READ | EV_WRITE);
                 bufferevent_setwatermark(tap->requester_bev, EV_READ, 0, ZM_BUF_WATERMARK_HIGH);
             }
@@ -714,7 +725,7 @@ bool ZmTapContextEventHandler::OnPairAcceptConn(void* ctx, evutil_socket_t fd)
         if (!delegate->IsCallbackSelfManaged())
         {
             /**分配读/写回调*/
-            bufferevent_setcb(tap->requester_bev, ZmTapContextEventHandler::OnRequesterReadCB, NULL, ZmTapContextEventHandler::OnRequesterEventCB, tap);
+            bufferevent_setcb(tap->requester_bev, ZmTapContextEventHandler::OnRequesterReadCB, nullptr, ZmTapContextEventHandler::OnRequesterEventCB, tap);
             bufferevent_enable(tap->requester_bev, EV_READ | EV_WRITE);
             bufferevent_setwatermark(tap->requester_bev, EV_READ, 0, ZM_BUF_WATERMARK_HIGH);
         }
@@ -738,21 +749,25 @@ void ZmTapContextEventHandler::OnRequesterEventCB(struct bufferevent* requester_
             // needs callback before release
             if (tap->delegate)
             {
-                /** 尝试处理未读取数据 */
-                size_t applen = ZmTapContext::RequesterInputLen(tap);
-                if (applen > 0)
-                {
-                    tap->delegate->OnTapRequesterRead(tap, bufferevent_get_input(tap->requester_bev), applen);
-                }
+                ///** 尝试处理未读取数据 */
+                //size_t applen = ZmTapContext::RequesterInputLen(tap);
+                //if (applen > 0)
+                //{
+                //    tap->delegate->OnTapRequesterRead(tap, bufferevent_get_input(tap->requester_bev), applen);
+                //}
 
                 tap->delegate->OnTapRequesterEvent(tap, requester_bev, events);
             }
-            // force close tunnel while EOF/ERROR occurs on app end.
-            tap->Drop("force close tunnel while EOF/ERROR occurs on app end");
+
+            if (ZmTapContext::IsBackChainEmpty(tap))
+            {
+                // force close tunnel while EOF/ERROR occurs on app end.
+                tap->Drop("force close tunnel while EOF/ERROR occurs on app end");
+            }
         }
         else if (events & BEV_EVENT_CONNECTED)
         {
-            bufferevent_setcb(requester_bev, ZmTapContextEventHandler::OnRequesterReadCB, NULL, ZmTapContextEventHandler::OnRequesterEventCB, tap);
+            bufferevent_setcb(requester_bev, ZmTapContextEventHandler::OnRequesterReadCB, nullptr, ZmTapContextEventHandler::OnRequesterEventCB, tap);
             bufferevent_enable(requester_bev, EV_READ | EV_WRITE);
             bufferevent_setwatermark(requester_bev, EV_READ, 0, ZM_BUF_WATERMARK_HIGH);
             if (tap->delegate)

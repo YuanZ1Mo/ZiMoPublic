@@ -176,6 +176,8 @@ public:
     static ZmTapDelegate* BackChainPop(ZM_TAP_CTX* tap, bool remove = true);
     /** @brief 向回传链压入一个 delegate（去重） */
     static void BackChainPush(ZM_TAP_CTX* tap, ZmTapDelegate* delegate);
+    /** @brief 判断回传链是否为空 */
+    static bool IsBackChainEmpty(ZM_TAP_CTX* tap);
 
 private:
     /** @brief 分配并初始化一个新的 ZM_TAP_CTX */

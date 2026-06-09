@@ -172,5 +172,10 @@ void ZmTapDelegateJRPC::WriteResponse(ZM_TAP_CTX* tap, const char* json_str, siz
     {
         PUBLIC_LOG_ERROR("bufferevent_flush failed, TAP:{}, ret:{}", (void*)tap, ret);
     }
-    ZmTapContext::SetDropTimer(tap, 30);
+
+    //保证没有链式回调的情况下再回收,若此次连接发生EOF/ERROR 则ZmTapContextEventHandler::OnRequesterEventCB立即回收
+    if (ZmTapContext::IsBackChainEmpty(tap))
+    {
+        ZmTapContext::SetDropTimer(tap, 30);
+    }
 }
