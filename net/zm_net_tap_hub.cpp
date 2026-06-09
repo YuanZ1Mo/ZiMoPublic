@@ -271,9 +271,9 @@ uint16_t ZmTapHubProxy::AddListenPort(uint16_t port, const char* host, ZM_HUB_PR
 
     evconnlistener_cb cb = nullptr;
 
-    // 回调分类（预留 SOCK5 等协议扩展）
-    //if (type == PROXY_PORT_SOCK5) {
-    //    cb = ZmTapContextEventHandler::OnRequesterSOCK5AcceptConnCB;
+    // 回调分类（预留 SOCKS5 等协议扩展）
+    //if (type == PROXY_PORT_SOCKS5) {
+    //    cb = ZmTapContextEventHandler::OnRequesterSOCKS5AcceptConnCB;
     //}
 
     char pstr[16] = { 0 };

@@ -1,6 +1,9 @@
 #ifndef ZM_NET_TAP_H
 #define ZM_NET_TAP_H
 
+/** @brief bufferevent 创建选项：关闭时释放 fd、延迟回调、线程安全 */
+#define ZM_EVENT_BEV_OPTIONS BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_THREADSAFE
+
 #include "zm_net_http.h"
 
 #include <atomic>
@@ -291,6 +294,13 @@ public:
      *  @note  必须在事件循环线程中调用
      *  @note  一般由HUB回调,所以使用HUB的evtbase和context池 */
     static bool OnPairAcceptConn(void* ctx, evutil_socket_t fd);
+    /** @brief 接受 bufferevent 注入 — OnPairAcceptConn 的变体，用于已创建的 bufferevent（如 bufferevent_pair）
+     *  @param ctx Hub 代理 delegate
+     *  @param bev 已创建的 bufferevent（如 bufferevent_pair 的一端），成功后由 TAP 接管生命周期
+     *  @return true 成功创建 TAP 并触发协议探测，false 失败（bev 已释放）
+     *  @note  必须在事件循环线程中调用
+     *  @note  用于进程内零拷贝通信，bev 无需关联 socket fd */
+    static bool OnPairAcceptBev(void* ctx, struct bufferevent* bev);
     static void OnRequesterEventCB(struct bufferevent* requester_bev, short events, void* ctx);
     static void OnRequesterReadCB(struct bufferevent* requester_bev, void* ctx);
     static void OnRequesterWriteCB(struct bufferevent* requester_bev, void* ctx);

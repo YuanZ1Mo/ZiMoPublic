@@ -4,7 +4,6 @@
 #include "zm_net_dns.h"
 #include "../spdlog/zm_logger.h"
 
-#define ZM_EVENT_BEV_OPTIONS        BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS|BEV_OPT_THREADSAFE
 
 
 void ZM_TAP_CTX::Clear()
@@ -733,6 +732,73 @@ bool ZmTapContextEventHandler::OnPairAcceptConn(void* ctx, evutil_socket_t fd)
     else
     {
         context->Drop(tap, "OnPairAcceptConn: delegate accept failed");
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * @brief 接受 bufferevent 注入 — OnPairAcceptConn 的变体，用于已创建的 bufferevent
+ *
+ * 与 OnPairAcceptConn 流程一致，但跳过 bufferevent_socket_new 步骤，
+ * 直接使用传入的 bufferevent（如 bufferevent_pair 的一端）作为 TAP 的 requester_bev。
+ * 用于进程内零拷贝通信，bev 无需关联 socket fd。
+ *
+ * @note 调用后 bev 由 TAP 接管生命周期（BEV_OPT_CLOSE_ON_FREE），调用者不应再操作 bev
+ */
+bool ZmTapContextEventHandler::OnPairAcceptBev(void* ctx, struct bufferevent* bev)
+{
+    ZmTapDelegate* delegate = (ZmTapDelegate*)ctx;
+
+    if (!delegate || !bev)
+    {
+        if (bev) bufferevent_free(bev);
+        return false;
+    }
+
+    ZmTapContext* context = delegate->TapContext();
+    if (!context)
+    {
+        bufferevent_free(bev);
+        return false;
+    }
+
+    // 从池中获取 TAP
+    ZM_TAP_CTX* tap = context->Get();
+    if (!tap)
+    {
+        bufferevent_free(bev);
+        return false;
+    }
+
+    // 设置 TAP 字段（IP 固定为 127.0.0.1，标记为内部通道连接）
+    tap->delegate = delegate;
+    tap->SetEventBase(delegate->TapDelegateEventBase());
+    tap->requester_bev = bev;
+    strncpy_s(tap->requester_ip, "127.0.0.1", sizeof(tap->requester_ip));
+    tap->requester_port = 0;
+    tap->state = ZM_TAP_STATE_INUSE;
+
+    // 调用 delegate 的 Accept 设置协议探测回调
+    // fd 传 -1 表示无关联 socket（bufferevent_pair 无底层 fd）
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    if (delegate->OnTapRequesterAccept(tap, -1, (struct sockaddr*)&addr))
+    {
+        if (!delegate->IsCallbackSelfManaged())
+        {
+            bufferevent_setcb(tap->requester_bev, ZmTapContextEventHandler::OnRequesterReadCB,
+                nullptr, ZmTapContextEventHandler::OnRequesterEventCB, tap);
+            bufferevent_enable(tap->requester_bev, EV_READ | EV_WRITE);
+            bufferevent_setwatermark(tap->requester_bev, EV_READ, 0, ZM_BUF_WATERMARK_HIGH);
+        }
+    }
+    else
+    {
+        context->Drop(tap, "OnPairAcceptBev: delegate accept failed");
         return false;
     }
 
