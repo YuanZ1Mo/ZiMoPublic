@@ -32,12 +32,12 @@
 #define ZM_BUF_WATERMARK_HIGH       ZM_BUF_SIZE_64K
 #define ZM_BUF_WATERMARK_LOW        ZM_BUF_SIZE_16K
 
-/** @brief TLV 扩展头结构体（SP_PACKED 紧凑布局） */
-/** TLV 扩展头结构体（SP_PACKED 紧凑布局）
+/** @brief TLV 扩展头结构体（ZM_PACKED 紧凑布局） */
+/** TLV 扩展头结构体（ZM_PACKED 紧凑布局）
  *  value[0] 为柔性数组成员，用于定位 TLV 头后的载荷数据，不占空间（sizeof=8） */
 #pragma warning(push)
 #pragma warning(disable: 4200)  // char value[0] 是 MSVC 柔性数组成员扩展，不占空间
-typedef struct SP_PACKED
+typedef struct ZM_PACKED
 {
     char     tag[4];       /** 标签标识 */
     uint32_t len;          /** 数据长度 */

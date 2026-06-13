@@ -691,7 +691,6 @@ void ZmHttpHead::Build(ZmByteBuffer& output)
     for (size_t i = 0; i < _entries.Count(); i++)
     {
         _ENTRY* e = _entries.At(i);
-        // SP_LOGT("[%ld], %s: %s", i, e->name, e->value);
         offset += snprintf(tmp.Str() + offset, tmp.Size() - offset, "%s: %s\r\n", e->name, e->value);
     }
     output.Reset(offset, tmp.Head());
@@ -702,7 +701,6 @@ void ZmHttpHead::BuildToBuffer(struct evbuffer* buf)
     for (size_t i = 0; i < _entries.Count(); i++)
     {
         _ENTRY* e = _entries.At(i);
-        // SP_LOGT("[%ld], %s: %s", i, e->name, e->value);
         evbuffer_add_printf(buf, "%s: %s\r\n", e->name, e->value);
     }
 }
@@ -753,13 +751,11 @@ const char* ZmHttpHead::Value(const char* name, const char* value)
         }
         entry->value = _strdup(value);
     }
-    //SP_LOGT("ZmHttpHead::Value count=%ld, %s=%s", (long)_entries.Count(), name, value);
     return entry ? entry->value : NULL;
 }
 
 void ZmHttpHead::Remove(const char* name)
 {
-    //SP_LOGT("ZmHttpHead::Remove count=%ld, name=%s", (long)_entries.Count(), name);
     for (size_t i = 0; i < _entries.Count(); i++)
     {
         if (0 == _stricmp(_entries.At(i)->name, name))

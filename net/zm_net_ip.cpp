@@ -407,12 +407,12 @@ uint32_t ZmNetIP::IPv4SubnetBroadcast(uint32_t subnet, uint16_t bits)
  */
 size_t ZmNetIP::GetMacAddresses(char* hwaddr, size_t capacity, const ZM_IP_ADDR* specip, int nMode)
 {
-#define _SP_FORMAT_HWADDR(str, space, addr) snprintf((str), (space), \
+#define _ZM_FORMAT_HWADDR(str, space, addr) snprintf((str), (space), \
                                                 "%02x-%02x-%02x-%02x-%02x-%02x", \
                                                 (addr)[0], (addr)[1], (addr)[2], \
                                                 (addr)[3], (addr)[4], (addr)[5])
 
-#define _SP_FORMAT_HWADDRB(str, space, addr) snprintf((str), (space), \
+#define _ZM_FORMAT_HWADDRB(str, space, addr) snprintf((str), (space), \
                                                 "%02x:%02x:%02x:%02x:%02x:%02x", \
                                                 (addr)[0], (addr)[1], (addr)[2], \
                                                 (addr)[3], (addr)[4], (addr)[5])
@@ -449,11 +449,11 @@ size_t ZmNetIP::GetMacAddresses(char* hwaddr, size_t capacity, const ZM_IP_ADDR*
                 {
                     if (nMode == 1)
                     {
-                        _SP_FORMAT_HWADDRB(hwaddr, capacity, aa->PhysicalAddress);
+                        _ZM_FORMAT_HWADDRB(hwaddr, capacity, aa->PhysicalAddress);
                     }
                     else
                     {
-                        _SP_FORMAT_HWADDR(hwaddr, capacity, aa->PhysicalAddress);
+                        _ZM_FORMAT_HWADDR(hwaddr, capacity, aa->PhysicalAddress);
                     }
 
                     return 1;
@@ -465,11 +465,11 @@ size_t ZmNetIP::GetMacAddresses(char* hwaddr, size_t capacity, const ZM_IP_ADDR*
             // 未指定 IP 时，格式化所有有效以太网网卡的 MAC 地址
             if (nMode == 1)
             {
-                offset += _SP_FORMAT_HWADDRB(hwaddr + offset, capacity - offset, aa->PhysicalAddress);
+                offset += _ZM_FORMAT_HWADDRB(hwaddr + offset, capacity - offset, aa->PhysicalAddress);
             }
             else
             {
-                offset += _SP_FORMAT_HWADDR(hwaddr + offset, capacity - offset, aa->PhysicalAddress);
+                offset += _ZM_FORMAT_HWADDR(hwaddr + offset, capacity - offset, aa->PhysicalAddress);
             }
 
             offset++;

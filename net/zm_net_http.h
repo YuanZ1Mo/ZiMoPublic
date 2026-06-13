@@ -122,7 +122,7 @@ private:
 public:
     ~ZmHttpUtil() {}
 
-    /** Parse the HTTP verbs by the method name, like as 'GET'->SP_HTTP_VERB_GET */
+    /** Parse the HTTP verbs by the method name, like as 'GET'->ZM_HTTP_VERB_GET */
     static int          ParseVerb(const char* method);
     /** Parse the HTTP request first line and return the verbs type */
     static int          StartWithVerbs(const char* buf);
