@@ -7,6 +7,7 @@
 #include "zm_net_http.h"
 
 #include <atomic>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <unordered_set>
@@ -215,6 +216,69 @@ private:
     std::vector<ZM_TAP_CTX*> m_free_stack;    /** 空闲 TAP 栈，Get/Drop 均 O(1) */
 };
 
+// ============================================================================
+// BuffereventPairPool — bufferevent_pair 对象池
+// ============================================================================
+
+class BuffereventPairPool;
+
+/** @brief 池中单个槽位，持有一对 bufferevent_pair */
+struct PairPoolSlot
+{
+    struct bufferevent*  pair[2];   ///< pair[0] 响应端，pair[1] TAP 端
+    bool                 in_use;    ///< 是否正在使用中
+    bool                 pair0_done;///< pair[0] 是否已归还
+    bool                 pair1_done;///< pair[1] 是否已归还
+    BuffereventPairPool* owner;     ///< 回指所属池，供 ReleaseHalf 归还
+};
+
+/**
+ * @brief bufferevent_pair 对象池，消除高并发下的 socketpair 系统调用和堆分配开销
+ *
+ * 预创建固定数量的 bufferevent_pair，空闲时 O(1) 获取，两端都归还后自动回收。
+ * 池耗尽时自动扩容（每次创建一个新 pair，归还后进入空闲栈复用）。
+ * 使用 std::deque 保证扩容时已外借的槽位指针不失效。
+ */
+class BuffereventPairPool
+{
+public:
+    BuffereventPairPool();
+    ~BuffereventPairPool();
+
+    /** @brief 预创建池
+     *  @param evbase   libevent 事件循环基
+     *  @param capacity 预创建 pair 数量 */
+    void Init(struct event_base* evbase, int capacity);
+
+    /** @brief 销毁池中所有 pair（含运行时扩容的） */
+    void Shutdown();
+
+    /** @brief 获取一个可用槽位（O(1) 从空闲栈弹出，池耗尽时自动扩容）
+     *  @return 槽位指针，仅在 bufferevent_pair_new 失败时返回 nullptr */
+    PairPoolSlot* Acquire();
+
+    /** @brief 归还 pair 的某一端
+     *  @param slot      槽位指针
+     *  @param is_pair1  true 表示 pair[1]（TAP 端），false 表示 pair[0]（响应端）
+     *  @note 由 FreeRequesterEnd 和 OnResponseRead/Event 调用 */
+    static void ReleaseHalf(void* slot, bool is_pair1);
+
+    /** @brief 槽位回空闲栈（由 ReleaseHalf 内部调用） */
+    void ReturnToFreeStack(PairPoolSlot* slot);
+
+private:
+    /** @brief 池耗尽时创建一个新槽位并推入空闲栈
+     *  @return true 创建成功，false bufferevent_pair_new 失败 */
+    bool Grow();
+
+    /** @brief 重置 pair 的 evbuffer 状态，清空残留数据 */
+    static void ResetPair(PairPoolSlot* slot);
+
+    struct event_base*         m_evbase;
+    std::deque<PairPoolSlot>   m_slots;          ///< 槽位队列（deque 保证 push_back 不失效已有指针）
+    std::vector<PairPoolSlot*> m_free_stack;     ///< 空闲槽位栈
+};
+
 /**
  * @brief TAP 协议委托基类，子类实现具体的协议处理逻辑
  *
@@ -285,9 +349,9 @@ public:
     /** @brief 异步写入 JSON 响应 */
     void ResponseAsync(ZM_TAP_CTX* tap, const ZMJSON& jsResponse);
     /** @brief 异步写入成功结果（自动封装 {"result":...}） */
-    void ResponseResultAsync(ZM_TAP_CTX* tap, const ZMJSON& jsResult);
+    virtual void ResponseResultAsync(ZM_TAP_CTX* tap, const ZMJSON& jsResult);
     /** @brief 异步写入错误信息（自动封装 {"error":...}） */
-    void ResponseErrorAsync(ZM_TAP_CTX* tap, const ZMJSON& jsError);
+    virtual void ResponseErrorAsync(ZM_TAP_CTX* tap, const ZMJSON& jsError);
     /** @brief 异步设置 TAP 超时定时器 */
     void SetDropTimerAsync(ZM_TAP_CTX* tap, int seconds, int micros = 0, uint32_t drop_timeout_error_code = 0);
     /** @brief 异步释放 TAP */

@@ -512,6 +512,138 @@ bool ZmTapContext::IsBackChainEmpty(ZM_TAP_CTX* tap)
 
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
+// BuffereventPairPool
+BuffereventPairPool::BuffereventPairPool() : m_evbase(nullptr) {}
+BuffereventPairPool::~BuffereventPairPool() { Shutdown(); }
+
+void BuffereventPairPool::Init(struct event_base* evbase, int capacity)
+{
+    m_evbase = evbase;
+    for (int i = 0; i < capacity; i++)
+    {
+        m_slots.emplace_back();
+        auto& slot = m_slots.back();
+        slot.pair[0] = nullptr;
+        slot.pair[1] = nullptr;
+        slot.in_use = false;
+        slot.pair0_done = false;
+        slot.pair1_done = false;
+        slot.owner = this;
+
+        struct bufferevent* p[2] = { nullptr, nullptr };
+        if (bufferevent_pair_new(m_evbase, ZM_EVENT_BEV_OPTIONS, p) == 0)
+        {
+            slot.pair[0] = p[0];
+            slot.pair[1] = p[1];
+            m_free_stack.push_back(&slot);
+        }
+    }
+    DEFAULT_LOG_INFO("BuffereventPairPool initialized: capacity={}, created={}",
+        capacity, (int)m_free_stack.size());
+}
+
+void BuffereventPairPool::Shutdown()
+{
+    for (auto& slot : m_slots)
+    {
+        if (slot.pair[0]) { bufferevent_free(slot.pair[0]); slot.pair[0] = nullptr; }
+        if (slot.pair[1]) { bufferevent_free(slot.pair[1]); slot.pair[1] = nullptr; }
+    }
+    m_free_stack.clear();
+    m_slots.clear();
+    m_evbase = nullptr;
+}
+
+PairPoolSlot* BuffereventPairPool::Acquire()
+{
+    if (m_free_stack.empty())
+    {
+        if (!Grow())
+            return nullptr;
+    }
+
+    auto* slot = m_free_stack.back();
+    m_free_stack.pop_back();
+    slot->in_use = true;
+    slot->pair0_done = false;
+    slot->pair1_done = false;
+    return slot;
+}
+
+void BuffereventPairPool::ReleaseHalf(void* slotPtr, bool is_pair1)
+{
+    if (!slotPtr) return;
+    auto* s = static_cast<PairPoolSlot*>(slotPtr);
+
+    if (is_pair1)
+        s->pair1_done = true;
+    else
+        s->pair0_done = true;
+
+    if (s->pair0_done && s->pair1_done)
+    {
+        ResetPair(s);
+        s->in_use = false;
+        if (s->owner)
+            s->owner->ReturnToFreeStack(s);
+    }
+}
+
+void BuffereventPairPool::ReturnToFreeStack(PairPoolSlot* slot)
+{
+    m_free_stack.push_back(slot);
+}
+
+bool BuffereventPairPool::Grow()
+{
+    m_slots.emplace_back();
+    auto& slot = m_slots.back();
+    slot.pair[0] = nullptr;
+    slot.pair[1] = nullptr;
+    slot.in_use = false;
+    slot.pair0_done = false;
+    slot.pair1_done = false;
+    slot.owner = this;
+
+    struct bufferevent* p[2] = { nullptr, nullptr };
+    if (bufferevent_pair_new(m_evbase, ZM_EVENT_BEV_OPTIONS, p) != 0)
+    {
+        m_slots.pop_back();
+        return false;
+    }
+    slot.pair[0] = p[0];
+    slot.pair[1] = p[1];
+    m_free_stack.push_back(&slot);
+
+    PUBLIC_LOG_INFO("BuffereventPairPool grow: total slots={}", (int)m_slots.size());
+    return true;
+}
+
+void BuffereventPairPool::ResetPair(PairPoolSlot* slot)
+{
+    // ★ 必须先 disable，否则下次 bufferevent_enable 是 no-op，
+    //    数据在 setcb 前到达时不会触发读回调，导致请求永久卡住
+    if (slot->pair[0])
+    {
+        bufferevent_disable(slot->pair[0], EV_READ | EV_WRITE);
+        struct evbuffer* input = bufferevent_get_input(slot->pair[0]);
+        struct evbuffer* output = bufferevent_get_output(slot->pair[0]);
+        if (input)  evbuffer_drain(input, evbuffer_get_length(input));
+        if (output) evbuffer_drain(output, evbuffer_get_length(output));
+        bufferevent_setcb(slot->pair[0], nullptr, nullptr, nullptr, nullptr);
+    }
+    if (slot->pair[1])
+    {
+        bufferevent_disable(slot->pair[1], EV_READ | EV_WRITE);
+        struct evbuffer* input = bufferevent_get_input(slot->pair[1]);
+        struct evbuffer* output = bufferevent_get_output(slot->pair[1]);
+        if (input)  evbuffer_drain(input, evbuffer_get_length(input));
+        if (output) evbuffer_drain(output, evbuffer_get_length(output));
+        bufferevent_setcb(slot->pair[1], nullptr, nullptr, nullptr, nullptr);
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
 // ZmTapDelegate
 ZmTapDelegate::ZmTapDelegate()
     : m_evbase(nullptr), m_evdnsbase(nullptr), m_evdelegate(nullptr), m_mode(0)
@@ -533,7 +665,6 @@ void ZmTapDelegate::StartTapDelegate(struct event_base* evbase, int mode)
         event_add(m_evdelegate, nullptr);
     }
 }
-
 
 void ZmTapDelegate::StopTapDelegate()
 {
