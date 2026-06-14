@@ -486,10 +486,11 @@ void ZmHttpdTask::SetReplyBuf(struct evbuffer* buf)
  * @brief HTTP 请求处理任务，由线程池调度执行（不再继承 ZmThread）
  *
  * 生命周期:
- *   1. 事件循环线程创建 ZmHttpdDoer 并启动工作线程
- *   2. 工作线程执行 Run() → Perform() → event_active(REPLY)
+ *   1. 事件循环线程创建 ZmHttpdDoer 并提交到线程池
+ *   2. 线程池执行 Process() → Perform() → event_active(REPLY)
  *   3. 事件循环线程收到 REPLY 信号 → SendReply() → 启动 1 秒定时器
  *   4. 定时器触发 → SendReplyEnd() → delete this
+ *   5. Perform() 异常时兜底设置 500 并触发 REPLY，确保 doer 不泄露
  *
  * @note 此类仅在 cpp 内部使用，不对外暴露
  */
@@ -594,7 +595,21 @@ public:
 public:
     void Process()
     {
-        m_httpd->Perform(this);
+        try
+        {
+            m_httpd->Perform(this);
+        }
+        catch (const std::exception& e)
+        {
+            PUBLIC_LOG_ERROR("[请求#{}] Perform 异常: {}", m_id, e.what());
+            SetReply(500, "Internal Server Error");
+        }
+        catch (...)
+        {
+            PUBLIC_LOG_ERROR("[请求#{}] Perform 未知异常", m_id);
+            SetReply(500, "Internal Server Error");
+        }
+
         // 若业务层调用了 DeferReply()，跳过自动回复，等待 SendDeferredReply() 异步触发
         if (!m_deferred)
             event_active(m_reply_event, ZmHttpServer::ZM_HTTPD_CONTROL_REPLY, 0);

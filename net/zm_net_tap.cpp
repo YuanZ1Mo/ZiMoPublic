@@ -21,6 +21,8 @@ void ZM_TAP_CTX::Clear()
     onback_dlen = 0;
     state = ZM_TAP_STATE_NONE;
     _slot = nullptr;
+    on_bev_free = nullptr;
+    bev_pool_slot = nullptr;
     drop_timeout_error_code = 0;
     requester_data_len = 0;
     requester_received_len = 0;
@@ -156,7 +158,17 @@ void ZmTapContext::Drop(ZM_TAP_CTX* tap, const char* reason)
 
 void ZmTapContext::FreeRequesterEnd(ZM_TAP_CTX* tap)
 {
-    zm_util_bufferevent_free(tap->requester_bev);
+    // 若来自 bufferevent_pair 池，通过回调归还而非直接释放
+    if (tap->on_bev_free && tap->bev_pool_slot)
+    {
+        tap->on_bev_free(tap->bev_pool_slot, true);
+        tap->bev_pool_slot = nullptr;
+        tap->on_bev_free = nullptr;
+    }
+    else
+    {
+        zm_util_bufferevent_free(tap->requester_bev);
+    }
     tap->requester_bev = nullptr;
 }
 
@@ -747,7 +759,8 @@ bool ZmTapContextEventHandler::OnPairAcceptConn(void* ctx, evutil_socket_t fd)
  *
  * @note 调用后 bev 由 TAP 接管生命周期（BEV_OPT_CLOSE_ON_FREE），调用者不应再操作 bev
  */
-bool ZmTapContextEventHandler::OnPairAcceptBev(void* ctx, struct bufferevent* bev)
+bool ZmTapContextEventHandler::OnPairAcceptBev(void* ctx, struct bufferevent* bev,
+                                                void* slot, ZmTapBevFreeCB on_bev_free)
 {
     ZmTapDelegate* delegate = (ZmTapDelegate*)ctx;
 
@@ -776,6 +789,8 @@ bool ZmTapContextEventHandler::OnPairAcceptBev(void* ctx, struct bufferevent* be
     tap->delegate = delegate;
     tap->SetEventBase(delegate->TapDelegateEventBase());
     tap->requester_bev = bev;
+    tap->bev_pool_slot = slot;
+    tap->on_bev_free = on_bev_free;
     strncpy_s(tap->requester_ip, "127.0.0.1", sizeof(tap->requester_ip));
     tap->requester_port = 0;
     tap->state = ZM_TAP_STATE_INUSE;

@@ -1,0 +1,215 @@
+#include "zm_net_runloop.h"
+
+#include "zm_logger.h"
+#include "zm_util_sys.h"
+#include "zm_util_libevent.h"
+#include "zm_net_dns.h"
+#include "zm_util_str.h"
+
+enum { CONTROL_LOOP_SUCCESS = 0x0200, };
+
+ZmEvBaseRunLoop::ZmEvBaseRunLoop(const std::string& name): ZmThread(name)
+{
+    _evbase     = nullptr;
+    _evdnsbase = nullptr;
+    _eventCtrl  = nullptr;
+    _eventTimer = nullptr;
+    _b_looped = false;
+    _b_run_finished = false;
+}
+
+ZmEvBaseRunLoop::~ZmEvBaseRunLoop()
+{
+}
+
+void ZmEvBaseRunLoop::freeEventObjects()
+{
+    DEFAULT_LOG_INFO("Free the event objects");
+
+    if (_eventCtrl)
+    {
+        event_free(_eventCtrl);
+        _eventCtrl = nullptr;
+    }
+
+    if (_evdnsbase)
+    {
+        evdns_base_free(_evdnsbase, 0);
+        _evdnsbase = nullptr;
+    }
+
+    if (_eventTimer)
+    {
+        event_free(_eventTimer);
+        _eventTimer = nullptr;
+    }
+
+    if (_evbase)
+    {
+        event_base_free(_evbase);
+        _evbase = nullptr;
+    }
+}
+
+bool ZmEvBaseRunLoop::Loop()
+{
+    std::unique_lock<std::mutex> lock(_mutex_loop);
+    if (!_b_looped)
+    {
+        Start();
+        _cv_loop.wait(lock, [this] { return _b_looped || _b_run_finished; });
+    }
+
+    return _b_looped;
+}
+
+bool ZmEvBaseRunLoop::IsLooped()
+{
+    std::unique_lock<std::mutex> lock(_mutex_loop);
+    return _b_looped;
+}
+
+void ZmEvBaseRunLoop::Control(short events)
+{
+    std::unique_lock<std::mutex> lock(_mutex_loop);
+
+    DEFAULT_LOG_INFO("Received control event: events={}", events);
+
+    if (IsRunning() || IsStopping())
+    {
+        if (_eventCtrl)
+        {
+            event_active(_eventCtrl, events, 0);
+        }
+    }
+}
+
+event_base* ZmEvBaseRunLoop::GetEventBase()
+{
+    std::unique_lock<std::mutex> lock(_mutex_loop);
+    return _evbase;
+}
+
+evdns_base* ZmEvBaseRunLoop::GetEventDnsBase()
+{
+    std::unique_lock<std::mutex> lock(_mutex_loop);
+    return _evdnsbase;
+}
+
+void ZmEvBaseRunLoop::Run()
+{
+    DEFAULT_LOG_INFO("The ZmEvBaseRunLoop is running");
+
+    zm_util_eventbase_init();
+
+    freeEventObjects();
+
+    struct event_config* cfg = event_config_new();
+    event_config_set_flag(cfg, EVENT_BASE_FLAG_STARTUP_IOCP);
+
+    _evbase = event_base_new();
+    if (nullptr != _evbase)
+    {
+        _eventCtrl = event_new(_evbase, -1, EV_PERSIST | EV_READ, ZmEvBaseRunLoop::OnEventCtrlCB, (void*)this);
+        event_add(_eventCtrl, 0);
+        event_active(_eventCtrl, CONTROL_LOOP_SUCCESS, 0);
+
+        _evdnsbase = evdns_base_new(_evbase, 0);
+
+        // 从系统获取 DNS 服务器并配置到 evdns_base，不然 evdns_getaddrinfo 无法正常工作
+        {
+            std::string dns_addrs = ZmNetDNS::GetDNSAddresses();
+            if (!dns_addrs.empty())
+            {
+                char* addrs_buf = _strdup(dns_addrs.c_str());
+                if (addrs_buf)
+                {
+                    char* cursor = addrs_buf;
+                    char* token = zm_strsep(&cursor, ",");
+                    while (token)
+                    {
+                        while (*token == ' ') token++;
+                        if (*token)
+                        {
+                            evdns_base_nameserver_ip_add(_evdnsbase, token);
+                            DEFAULT_LOG_INFO("Add DNS nameserver to evdns_base: {}", token);
+                        }
+                        token = zm_strsep(&cursor, ",");
+                    }
+                    free(addrs_buf);
+                }
+            }
+        }
+
+        // EV_PERSIST保证定时器循环触发
+        _eventTimer = event_new(_evbase, -1, EV_TIMEOUT | EV_PERSIST, ZmEvBaseRunLoop::OnTimerCB, this);
+        timeval timer_second = { ZM_DOCK_HEARTBEAT_SEC, 0 };
+        event_add(_eventTimer, &timer_second);
+
+        // #define EVLOOP_ONCE              0x01
+        // #define EVLOOP_NONBLOCK          0x02
+        // #define EVLOOP_NO_EXIT_ON_EMPTY  0x04
+        int ret = event_base_loop(_evbase, EVLOOP_NO_EXIT_ON_EMPTY);
+        DEFAULT_LOG_INFO("ZmEvBaseRunLoop is exited ret:{}, unexpected:{}", ret, (0 == event_base_got_exit(_evbase)) ? 0 : 1);
+
+        // 先标记结束状态并通知等待者，消除 _evbase 释放与状态变更之间的不一致窗口
+        {
+            std::lock_guard<std::mutex> lock(_mutex_loop);
+            _b_looped = false;
+            _b_run_finished = true;
+        }
+        _cv_loop.notify_one();
+
+        // 等待者已收到通知，安全释放资源
+        freeEventObjects();
+    }
+    else
+    {
+        DEFAULT_LOG_ERROR("Open event base failed");
+        {
+            std::lock_guard<std::mutex> lock(_mutex_loop);
+            _b_run_finished = true;
+        }
+        _cv_loop.notify_one();
+    }
+
+    DEFAULT_LOG_INFO("The ZmEvBaseRunLoop is stoped");
+}
+
+void ZmEvBaseRunLoop::OnStopping()
+{
+    Control(CONTROL_LOOP_EXIT);
+}
+
+void ZmEvBaseRunLoop::OnEventCtrlCB(evutil_socket_t fd, short what, void* arg)
+{
+    DEFAULT_LOG_INFO("Received control event: fd={}, what={}, arg={}", (int)fd, what, arg);
+
+    ZmEvBaseRunLoop* dockRunloop = (ZmEvBaseRunLoop*)arg;
+
+    //剥离 libevent标准事件标志、保留自定义控制命令
+    what = what & 0x7F00;
+    if ((what & CONTROL_LOOP_EXIT) == CONTROL_LOOP_EXIT)
+    {
+        if (nullptr != dockRunloop->_evbase)
+        {
+            event_base_loopexit(dockRunloop->_evbase, NULL);
+        }
+    }
+    if ((what & CONTROL_LOOP_SUCCESS) == CONTROL_LOOP_SUCCESS)
+    {
+        {
+            /** event_base_loopbreak() 立即退出， event_base_loopexit() 完成未完成的任务后再退出 */
+            std::lock_guard<std::mutex> lock(dockRunloop->_mutex_loop);
+            dockRunloop->_b_looped = true;
+        }
+        dockRunloop->_cv_loop.notify_one();
+    }
+}
+
+void ZmEvBaseRunLoop::OnTimerCB(evutil_socket_t fd, short what, void* arg)
+{
+    char buf[32];
+    ZmSystem::CurrentTimeStr(buf, sizeof(buf));
+    DEFAULT_LOG_INFO("ZmEvBaseRunLoop:{} HeartbeatTime:{}", arg, buf);
+}

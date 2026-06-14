@@ -66,6 +66,11 @@ typedef enum
     ZM_DELEGATE_MODE_DNR_ASYNC = 3,            /** 异步域名解析器（已废弃） */
 } ZM_DELEGATE_MODE;
 
+/** @brief bufferevent_pair 池归还回调类型
+ *  @param slot      池槽位指针
+ *  @param is_pair1  true 表示 pair[1]（TAP 端），false 表示 pair[0]（响应端） */
+typedef void(*ZmTapBevFreeCB)(void* slot, bool is_pair1);
+
 /** @brief TAP 状态枚举 */
 typedef enum
 {
@@ -113,6 +118,11 @@ public:
 
     char           seq_num[16];               /** 消息序号（原子自增生成，唯一标识） */
     ZM_TAP_SLOT*   _slot;                     /** 回指 pool 中的槽位，扩容时被 ZmTapContext 同步更新 */
+
+    // bufferevent_pair 池化支持：当 requester_bev 来自池时，
+    // FreeRequesterEnd 通过此回调归还而非 bufferevent_free
+    ZmTapBevFreeCB on_bev_free;                /** bufferevent 释放回调（nullptr 表示直接 free） */
+    void*          bev_pool_slot;              /** 池槽位指针，传给 on_bev_free */
 
 public:
     /**
@@ -294,13 +304,17 @@ public:
      *  @note  必须在事件循环线程中调用
      *  @note  一般由HUB回调,所以使用HUB的evtbase和context池 */
     static bool OnPairAcceptConn(void* ctx, evutil_socket_t fd);
+
     /** @brief 接受 bufferevent 注入 — OnPairAcceptConn 的变体，用于已创建的 bufferevent（如 bufferevent_pair）
-     *  @param ctx Hub 代理 delegate
-     *  @param bev 已创建的 bufferevent（如 bufferevent_pair 的一端），成功后由 TAP 接管生命周期
+     *  @param ctx  Hub 代理 delegate
+     *  @param bev  已创建的 bufferevent（如 bufferevent_pair 的一端），成功后由 TAP 接管生命周期
+     *  @param slot 可选，bufferevent_pair 池槽位指针；非空时设置 TAP 的 bev_pool_slot
+     *  @param on_bev_free 可选，池归还回调；非空时设置 TAP 的 on_bev_free
      *  @return true 成功创建 TAP 并触发协议探测，false 失败（bev 已释放）
      *  @note  必须在事件循环线程中调用
      *  @note  用于进程内零拷贝通信，bev 无需关联 socket fd */
-    static bool OnPairAcceptBev(void* ctx, struct bufferevent* bev);
+    static bool OnPairAcceptBev(void* ctx, struct bufferevent* bev,
+                                void* slot = nullptr, ZmTapBevFreeCB on_bev_free = nullptr);
     static void OnRequesterEventCB(struct bufferevent* requester_bev, short events, void* ctx);
     static void OnRequesterReadCB(struct bufferevent* requester_bev, void* ctx);
     static void OnRequesterWriteCB(struct bufferevent* requester_bev, void* ctx);
