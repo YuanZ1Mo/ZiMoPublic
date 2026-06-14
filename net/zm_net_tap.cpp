@@ -950,6 +950,7 @@ void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* li
     {
         tap->delegate = delegate;
         tap->SetEventBase(delegate->TapDelegateEventBase());
+        tap->SetEvDnsBase(delegate->TapDelegateEvdnsBase());
         tap->requester_bev = bev;
         memcpy(tap->requester_ip, ipstr, sizeof(tap->requester_ip));
         tap->requester_port = app_port;
@@ -1024,6 +1025,7 @@ bool ZmTapContextEventHandler::OnPairAcceptConn(void* ctx, evutil_socket_t fd)
     // 3. 设置 TAP 字段（与 OnRequesterAcceptConnCB 一致，但 IP 固定为 127.0.0.1）
     tap->delegate = delegate;
     tap->SetEventBase(delegate->TapDelegateEventBase());
+    tap->SetEvDnsBase(delegate->TapDelegateEvdnsBase());
     tap->requester_bev = bev;
     strncpy_s(tap->requester_ip, "127.0.0.1", sizeof(tap->requester_ip));
     tap->requester_port = 0;
@@ -1091,6 +1093,7 @@ bool ZmTapContextEventHandler::OnPairAcceptBev(void* ctx, struct bufferevent* be
     // 设置 TAP 字段（IP 固定为 127.0.0.1，标记为内部通道连接）
     tap->delegate = delegate;
     tap->SetEventBase(delegate->TapDelegateEventBase());
+    tap->SetEvDnsBase(delegate->TapDelegateEvdnsBase());
     tap->requester_bev = bev;
     tap->bev_pool_slot = slot;
     tap->on_bev_free = on_bev_free;
