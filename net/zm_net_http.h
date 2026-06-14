@@ -91,12 +91,12 @@ typedef struct strust_http_req
         verb = 0;
         major = 0;
         minor = 0;
-        host = NULL;
+        host = nullptr;
         port = 0;
         websocket = 0;
-        userinfo = NULL;
-        path = NULL;
-        useragent = NULL;
+        userinfo = nullptr;
+        path = nullptr;
+        useragent = nullptr;
         pid = 0;
     }
 
@@ -228,7 +228,7 @@ public:
     /**
      * @brief 设置响应头（延迟到发送响应时写入）
      * @param name  响应头名称
-     * @param val   响应头值，传入 NULL 时存储为空字符串
+     * @param val   响应头值，传入 nullptr 时存储为空字符串
      *
      * @note 可在 SendReply 之前多次调用，同名字段会被覆盖
      */
@@ -237,24 +237,24 @@ public:
     /**
      * @brief 设置响应状态码和原因短语
      * @param code    HTTP 状态码，如 200、404、500
-     * @param reason  原因短语，如 "OK"、"Not Found"，传入 NULL 时由 libevent 自动填充
+     * @param reason  原因短语，如 "OK"、"Not Found"，传入 nullptr 时由 libevent 自动填充
      */
-    void SetReply(int code, const char* reason = NULL);
+    void SetReply(int code, const char* reason = nullptr);
 
     /**
      * @brief 设置响应体数据（追加到响应缓冲区）
      * @param data  响应体数据的字节指针
      * @param dlen  响应体数据长度（字节数）
      *
-     * @note 传入 NULL 或 dlen 为 0 时不执行任何操作
+     * @note 传入 nullptr 或 dlen 为 0 时不执行任何操作
      */
-    void SetReplyData(const BYTE* data = NULL, size_t dlen = 0);
+    void SetReplyData(const BYTE* data = nullptr, size_t dlen = 0);
 
     /**
      * @brief 将一个 evbuffer 的全部内容追加到响应缓冲区
      * @param buf  源 evbuffer，传输完成后源 buffer 内容被消费
      */
-    void SetReplyBuf(struct evbuffer* buf = NULL);
+    void SetReplyBuf(struct evbuffer* buf = nullptr);
 
     /**
      * @brief 清空已写入的响应体数据（保留状态码和响应头）
@@ -332,12 +332,8 @@ public:
     ZmHttpHead();
     ~ZmHttpHead();
 
-    inline int  StatusCode() { return _status_code; }
-    inline int  ContentLength()
-    {
-        const char* value = Value("Content-Length");
-        return value ? atoi(value) : 0;
-    }
+    int         StatusCode();
+    int         ContentLength();
 
     void        Parse(const char* buf, size_t len, bool hasReqLine = false);
     void        Build(ZmByteBuffer& output);
@@ -345,11 +341,11 @@ public:
     void        PutAll(ZmHttpHead* other);
 
     const char* PutValue(const char* name, const char* fmt, ...);
-    const char* Value(const char* name, const char* value = NULL);
+    const char* Value(const char* name, const char* value = nullptr);
     void        Remove(const char* name);
     void        SetHostField(const char* scheme, const char* host, uint16_t port);
 
-    inline bool IsEmpty() { return (0 == _entries.Count()); }
+    bool        IsEmpty();
 
 private:
     typedef struct
@@ -517,7 +513,7 @@ protected:
     /** @brief 通过 event_base_loopbreak 终止事件循环 */
     void OnControlClose();
 
-    /** @brief 按顺序释放 ctrl_event → evhttpd → evbase，全部置 NULL */
+    /** @brief 按顺序释放 ctrl_event → evhttpd → evbase，全部置 nullptr */
     void FreeEventObjects();
 
 private:
@@ -615,7 +611,7 @@ public:
 
     /**
      * @brief 构造 JSON-RPC 服务器
-     * @param root_uri     RPC 请求的 URI 前缀，仅匹配此前缀的请求走 RPC 流程，为空或 NULL 时所有请求走 RPC
+     * @param root_uri     RPC 请求的 URI 前缀，仅匹配此前缀的请求走 RPC 流程，为空或 nullptr 时所有请求走 RPC
      * @param local_port   监听端口号
      */
     ZmJsonRpcServer(const char* root_uri, uint16_t local_port);

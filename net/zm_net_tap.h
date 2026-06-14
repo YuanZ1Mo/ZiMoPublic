@@ -35,8 +35,7 @@
 #define ZM_BUF_WATERMARK_HIGH       ZM_BUF_SIZE_64K
 #define ZM_BUF_WATERMARK_LOW        ZM_BUF_SIZE_16K
 
-/** @brief TLV 扩展头结构体（ZM_PACKED 紧凑布局） */
-/** TLV 扩展头结构体（ZM_PACKED 紧凑布局）
+/** @brief TLV 扩展头结构体（ZM_PACKED 紧凑布局）
  *  value[0] 为柔性数组成员，用于定位 TLV 头后的载荷数据，不占空间（sizeof=8） */
 #pragma warning(push)
 #pragma warning(disable: 4200)  // char value[0] 是 MSVC 柔性数组成员扩展，不占空间
@@ -91,42 +90,41 @@ typedef enum
 typedef struct ZM_TAP_CTX
 {
 private:
-    ZmTapContext* tap_context;                /** 所属的 TAP 池，暂定每个ZM_TAP_CTX对象在未收回前有且只有一个唯一值  */
-    event_base*   ev_base;                     /** libevent 事件循环基, 暂定evbase仅挂靠在创建时的HUB上且中途无法更改 */
-    evdns_base*   ev_dns_base;
+    ZmTapContext* tap_context;                ///< 所属的 TAP 池，未收回前有且只有一个唯一值
+    event_base*   ev_base;                    ///< libevent 事件循环基，暂定仅挂靠在创建时的 HUB 上且中途不可更改
+    evdns_base*   ev_dns_base;                ///< libevent DNS 解析基，暂定仅挂靠在创建时的 HUB 上且中途不可更改
 
 public:
 
-    event*        ev_timeout;                 /** 超时定时器事件 */
-    uint32_t      drop_timeout_error_code;    /** 超时错误码 */
+    event*        ev_timeout;                 ///< 超时定时器事件
+    uint32_t      drop_timeout_error_code;    ///< 超时错误码
 
-    bufferevent*  requester_bev;              /** 请求端 bufferevent */
-    BYTE*         requester_data;             /** 请求数据接收缓冲区（变长，堆分配） */
-    uint32_t      requester_data_len;         /** 期望接收的请求数据总长度 */
-    uint32_t      requester_received_len;     /** 已接收的请求数据长度 */
-    uint16_t      requester_port;             /** 请求来源端口 */
-    char          requester_ip[64];           /** 请求来源 IP 地址字符串 */
+    bufferevent*  requester_bev;              ///< 请求端 bufferevent
+    BYTE*         requester_data;             ///< 请求数据接收缓冲区（变长，堆分配）
+    uint32_t      requester_data_len;         ///< 期望接收的请求数据总长度
+    uint32_t      requester_received_len;     ///< 已接收的请求数据长度
+    uint16_t      requester_port;             ///< 请求来源端口
+    char          requester_ip[64];           ///< 请求来源 IP 地址字符串
 
-    uint8_t       state;                      /** 当前状态，见 ZM_TAP_STATE */
+    uint8_t       state;                      ///< 当前状态，见 ZM_TAP_STATE
 
-    evdns_getaddrinfo_request* dns_request;   /** libevent DNS 解析请求句柄 */
+    evdns_getaddrinfo_request* dns_request;   ///< libevent DNS 解析请求句柄
 
-    // 以下字段在释放 TAP 时不 free（由 delegate 持有或内联存储）
-    ZmTapDelegate* delegate;                  /** 当前关联的协议处理器 */
-    ZM_HTTP_REQ    request;                   /** HTTP 请求参数（内联存储，避免额外 malloc） */
+    /// 以下字段在释放 TAP 时不 free（由 delegate 持有或内联存储）
+    ZmTapDelegate* delegate;                  ///< 当前关联的协议处理器
+    ZM_HTTP_REQ    request;                   ///< HTTP 请求参数（内联存储，避免额外 malloc）
 
-    /** 回传代理链：响应数据按 LIFO 顺序经过链上各 delegate 处理 */
+    /** @brief 回传代理链：响应数据按 LIFO 顺序经过链上各 delegate 处理 */
     ZmTapDelegate* onback_chains[ZM_TAP_DELEGATE_CHAIN_MAX];
-    void*          onback_data;               /** 回传数据缓冲区 */
-    uint32_t       onback_dlen;               /** 回传数据长度 */
+    void*          onback_data;               ///< 回传数据缓冲区
+    uint32_t       onback_dlen;               ///< 回传数据长度
 
-    char           seq_num[16];               /** 消息序号（原子自增生成，唯一标识） */
-    ZM_TAP_SLOT*   _slot;                     /** 回指 pool 中的槽位，扩容时被 ZmTapContext 同步更新 */
+    char           seq_num[16];               ///< 消息序号（原子自增生成，唯一标识）
+    ZM_TAP_SLOT*   _slot;                     ///< 回指 pool 中的槽位，扩容时被 ZmTapContext 同步更新
 
-    // bufferevent_pair 池化支持：当 requester_bev 来自池时，
-    // FreeRequesterEnd 通过此回调归还而非 bufferevent_free
-    ZmTapBevFreeCB on_bev_free;                /** bufferevent 释放回调（nullptr 表示直接 free） */
-    void*          bev_pool_slot;              /** 池槽位指针，传给 on_bev_free */
+    /// bufferevent_pair 池化支持：当 requester_bev 来自池时，FreeRequesterEnd 通过回调归还
+    ZmTapBevFreeCB on_bev_free;               ///< bufferevent 释放回调（nullptr 表示直接 free）
+    void*          bev_pool_slot;              ///< 池槽位指针，传给 on_bev_free
 
 public:
     /**
@@ -305,9 +303,9 @@ public:
     void SetEvDns(evdns_base* evdnsbase);
 
     // --- 属性访问 ---
-    int          TapDelegateMode()      { return m_mode; }
-    event_base*  TapDelegateEventBase() { return m_evbase; }
-    evdns_base*  TapDelegateEvdnsBase() { return m_evdnsbase; }
+    int         TapDelegateMode();
+    event_base* TapDelegateEventBase();
+    evdns_base* TapDelegateEvdnsBase();
 
     // --- 网络事件回调（子类按需重写） ---
     /** @brief bufferevent 事件回调（EOF/ERROR/CONNECTED） */

@@ -111,7 +111,7 @@ void ZmTapContext::Clear()
 void ZmTapContext::Drop(ZM_TAP_CTX* tap, const char* reason)
 {
     /** 通过判断 tap->mode 可以有效防止重复释放 */
-    if (tap && ZM_TAP_STATE_DROPPING != tap->state)
+    if (tap && tap->state != ZM_TAP_STATE_DROPPING)
     {
         tap->state = ZM_TAP_STATE_DROPPING;
 
@@ -301,7 +301,7 @@ void ZmTapContext::SetDropTimer(ZM_TAP_CTX* tap, int seconds, int micros, uint32
     {
         tap->drop_timeout_error_code = drop_timeout_error_code;
 
-        if (!tap->ev_timeout)
+        if (tap->ev_timeout == nullptr)
         {
             tap->ev_timeout = evtimer_new(const_cast<event_base*>(tap->EventBase()), ZmTapContextEventHandler::OnDropTimerCB, tap);
         }
@@ -407,7 +407,7 @@ void ZmTapContext::EvDnsResolve(ZM_TAP_CTX* tap, const char* hostname, uint16_t 
     tap->dns_request = evdns_getaddrinfo(const_cast<evdns_base*>(tap->EventDnsBase()), hostname, port_str, &hints,
         ZmTapContextEventHandler::OnDnsResolvedCB, tap);
 
-    if (!tap->dns_request)
+    if (tap->dns_request == nullptr)
     {
         // evdns_getaddrinfo 返回 nullptr 表示立即完成了（命中缓存/hosts/或出错）
         // 此时回调已在 evdns_getaddrinfo 内部被同步调用
@@ -460,7 +460,7 @@ void ZmTapContext::ForEach(std::function<void(ZM_TAP_CTX*)> fnaction,
     for (size_t i = 0; i < m_count; i++)
     {
         ZM_TAP_CTX* item = m_slots[i].tap;
-        if (!fnmatches || fnmatches(item))
+        if (fnmatches == nullptr || fnmatches(item))
         {
             fnaction(item);
         }
@@ -488,7 +488,7 @@ void ZmTapContext::BackChainPush(ZM_TAP_CTX* tap, ZmTapDelegate* delegate)
     {
         for (int i = 0; i < ZM_TAP_DELEGATE_CHAIN_MAX; i++)
         {
-            if (nullptr == tap->onback_chains[i])
+            if (tap->onback_chains[i] == nullptr)
             {
                 tap->onback_chains[i] = delegate;
                 break;
@@ -511,7 +511,7 @@ bool ZmTapContext::IsBackChainEmpty(ZM_TAP_CTX* tap)
 }
 
 
-//////////////////////////////////////////////////////////////////////////////////////////////////
+// ============================================================================
 // BuffereventPairPool
 BuffereventPairPool::BuffereventPairPool() : m_evbase(nullptr) {}
 BuffereventPairPool::~BuffereventPairPool() { Shutdown(); }
@@ -538,7 +538,7 @@ void BuffereventPairPool::Init(struct event_base* evbase, int capacity)
             m_free_stack.push_back(&slot);
         }
     }
-    DEFAULT_LOG_INFO("BuffereventPairPool initialized: capacity={}, created={}",
+    PUBLIC_LOG_INFO("BuffereventPairPool initialized: capacity={}, created={}",
         capacity, (int)m_free_stack.size());
 }
 
@@ -572,7 +572,7 @@ PairPoolSlot* BuffereventPairPool::Acquire()
 
 void BuffereventPairPool::ReleaseHalf(void* slotPtr, bool is_pair1)
 {
-    if (!slotPtr) return;
+    if (slotPtr == nullptr) return;
     auto* s = static_cast<PairPoolSlot*>(slotPtr);
 
     if (is_pair1)
@@ -643,7 +643,7 @@ void BuffereventPairPool::ResetPair(PairPoolSlot* slot)
     }
 }
 
-//////////////////////////////////////////////////////////////////////////////////////////////////
+// ============================================================================
 // ZmTapDelegate
 ZmTapDelegate::ZmTapDelegate()
     : m_evbase(nullptr), m_evdnsbase(nullptr), m_evdelegate(nullptr), m_mode(0)
@@ -658,7 +658,7 @@ void ZmTapDelegate::StartTapDelegate(struct event_base* evbase, int mode)
 
     if (OnStartTap())
     {
-        if (!m_evdelegate)
+        if (m_evdelegate == nullptr)
         {
             m_evdelegate = event_new(m_evbase, -1, EV_PERSIST | EV_READ, ZmTapContextEventHandler::OnTapDelegateEventCB, this);
         }
@@ -682,7 +682,7 @@ void ZmTapDelegate::StopTapDelegate()
         m_pendingScheduleCtx.clear();
     }
 
-    if (nullptr != m_evdelegate)
+    if (m_evdelegate != nullptr)
     {
         event_free(m_evdelegate);
         m_evdelegate = nullptr;
@@ -699,13 +699,33 @@ char* ZmTapDelegate::TapDelegateName(const char* name)
     return m_name;
 }
 
+void ZmTapDelegate::SetEvDns(evdns_base* evdnsbase)
+{
+    m_evdnsbase = evdnsbase;
+}
+
+int ZmTapDelegate::TapDelegateMode()
+{
+    return m_mode;
+}
+
+event_base* ZmTapDelegate::TapDelegateEventBase()
+{
+    return m_evbase;
+}
+
+evdns_base* ZmTapDelegate::TapDelegateEvdnsBase()
+{
+    return m_evdnsbase;
+}
+
 // ============================================================================
 // 跨线程调度
 // ============================================================================
 
 bool ZmTapDelegate::ScheduleInLoop(std::function<void()> fn)
 {
-    if (!m_evbase)
+    if (m_evbase == nullptr)
         return false;
 
     ScheduleCtx* ctx = new ScheduleCtx();
@@ -728,7 +748,7 @@ bool ZmTapDelegate::ScheduleInLoop(std::function<void()> fn)
 
 void ZmTapDelegate::OnScheduleEventCB(evutil_socket_t fd, short what, void* pctx)
 {
-    if (!pctx) return;
+    if (pctx == nullptr) return;
     ScheduleCtx* ctx = (ScheduleCtx*)pctx;
     ZmTapDelegate* self = ctx->owner;
 
@@ -760,7 +780,7 @@ void ZmTapDelegate::Response(ZM_TAP_CTX* tap, const ZMJSON& jsResponse)
     }
     else
     {
-        DEFAULT_LOG_WARN("TAP 回传链为空，无法写入响应，TAP:{}", (void*)tap);
+        PUBLIC_LOG_WARN("TAP 回传链为空，无法写入响应，TAP:{}", (void*)tap);
         tap->Drop("back chain empty");
     }
 }
@@ -777,7 +797,7 @@ void ZmTapDelegate::ResponseAsync(ZM_TAP_CTX* tap, const ZMJSON& jsResponse)
         // 校验 TAP 是否仍然存活
         if (tap->state != ZM_TAP_STATE_INUSE)
         {
-            DEFAULT_LOG_WARN("TAP 已失效，丢弃异步响应，TAP:{}, state:{}",
+            PUBLIC_LOG_WARN("TAP 已失效，丢弃异步响应，TAP:{}, state:{}",
                 (void*)tap, tap->state);
             return;
         }
@@ -786,7 +806,7 @@ void ZmTapDelegate::ResponseAsync(ZM_TAP_CTX* tap, const ZMJSON& jsResponse)
         ZMJSON js = zm_json_parse(rspJson, err);
         if (!err.empty())
         {
-            DEFAULT_LOG_ERROR("异步响应 JSON 解析失败: {}，TAP:{}", err, (void*)tap);
+            PUBLIC_LOG_ERROR("异步响应 JSON 解析失败: {}，TAP:{}", err, (void*)tap);
             tap->Drop("async response json parse error");
             return;
         }
@@ -795,7 +815,7 @@ void ZmTapDelegate::ResponseAsync(ZM_TAP_CTX* tap, const ZMJSON& jsResponse)
 
     if (!scheduled)
     {
-        DEFAULT_LOG_ERROR("ScheduleInLoop 调度失败，事件循环可能已停止，TAP:{}", (void*)tap);
+        PUBLIC_LOG_ERROR("ScheduleInLoop 调度失败，事件循环可能已停止，TAP:{}", (void*)tap);
     }
 }
 
@@ -821,7 +841,7 @@ void ZmTapDelegate::SetDropTimerAsync(ZM_TAP_CTX* tap, int seconds, int micros, 
 
     if (!scheduled)
     {
-        DEFAULT_LOG_ERROR("ScheduleInLoop 调度失败，SetDropTimerAsync 未执行，TAP:{}", (void*)tap);
+        PUBLIC_LOG_ERROR("ScheduleInLoop 调度失败，SetDropTimerAsync 未执行，TAP:{}", (void*)tap);
     }
 }
 
@@ -831,7 +851,7 @@ void ZmTapDelegate::DropAsync(ZM_TAP_CTX* tap, const char* reason)
     bool scheduled = ScheduleInLoop([tap, rsn]() {
         if (tap->state != ZM_TAP_STATE_INUSE)
         {
-            DEFAULT_LOG_WARN("TAP 已失效，跳过重复 Drop，TAP:{}, state:{}, reason:{}",
+            PUBLIC_LOG_WARN("TAP 已失效，跳过重复 Drop，TAP:{}, state:{}, reason:{}",
                 (void*)tap, tap->state, rsn);
             return;
         }
@@ -840,18 +860,12 @@ void ZmTapDelegate::DropAsync(ZM_TAP_CTX* tap, const char* reason)
 
     if (!scheduled)
     {
-        DEFAULT_LOG_ERROR("ScheduleInLoop 调度失败，DropAsync 未执行，TAP:{}, reason:{}",
+        PUBLIC_LOG_ERROR("ScheduleInLoop 调度失败，DropAsync 未执行，TAP:{}, reason:{}",
             (void*)tap, rsn);
     }
 }
 
-void ZmTapDelegate::SetEvDns(evdns_base* evdnsbase)
-{
-    m_evdnsbase = evdnsbase;
-}
-
-
-//////////////////////////////////////////////////////////////////////////////////////////////////
+// ============================================================================
 // ZmTapContextEventHandler
 
 // Inner Events
@@ -877,7 +891,7 @@ void ZmTapContextEventHandler::OnDropTimerCB(evutil_socket_t fd, short what, voi
         }
         else
         {
-            tap->Drop("On Timer");;
+            tap->Drop("On Timer");
         }
     }
 }
@@ -887,12 +901,12 @@ void ZmTapContextEventHandler::OnDnsResolvedCB(int errcode, struct evutil_addrin
 {
     ZM_TAP_CTX* tap = (ZM_TAP_CTX*)ctx;
     tap->dns_request = nullptr;
-    if (errcode != EVUTIL_EAI_CANCEL && addr)
+    if (errcode != EVUTIL_EAI_CANCEL && addr != nullptr)
     {
         struct sockaddr_in6 sa6 = { 0 };
         socklen_t           salen = 0;
         char                ipstr[64] = { 0 };
-        if (0 == errcode)
+        if (errcode == 0)
         {
             salen = ZmNetDNS::ExtractEventAddrInfo(&sa6, addr, ipstr, sizeof(ipstr));
         }
@@ -911,12 +925,12 @@ void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* li
     /*HUB有了新的连接 为它设置一个缓冲区*/
     struct event_base* base = evconnlistener_get_base(listener);
     struct bufferevent* bev = bufferevent_socket_new(base, fd, ZM_EVENT_BEV_OPTIONS);
-    if (!bev)
+    if (bev == nullptr)
     {
         evutil_closesocket(fd);
         return;
     }
-    else if (!ctx)
+    else if (ctx == nullptr)
     {
         bufferevent_free(bev);
         return;
@@ -939,7 +953,7 @@ void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* li
     }
 
     ZmTapContext* context = delegate->TapContext();
-    if (!context)
+    if (context == nullptr)
     {
         bufferevent_free(bev);
         return;
@@ -991,7 +1005,7 @@ bool ZmTapContextEventHandler::OnPairAcceptConn(void* ctx, evutil_socket_t fd)
 {
     ZmTapDelegate* delegate = (ZmTapDelegate*)ctx;
 
-    if (!delegate)
+    if (delegate == nullptr)
     {
         if (fd >= 0) evutil_closesocket(fd);
         return false;
@@ -999,14 +1013,14 @@ bool ZmTapContextEventHandler::OnPairAcceptConn(void* ctx, evutil_socket_t fd)
 
     // 1. 为 pair fd 创建 bufferevent
     struct bufferevent* bev = bufferevent_socket_new(delegate->TapDelegateEventBase(), fd, ZM_EVENT_BEV_OPTIONS);
-    if (!bev)
+    if (bev == nullptr)
     {
         evutil_closesocket(fd);
         return false;
     }
 
     ZmTapContext* context = delegate->TapContext();
-    if (!context)
+    if (context == nullptr)
     {
         bufferevent_free(bev);
         evutil_closesocket(fd);
@@ -1015,7 +1029,7 @@ bool ZmTapContextEventHandler::OnPairAcceptConn(void* ctx, evutil_socket_t fd)
 
     // 2. 从池中获取 TAP
     ZM_TAP_CTX* tap = context->Get();
-    if (!tap)
+    if (tap == nullptr)
     {
         bufferevent_free(bev);
         evutil_closesocket(fd);
@@ -1069,14 +1083,14 @@ bool ZmTapContextEventHandler::OnPairAcceptBev(void* ctx, struct bufferevent* be
 {
     ZmTapDelegate* delegate = (ZmTapDelegate*)ctx;
 
-    if (!delegate || !bev)
+    if (delegate == nullptr || bev == nullptr)
     {
         if (bev) bufferevent_free(bev);
         return false;
     }
 
     ZmTapContext* context = delegate->TapContext();
-    if (!context)
+    if (context == nullptr)
     {
         bufferevent_free(bev);
         return false;
@@ -1084,7 +1098,7 @@ bool ZmTapContextEventHandler::OnPairAcceptBev(void* ctx, struct bufferevent* be
 
     // 从池中获取 TAP
     ZM_TAP_CTX* tap = context->Get();
-    if (!tap)
+    if (tap == nullptr)
     {
         bufferevent_free(bev);
         return false;
@@ -1136,13 +1150,6 @@ void ZmTapContextEventHandler::OnRequesterEventCB(struct bufferevent* requester_
             // needs callback before release
             if (tap->delegate)
             {
-                ///** 尝试处理未读取数据 */
-                //size_t applen = ZmTapContext::RequesterInputLen(tap);
-                //if (applen > 0)
-                //{
-                //    tap->delegate->OnTapRequesterRead(tap, bufferevent_get_input(tap->requester_bev), applen);
-                //}
-
                 tap->delegate->OnTapRequesterEvent(tap, requester_bev, events);
             }
 

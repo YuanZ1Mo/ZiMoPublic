@@ -15,7 +15,7 @@
 
 
 
- ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ // ============================================================================
  // ZmHttpUtil
 ZM_HTTP_REQ* ZmHttpUtil::CreateRequest()
 {
@@ -85,17 +85,17 @@ bool ZmHttpUtil::ParseRequest(ZM_HTTP_REQ* req, const char* line, int verb)
     char* reqline = heap.Str();
     /* Parse the request line */
     method = zm_strsep(&reqline, " ");
-    if (reqline == NULL)
+    if (reqline == nullptr)
     {
         return false;
     }
     uri = zm_strsep(&reqline, " ");
-    if (reqline == NULL)
+    if (reqline == nullptr)
     {
         return false;
     }
     version = zm_strsep(&reqline, " ");
-    if (reqline != NULL)
+    if (reqline != nullptr)
     {
         return false;
     }
@@ -134,7 +134,7 @@ bool ZmHttpUtil::ParseRequest(ZM_HTTP_REQ* req, const char* line, int verb)
  */
 void ZmHttpUtil::ParseUri(ZM_HTTP_REQ* req, const char* uri_)
 {
-    if (req == NULL || uri_ == NULL)
+    if (req == nullptr || uri_ == nullptr)
     {
         return;
     }
@@ -143,17 +143,17 @@ void ZmHttpUtil::ParseUri(ZM_HTTP_REQ* req, const char* uri_)
     if (req->userinfo) { free(req->userinfo); }
     if (req->path) { free(req->path); }
     if (req->useragent) { free(req->useragent); }
-    req->host = NULL;
-    req->userinfo = NULL;
-    req->path = NULL;
-    req->useragent = NULL;
+    req->host = nullptr;
+    req->userinfo = nullptr;
+    req->path = nullptr;
+    req->useragent = nullptr;
 
     ZmByteBuffer heap(strlen(uri_), uri_);
     char* uri = heap.Str();
 
     // scheme
     char* scheme = strstr(uri, "://");
-    if (NULL != scheme)
+    if (nullptr != scheme)
     {
         snprintf(req->scheme, sizeof(req->scheme), "%s", zm_strsep(&uri, "://"));
         uri += 2;
@@ -161,13 +161,13 @@ void ZmHttpUtil::ParseUri(ZM_HTTP_REQ* req, const char* uri_)
 
     // path
     char* path = strchr(uri, '/');
-    req->path = _strdup(NULL != path ? path : "/");
+    req->path = _strdup(nullptr != path ? path : "/");
 
     // host and port
-    char* host = (NULL != path) ? zm_strsep(&uri, "/") : uri;
+    char* host = (nullptr != path) ? zm_strsep(&uri, "/") : uri;
 
     // userinfo
-    if (NULL != strchr(host, '@'))
+    if (nullptr != strchr(host, '@'))
     {
         req->userinfo = _strdup(zm_strsep(&host, "@"));
     }
@@ -193,15 +193,9 @@ void ZmHttpUtil::ParseUri(ZM_HTTP_REQ* req, const char* uri_)
     else
     {
         /**
-         * +- 2019.06.20
          *  兼容类似这样的 IPv6 代理请求: CONNECT fec0::2:0:0:1092:285:443 HTTP/1.1
          *  因此修改为从右搜索冒号
          */
-         // -- req->host = y_strdup(y_strsep(&host, ":"));
-         // -- if ( NULL!=host )
-         // -- {
-         // --     req->port = (uint16_t)atoi(host);
-         // -- }
         char* port = strrchr(host, ':');
         if (port)
         {
@@ -262,7 +256,7 @@ void ZmHttpUtil::ParseUriPath(ZM_HTTP_URI* uri, char* path)
     }
 
     char  delims[] = "&";
-    char* next_token = NULL;
+    char* next_token = nullptr;
     char* pstr = strtok_s(query, delims, &next_token);
     while (pstr && uri->qcnt < 16)
     {
@@ -278,7 +272,7 @@ void ZmHttpUtil::ParseUriPath(ZM_HTTP_URI* uri, char* path)
             }
             uri->qcnt++;
         }
-        pstr = strtok_s(NULL, delims, &next_token);
+        pstr = strtok_s(nullptr, delims, &next_token);
     }
 }
 
@@ -368,7 +362,7 @@ ZmHttpdTask::~ZmHttpdTask()
     {
         evbuffer_free(m_reply_buf);
     }
-    m_reply_buf = NULL;
+    m_reply_buf = nullptr;
 }
 
 struct evhttp_request* ZmHttpdTask::Request()
@@ -449,7 +443,7 @@ const char* ZmHttpdTask::GetRequestHeader(const char* name, const char* defv)
 
 void ZmHttpdTask::PutReplyHeader(const char* name, const char* val)
 {
-    // val 为 NULL 时存储空字符串，防止后续构造 string 时崩溃
+    // val 为 nullptr 时存储空字符串，防止后续构造 string 时崩溃
     m_reply_headers[std::string(name)] = std::string(val ? val : "");
 }
 
@@ -505,10 +499,10 @@ public:
     ZmHttpdDoer(ZmHttpServer* httpd, struct evhttp_request* request)
         : ZmHttpdTask(request), m_httpd(httpd)
     {
-        m_remove_event = NULL;
+        m_remove_event = nullptr;
         m_reply_event = event_new(m_httpd->EventBase(), -1, EV_PERSIST | EV_READ,
             ZmHttpServer::OnEvent_Control, this);
-        event_add(m_reply_event, NULL);
+        event_add(m_reply_event, nullptr);
 
         // 设置延迟回复回调：异步处理完成后由业务层调用 SendDeferredReply() 触发
         SetDeferredReplyCallback([this] {
@@ -524,12 +518,12 @@ public:
         if (m_reply_event)
         {
             event_free(m_reply_event);
-            m_reply_event = NULL;
+            m_reply_event = nullptr;
         }
         if (m_remove_event)
         {
             event_free(m_remove_event);
-            m_remove_event = NULL;
+            m_remove_event = nullptr;
         }
     }
 
@@ -549,7 +543,7 @@ public:
         if (m_reply_event)
         {
             event_free(m_reply_event);
-            m_reply_event = NULL;
+            m_reply_event = nullptr;
         }
         // 将收集到的响应头统一写入 evhttp_request 的输出头
         // 此处必须在事件循环线程执行，因为 evhttp_add_header 操作 libevent 内部结构
@@ -557,7 +551,7 @@ public:
         {
             evhttp_add_header(evhttp_request_get_output_headers(m_request), it->first.c_str(), it->second.c_str());
         }
-        evhttp_send_reply(m_request, m_status_code, m_reason.empty() ? NULL : m_reason.c_str(), m_reply_buf);
+        evhttp_send_reply(m_request, m_status_code, m_reason.empty() ? nullptr : m_reason.c_str(), m_reply_buf);
 
         // 打印响应返回日志，包含追踪 ID 便于关联请求和响应
         PUBLIC_LOG_INFO("[响应#{}] ← {} {}", m_id, m_status_code,
@@ -568,7 +562,7 @@ public:
         if (m_remove_event)
         {
             event_free(m_remove_event);
-            m_remove_event = NULL;
+            m_remove_event = nullptr;
         }
         m_remove_event = event_new(m_httpd->EventBase(), -1, EV_TIMEOUT, ZmHttpServer::OnEvent_Timer, this);
         evtimer_add(m_remove_event, &tv);
@@ -584,7 +578,7 @@ public:
         if (m_remove_event)
         {
             event_free(m_remove_event);
-            m_remove_event = NULL;
+            m_remove_event = nullptr;
         }
         delete this;
     }
@@ -647,10 +641,21 @@ ZmHttpHead::~ZmHttpHead()
     _entries.Clear();
 }
 
+int ZmHttpHead::StatusCode()
+{
+    return _status_code;
+}
+
+int ZmHttpHead::ContentLength()
+{
+    const char* value = Value("Content-Length");
+    return value ? atoi(value) : 0;
+}
+
 void ZmHttpHead::Parse(const char* buf, size_t len, bool hasReqLine)
 {
     _entries.Clear();
-    const char* hstr = NULL;
+    const char* hstr = nullptr;
     if (hasReqLine)
     {
         hstr = strstr(buf, "\r\n");
@@ -664,7 +669,7 @@ void ZmHttpHead::Parse(const char* buf, size_t len, bool hasReqLine)
     }
     ZmByteBuffer str(len, hstr);
     char  delims[] = "\r\n";
-    char* next_token = NULL;
+    char* next_token = nullptr;
     char* pstr = strtok_s(str.Str(), delims, &next_token);
     while (pstr)
     {
@@ -695,7 +700,7 @@ void ZmHttpHead::Parse(const char* buf, size_t len, bool hasReqLine)
         entry->name = _strdup(pstr);
         entry->value = _strdup(vstr ? vstr : "");
 
-        pstr = strtok_s(NULL, delims, &next_token);
+        pstr = strtok_s(nullptr, delims, &next_token);
     }
 }
 
@@ -732,12 +737,12 @@ ZmHttpHead::_ENTRY* ZmHttpHead::QueryEntry(const char* name)
 {
     for (size_t i = 0; i < _entries.Count(); i++)
     {
-        if (0 == _stricmp(_entries.At(i)->name, name))
+        if (_stricmp(_entries.At(i)->name, name) == 0)
         {
             return _entries.At(i);
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 const char* ZmHttpHead::PutValue(const char* name, const char* fmt, ...)
@@ -766,14 +771,14 @@ const char* ZmHttpHead::Value(const char* name, const char* value)
         }
         entry->value = _strdup(value);
     }
-    return entry ? entry->value : NULL;
+    return entry ? entry->value : nullptr;
 }
 
 void ZmHttpHead::Remove(const char* name)
 {
     for (size_t i = 0; i < _entries.Count(); i++)
     {
-        if (0 == _stricmp(_entries.At(i)->name, name))
+        if (_stricmp(_entries.At(i)->name, name) == 0)
         {
             _entries.Remove(i);
             return;
@@ -800,10 +805,15 @@ void ZmHttpHead::SetHostField(const char* scheme, const char* host, uint16_t por
     Value("Host", temp.Str());
 }
 
+bool ZmHttpHead::IsEmpty()
+{
+    return (_entries.Count() == 0);
+}
+
 // ============================ ZmHttpServer ============================
 
 ZmHttpServer::ZmHttpServer(uint16_t local_port) : ZmThread("HTTPD"),
-    m_evbase(NULL), m_evhttpd(NULL), m_ctrl_event(NULL), m_pool(nullptr),
+    m_evbase(nullptr), m_evhttpd(nullptr), m_ctrl_event(nullptr), m_pool(nullptr),
     m_local_port(local_port), m_port_bind_failed(false), m_shutdown_requested(false)
 {}
 
@@ -895,7 +905,7 @@ void ZmHttpServer::Perform(ZmHttpdTask* task)
     size_t           dlen = evbuffer_get_length(inbuf);
     int              code = OnHttpdRequest(task, evbuffer_pullup(inbuf, dlen), dlen);
     // OnHttpdRequest 返回 0 表示该路径未被任何回调处理，默认 404
-    if (0 == code)
+    if (code == 0)
     {
         code = 404;
     }
@@ -913,7 +923,7 @@ void ZmHttpServer::OnHttp_RequestCB(struct evhttp_request* request, void* arg)
     }
     else
     {
-        evhttp_send_error(request, 500, NULL);
+        evhttp_send_error(request, 500, nullptr);
     }
 }
 
@@ -1027,7 +1037,7 @@ bool ZmHttpServer::BindEventBase(struct event_base* evbase)
         // 创建控制事件用于接收外部线程的信号（Shutdown、Reply 等）
         // fd=-1 表示不关联 socket，EV_PERSIST 允许重复触发
         m_ctrl_event = event_new(evbase, -1, EV_PERSIST | EV_READ, ZmHttpServer::OnEvent_Control, (void*)this);
-        event_add(m_ctrl_event, NULL);
+        event_add(m_ctrl_event, nullptr);
     }
     else
     {
@@ -1037,7 +1047,7 @@ bool ZmHttpServer::BindEventBase(struct event_base* evbase)
         if (m_evhttpd)
         {
             evhttp_free(m_evhttpd);
-            m_evhttpd = NULL;
+            m_evhttpd = nullptr;
         }
     }
 
@@ -1066,17 +1076,17 @@ void ZmHttpServer::FreeEventObjects()
     if (m_ctrl_event)
     {
         event_free(m_ctrl_event);
-        m_ctrl_event = NULL;
+        m_ctrl_event = nullptr;
     }
     if (m_evhttpd)
     {
         evhttp_free(m_evhttpd);
-        m_evhttpd = NULL;
+        m_evhttpd = nullptr;
     }
     if (m_evbase)
     {
         event_base_free(m_evbase);
-        m_evbase = NULL;
+        m_evbase = nullptr;
     }
 }
 
@@ -1101,7 +1111,7 @@ ZmJsonRpcServer::ZmJsonRpcServer(const char* root_uri, uint16_t local_port)
     }
     else
     {
-        // root_uri 为 NULL 时清零，后续 ZmString::IsEmpty 返回 true，
+        // root_uri 为 nullptr 时清零，后续 ZmString::IsEmpty 返回 true，
         // 使 OnHttpdRequest 中所有请求都走 RPC 流程
         memset(m_root_uri, 0, sizeof(m_root_uri));
     }
@@ -1188,14 +1198,14 @@ int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
     ZMJSON request = zm_json_parse(buf.Str(), errmsg);
     if (errmsg.empty())
     {
-        // 构造 JSON-RPC 2.0 标准响应
-        rsp_reply["jsonrpc"] = "2.0";
-
         //id 原样回传，便于客户端匹配响应
         if (!request["id"].is_null())
         {
             rsp_reply["id"] = request["id"];
         }
+
+        // 构造 JSON-RPC 2.0 标准响应
+        rsp_reply["jsonrpc"] = "2.0";
 
         std::string method = zm_json_get_str(request, "method");
         if (!method.empty())

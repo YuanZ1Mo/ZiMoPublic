@@ -1,7 +1,10 @@
 #include "zm_net_http_router.h"
 #include "../util/zm_util_str.h"
+#include "../spdlog/zm_logger.h"
 
 #include <algorithm>
+#include <chrono>
+#include <exception>
 #include <sstream>
 
 // 线程局部：当前请求的路径参数
@@ -26,7 +29,7 @@ ZmHttpRouter::~ZmHttpRouter() = default;
 static std::vector<std::string> SplitPath(const char* pattern)
 {
     std::vector<std::string> segs;
-    if (!pattern || !pattern[0])
+    if (pattern == nullptr || pattern[0] == '\0')
         return segs;
 
     std::string p(pattern);
@@ -69,7 +72,7 @@ void ZmHttpRouter::AddRoute(const char* method, const char* pattern, Handler h,
                 break;
             }
         }
-        if (!child)
+        if (child == nullptr)
         {
             auto newNode = std::make_unique<Node>();
             newNode->segment = seg;
@@ -261,7 +264,7 @@ ZmHttpRouter::MatchRoute(const std::string& path,
 int ZmHttpRouter::Serve(ZmHttpdTask* task, const BYTE* data, size_t dlen)
 {
     const char* uri = task->Uri();
-    if (!uri)
+    if (uri == nullptr)
         return 404;
 
     // 去掉 query string
@@ -273,7 +276,7 @@ int ZmHttpRouter::Serve(ZmHttpdTask* task, const BYTE* data, size_t dlen)
     // 一次遍历完成路径匹配 + 中间件收集
     t_params.clear();
     auto matched = MatchRoute(path, t_params);
-    if (!matched.handlers)
+    if (matched.handlers == nullptr)
         return 404;
 
     // 匹配 HTTP 方法
@@ -364,4 +367,61 @@ std::string ZmHttpRouter::GetParam(const char* name)
 {
     auto it = t_params.find(name);
     return (it != t_params.end()) ? it->second : std::string();
+}
+
+// ============================================================================
+// 内置中间件
+// ============================================================================
+
+ZmHttpRouter::Middleware ZmHttpMiddlewareLogging()
+{
+	return [](ZmHttpdTask* task, ZmHttpRouter::Next next) {
+		auto t0 = std::chrono::steady_clock::now();
+		const char* uri = task->Uri() ? task->Uri() : "(null)";
+		const char* method = "UNKNOWN";
+		switch (task->Method())
+		{
+		case EVHTTP_REQ_GET:    method = "GET";    break;
+		case EVHTTP_REQ_POST:   method = "POST";   break;
+		case EVHTTP_REQ_PUT:    method = "PUT";    break;
+		case EVHTTP_REQ_DELETE: method = "DELETE"; break;
+		default: break;
+		}
+
+		next();
+
+		auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - t0).count();
+		PUBLIC_LOG_INFO("[#{}] HTTP {} {} → {}ms", task->Id(), method, uri, ms);
+	};
+}
+
+ZmHttpRouter::Middleware ZmHttpMiddlewareRecovery()
+{
+	return [](ZmHttpdTask* task, ZmHttpRouter::Next next) {
+		try
+		{
+			next();
+		}
+		catch (const std::exception& e)
+		{
+			PUBLIC_LOG_ERROR("[#{}] HTTP 请求异常: {}，URI: {}",
+				task->Id(), e.what(), task->Uri() ? task->Uri() : "(null)");
+			task->ClearReplyBody();
+			task->PutReplyHeader("Content-type", "application/json; charset=utf-8");
+			task->SetReply(500, "Internal Server Error");
+			std::string body = "{\"error\":\"Internal Server Error\"}";
+			task->SetReplyData((const BYTE*)body.c_str(), body.size());
+		}
+		catch (...)
+		{
+			PUBLIC_LOG_ERROR("HTTP 请求未知异常，URI: {}",
+				task->Uri() ? task->Uri() : "(null)");
+			task->ClearReplyBody();
+			task->PutReplyHeader("Content-type", "application/json; charset=utf-8");
+			task->SetReply(500, "Internal Server Error");
+			std::string body = "{\"error\":\"Internal Server Error\"}";
+			task->SetReplyData((const BYTE*)body.c_str(), body.size());
+		}
+	};
 }

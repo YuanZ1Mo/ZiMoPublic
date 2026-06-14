@@ -175,4 +175,33 @@ private:
     static thread_local std::map<std::string, std::string> t_params;
 };
 
+// ============================================================================
+// 内置中间件（自由函数）
+// ============================================================================
+
+/**
+ * @brief 请求日志中间件
+ *
+ * 记录请求方法、路径、耗时（毫秒），通过 PUBLIC_LOG_INFO 输出。
+ *
+ * @example
+ * @code
+ *   app.Use(ZmHttpMiddlewareLogging());
+ * @endcode
+ */
+ZmHttpRouter::Middleware ZmHttpMiddlewareLogging();
+
+/**
+ * @brief 异常恢复中间件
+ *
+ * 捕获处理器抛出的 std::exception，自动返回 500 并输出错误日志。
+ * 应放在链的最前面，确保后续中间件和处理器的异常能被兜底。
+ *
+ * @example
+ * @code
+ *   app.Use(ZmHttpMiddlewareRecovery());
+ * @endcode
+ */
+ZmHttpRouter::Middleware ZmHttpMiddlewareRecovery();
+
 #endif // ZM_NET_HTTP_ROUTER_H
