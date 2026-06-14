@@ -7,7 +7,9 @@
 #include "zm_net_http.h"
 
 #include <atomic>
+#include <functional>
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 
 #include <event2/bufferevent.h>
@@ -90,6 +92,7 @@ typedef struct ZM_TAP_CTX
 private:
     ZmTapContext* tap_context;                /** 所属的 TAP 池，暂定每个ZM_TAP_CTX对象在未收回前有且只有一个唯一值  */
     event_base*   ev_base;                     /** libevent 事件循环基, 暂定evbase仅挂靠在创建时的HUB上且中途无法更改 */
+    evdns_base*   ev_dns_base;
 
 public:
 
@@ -138,6 +141,10 @@ public:
     void SetEventBase(event_base* evbase);
 
     const event_base* EventBase();
+
+    void SetEvDnsBase(evdns_base* evdnsbase);
+
+    const evdns_base* EventDnsBase();
 
     void Drop(const char* reason = "");
 } ZM_TAP_CTX;
@@ -268,6 +275,24 @@ public:
      *  @return ZmTapContext 指针，默认返回 nullptr（非 Hub 模式） */
     virtual ZmTapContext* TapContext() { return nullptr; }
 
+    // --- TAP 响应操作（必须在 libevent 线程中调用）---
+
+    /** @brief 通过 TAP 回传链写入 JSON 响应（同步，必须在事件循环线程中调用） */
+    void Response(ZM_TAP_CTX* tap, const ZMJSON& jsResponse);
+
+    // --- TAP 异步操作（可在任意线程中调用，内部回投到事件循环线程）---
+
+    /** @brief 异步写入 JSON 响应 */
+    void ResponseAsync(ZM_TAP_CTX* tap, const ZMJSON& jsResponse);
+    /** @brief 异步写入成功结果（自动封装 {"result":...}） */
+    void ResponseResultAsync(ZM_TAP_CTX* tap, const ZMJSON& jsResult);
+    /** @brief 异步写入错误信息（自动封装 {"error":...}） */
+    void ResponseErrorAsync(ZM_TAP_CTX* tap, const ZMJSON& jsError);
+    /** @brief 异步设置 TAP 超时定时器 */
+    void SetDropTimerAsync(ZM_TAP_CTX* tap, int seconds, int micros = 0, uint32_t drop_timeout_error_code = 0);
+    /** @brief 异步释放 TAP */
+    void DropAsync(ZM_TAP_CTX* tap, const char* reason);
+
 protected:
     /** @brief 触发 delegate 内部事件 */
     void ActiveTapDelegateEvent(short what) { if (m_evdelegate) { event_active(m_evdelegate, what, 0); } }
@@ -276,12 +301,33 @@ protected:
     /** @brief 停止时回调 */
     virtual void OnStopTap() {}
 
+    /**
+     * @brief 在事件循环线程中调度执行任务（跨线程安全）
+     * @param fn 要在事件循环线程中执行的任务
+     * @return true 调度成功，false 事件循环未就绪
+     */
+    bool ScheduleInLoop(std::function<void()> fn);
+
 protected:
     struct event_base* m_evbase;       /** libevent 事件循环基 */
     struct evdns_base* m_evdnsbase;    /** libevent DNS 解析基 */
     struct event*      m_evdelegate;   /** delegate 内部事件 */
     char               m_name[32];     /** delegate 名称（调试用） */
     int                m_mode;         /** 工作模式 */
+
+    /** @brief 调度任务上下文 */
+    struct ScheduleCtx
+    {
+        struct event*          ev_schedule;  ///< libevent 调度事件
+        std::function<void()>  fn;           ///< 要执行的任务
+        ZmTapDelegate*         owner;        ///< 回指 delegate，用于回调中移除自身
+    };
+
+    /** @brief 调度事件回调，执行 fn 后释放 ctx */
+    static void OnScheduleEventCB(evutil_socket_t fd, short what, void* ctx);
+
+    std::mutex                     m_scheduleMutex;       ///< 保护 m_pendingScheduleCtx
+    std::unordered_set<ScheduleCtx*> m_pendingScheduleCtx; ///< 未触发的调度任务
 };
 
 /**

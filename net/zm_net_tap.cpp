@@ -57,6 +57,19 @@ const event_base* ZM_TAP_CTX::EventBase()
     return ev_base;
 }
 
+void ZM_TAP_CTX::SetEvDnsBase(evdns_base* evdnsbase)
+{
+    if (evdnsbase && !ev_dns_base)
+    {
+        ev_dns_base = evdnsbase;
+    }
+}
+
+const evdns_base* ZM_TAP_CTX::EventDnsBase()
+{
+    return ev_dns_base;
+}
+
 void ZM_TAP_CTX::Drop(const char* reason)
 {
     if (tap_context)
@@ -373,7 +386,7 @@ void ZmTapContext::EvDnsResolve(ZM_TAP_CTX* tap, const char* hostname, uint16_t 
 {
     PUBLIC_LOG_INFO("Tap: {}, EvDnsResolving HostName={}, port={}", (void*)tap, hostname, port);
 
-    if (!tap->delegate->TapDelegateEvdnsBase())
+    if (!tap->EventDnsBase())
     {
         PUBLIC_LOG_ERROR("EvDnsResolve failed: evdns_base is null");
         return;
@@ -391,7 +404,7 @@ void ZmTapContext::EvDnsResolve(ZM_TAP_CTX* tap, const char* hostname, uint16_t 
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
-    tap->dns_request = evdns_getaddrinfo(tap->delegate->TapDelegateEvdnsBase(), hostname, port_str, &hints,
+    tap->dns_request = evdns_getaddrinfo(const_cast<evdns_base*>(tap->EventDnsBase()), hostname, port_str, &hints,
         ZmTapContextEventHandler::OnDnsResolvedCB, tap);
 
     if (!tap->dns_request)
@@ -501,7 +514,7 @@ bool ZmTapContext::IsBackChainEmpty(ZM_TAP_CTX* tap)
 //////////////////////////////////////////////////////////////////////////////////////////////////
 // ZmTapDelegate
 ZmTapDelegate::ZmTapDelegate()
-    : m_evbase(nullptr), m_evdnsbase(nullptr), m_evdelegate(nullptr)
+    : m_evbase(nullptr), m_evdnsbase(nullptr), m_evdelegate(nullptr), m_mode(0)
 {
     TapDelegateName("ZmTapDelegate");
 }
@@ -525,6 +538,19 @@ void ZmTapDelegate::StartTapDelegate(struct event_base* evbase, int mode)
 void ZmTapDelegate::StopTapDelegate()
 {
     OnStopTap();
+
+    // 清理未触发的调度事件
+    {
+        std::lock_guard<std::mutex> lock(m_scheduleMutex);
+        for (auto* ctx : m_pendingScheduleCtx)
+        {
+            if (ctx->ev_schedule)
+                event_free(ctx->ev_schedule);
+            delete ctx;
+        }
+        m_pendingScheduleCtx.clear();
+    }
+
     if (nullptr != m_evdelegate)
     {
         event_free(m_evdelegate);
@@ -540,6 +566,152 @@ char* ZmTapDelegate::TapDelegateName(const char* name)
         snprintf(m_name, sizeof(m_name), "%s", name);
     }
     return m_name;
+}
+
+// ============================================================================
+// 跨线程调度
+// ============================================================================
+
+bool ZmTapDelegate::ScheduleInLoop(std::function<void()> fn)
+{
+    if (!m_evbase)
+        return false;
+
+    ScheduleCtx* ctx = new ScheduleCtx();
+    ctx->ev_schedule = nullptr;
+    ctx->fn = std::move(fn);
+    ctx->owner = this;
+
+    // fd=-1 手动触发事件，events=0 不监听任何 I/O
+    ctx->ev_schedule = event_new(m_evbase, -1, 0, ZmTapDelegate::OnScheduleEventCB, ctx);
+    event_add(ctx->ev_schedule, nullptr);
+
+    {
+        std::lock_guard<std::mutex> lock(m_scheduleMutex);
+        m_pendingScheduleCtx.insert(ctx);
+    }
+
+    event_active(ctx->ev_schedule, EV_TIMEOUT, 0);
+    return true;
+}
+
+void ZmTapDelegate::OnScheduleEventCB(evutil_socket_t fd, short what, void* pctx)
+{
+    if (!pctx) return;
+    ScheduleCtx* ctx = (ScheduleCtx*)pctx;
+    ZmTapDelegate* self = ctx->owner;
+
+    if (self)
+    {
+        std::lock_guard<std::mutex> lock(self->m_scheduleMutex);
+        self->m_pendingScheduleCtx.erase(ctx);
+    }
+
+    if (ctx->ev_schedule)
+        event_free(ctx->ev_schedule);
+    if (ctx->fn)
+        ctx->fn();
+    delete ctx;
+}
+
+// ============================================================================
+// TAP 响应操作（同步，必须在事件循环线程中调用）
+// ============================================================================
+
+void ZmTapDelegate::Response(ZM_TAP_CTX* tap, const ZMJSON& jsResponse)
+{
+    ZmTapDelegate* back_delegate = ZmTapContext::BackChainPop(tap);
+    if (back_delegate)
+    {
+        std::string jstr = jsResponse.dump();
+        ZmTapContext::SetOnBackData(tap, jstr.size(), jstr.c_str());
+        back_delegate->OnTapDelegateBackEvent(tap);
+    }
+    else
+    {
+        DEFAULT_LOG_WARN("TAP 回传链为空，无法写入响应，TAP:{}", (void*)tap);
+        tap->Drop("back chain empty");
+    }
+}
+
+// ============================================================================
+// TAP 异步操作（可在任意线程调用，内部回投到事件循环线程）
+// ============================================================================
+
+void ZmTapDelegate::ResponseAsync(ZM_TAP_CTX* tap, const ZMJSON& jsResponse)
+{
+    std::string rspJson = jsResponse.dump();
+
+    bool scheduled = ScheduleInLoop([this, tap, rspJson]() {
+        // 校验 TAP 是否仍然存活
+        if (tap->state != ZM_TAP_STATE_INUSE)
+        {
+            DEFAULT_LOG_WARN("TAP 已失效，丢弃异步响应，TAP:{}, state:{}",
+                (void*)tap, tap->state);
+            return;
+        }
+
+        std::string err;
+        ZMJSON js = zm_json_parse(rspJson, err);
+        if (!err.empty())
+        {
+            DEFAULT_LOG_ERROR("异步响应 JSON 解析失败: {}，TAP:{}", err, (void*)tap);
+            tap->Drop("async response json parse error");
+            return;
+        }
+        Response(tap, js);
+    });
+
+    if (!scheduled)
+    {
+        DEFAULT_LOG_ERROR("ScheduleInLoop 调度失败，事件循环可能已停止，TAP:{}", (void*)tap);
+    }
+}
+
+void ZmTapDelegate::ResponseResultAsync(ZM_TAP_CTX* tap, const ZMJSON& jsResult)
+{
+    ZMJSON rsp;
+    rsp["result"] = jsResult;
+    ResponseAsync(tap, rsp);
+}
+
+void ZmTapDelegate::ResponseErrorAsync(ZM_TAP_CTX* tap, const ZMJSON& jsError)
+{
+    ZMJSON rsp;
+    rsp["error"] = jsError;
+    ResponseAsync(tap, rsp);
+}
+
+void ZmTapDelegate::SetDropTimerAsync(ZM_TAP_CTX* tap, int seconds, int micros, uint32_t drop_timeout_error_code)
+{
+    bool scheduled = ScheduleInLoop([tap, seconds, micros, drop_timeout_error_code]() {
+        ZmTapContext::SetDropTimer(tap, seconds, micros, drop_timeout_error_code);
+    });
+
+    if (!scheduled)
+    {
+        DEFAULT_LOG_ERROR("ScheduleInLoop 调度失败，SetDropTimerAsync 未执行，TAP:{}", (void*)tap);
+    }
+}
+
+void ZmTapDelegate::DropAsync(ZM_TAP_CTX* tap, const char* reason)
+{
+    std::string rsn(reason ? reason : "unknown");
+    bool scheduled = ScheduleInLoop([tap, rsn]() {
+        if (tap->state != ZM_TAP_STATE_INUSE)
+        {
+            DEFAULT_LOG_WARN("TAP 已失效，跳过重复 Drop，TAP:{}, state:{}, reason:{}",
+                (void*)tap, tap->state, rsn);
+            return;
+        }
+        tap->Drop(rsn.c_str());
+    });
+
+    if (!scheduled)
+    {
+        DEFAULT_LOG_ERROR("ScheduleInLoop 调度失败，DropAsync 未执行，TAP:{}, reason:{}",
+            (void*)tap, rsn);
+    }
 }
 
 void ZmTapDelegate::SetEvDns(evdns_base* evdnsbase)
