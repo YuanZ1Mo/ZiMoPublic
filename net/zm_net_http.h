@@ -178,16 +178,16 @@ public:
     struct evhttp_request* Request();
 
     /** @brief 获取请求的 HTTP 方法（GET/POST/PUT 等） */
-    evhttp_cmd_type        Method();
+    evhttp_cmd_type Method();
 
     /** @brief 获取请求的 URI 路径（含 query string），例如 "/api?foo=bar" */
-    const char*            Uri();
+    const char* Uri();
 
     const char* Ip();
     ev_uint16_t Port();
 
     /** @brief 获取请求的唯一追踪 ID（自增序号，从 1 开始，进程内唯一） */
-    uint64_t    Id();
+    uint64_t Id();
 
     /**
      * @brief 获取 URI query string 中指定参数的值
@@ -202,7 +202,7 @@ public:
      *   const char* page  = task->GetQueryValue("page", "1");   // "1"（未传时使用默认值）
      * @endcode
      */
-    const char*            GetQueryValue(const char* name, const char* defv = "");
+    const char* GetQueryValue(const char* name, const char* defv = "");
 
     /**
      * @brief 将所有请求头导出为 JSON 对象
@@ -215,7 +215,7 @@ public:
      *   // headers["User-Agent"] == "Mozilla/5.0 ..."
      * @endcode
      */
-    void                   GetRequestHeaders(nlohmann::json::object_t& headersObj);
+    void GetRequestHeaders(nlohmann::json::object_t& headersObj);
 
     /**
      * @brief 获取指定请求头的值
@@ -223,7 +223,7 @@ public:
      * @param defv   请求头不存在时的默认返回值
      * @return       请求头值字符串指针，内部缓冲区
      */
-    const char*            GetRequestHeader(const char* name, const char* defv = "");
+    const char* GetRequestHeader(const char* name, const char* defv = "");
 
     /**
      * @brief 设置响应头（延迟到发送响应时写入）
@@ -262,11 +262,7 @@ public:
      * 适用于异常恢复场景：handler 部分写入后抛异常，
      * 中间件可清空脏数据后重写错误响应。
      */
-    void ClearReplyBody()
-    {
-        if (m_reply_buf)
-            evbuffer_drain(m_reply_buf, evbuffer_get_length(m_reply_buf));
-    }
+    void ClearReplyBody();
 
     /**
      * @brief 延迟自动回复，用于异步处理场景
@@ -276,7 +272,7 @@ public:
      *
      * @note 必须在 Perform() 返回之前调用（即 OnHttpdRequest 回调内）
      */
-    void DeferReply() { m_deferred = true; }
+    void DeferReply();
 
     /**
      * @brief 发送被延迟的 HTTP 响应
@@ -287,19 +283,13 @@ public:
      * @note 可在任意线程调用（event_active 线程安全）。
      *       调用前需确保已通过 SetReply / SetReplyData / PutReplyHeader 设置好响应内容。
      */
-    void SendDeferredReply()
-    {
-        if (m_on_deferred_reply)
-            m_on_deferred_reply();
-    }
+    void SendDeferredReply();
 
 protected:
     /** @brief 设置延迟回复回调（由 ZmHttpdDoer 在构造时调用） */
-    void SetDeferredReplyCallback(std::function<void()> cb)
-    {
-        m_on_deferred_reply = std::move(cb);
-    }
+    void SetDeferredReplyCallback(std::function<void()> cb);
 
+protected:
     friend class ZmHttpdDoer;
 
     bool                  m_deferred = false;        ///< 是否延迟自动回复

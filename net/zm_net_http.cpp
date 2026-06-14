@@ -471,8 +471,27 @@ void ZmHttpdTask::SetReplyBuf(struct evbuffer* buf)
     }
 }
 
+void ZmHttpdTask::ClearReplyBody()
+{
+    if (m_reply_buf)
+        evbuffer_drain(m_reply_buf, evbuffer_get_length(m_reply_buf));
+}
 
+void ZmHttpdTask::DeferReply()
+{
+    m_deferred = true;
+}
 
+void ZmHttpdTask::SendDeferredReply()
+{
+    if (m_on_deferred_reply)
+        m_on_deferred_reply();
+}
+
+void ZmHttpdTask::SetDeferredReplyCallback(std::function<void()> cb)
+{
+    m_on_deferred_reply = std::move(cb);
+}
 
 // ============================ ZmHttpServer internals ============================
 
