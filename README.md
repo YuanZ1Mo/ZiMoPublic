@@ -9,7 +9,7 @@ ZiMoPublic/
 ├── define/          # 通用宏定义、版本号
 ├── json/            # nlohmann/json 封装（类型安全的读写辅助）
 ├── libevent/        # 预编译 libevent 头文件及静态库（事件驱动网络库）
-├── net/             # 网络通信模块（TCP/HTTP/DNS/TAP 代理链）
+├── net/             # 网络通信模块（TCP/HTTP/DNS/TAP 代理链/消息广播）
 ├── openssl/         # 预编译 OpenSSL 头文件及静态库
 ├── service/         # Windows 服务基类（SCM 集成、安装/卸载）
 ├── spdlog/          # 定制版 spdlog 日志库 + zm_logger 封装
@@ -134,6 +134,48 @@ ZiMoPublic/
 | `ZmTapDelegateJRPC` | JRPC 协议委托：解析长度前缀帧格式（4 字节大端长度 + JSON 体），通过回调通知上层 |
 
 回调类型：`TapDelegateJrpcRequestReadCB = std::function<void(ZM_TAP_CTX*, const char*)>`
+
+#### zm_net_broadcast — TCP 消息广播
+
+基于 libevent + ZmEvBaseRunLoop 的 TCP 一对多消息推送模块，包含服务端与客户端。
+
+| 文件 | 说明 |
+|------|------|
+| `zm_net_broadcast_base.h/.cpp` | 公共定义：状态枚举 `ZM_BROADCAST_STATE`、消息结构 `BcMessage`、客户端信息 `BcClientInfo`、帧协议编解码（4 字节大端长度 + JSON body）、UUID 生成 |
+| `zm_net_broadcast_server.h/.cpp` | `ZmBroadcastServer`：TCP 广播服务端，支持监听、握手、心跳、Tag 过滤、立即/延时/定时发送、客户端管理 |
+| `zm_net_broadcast_client.h/.cpp` | `ZmBroadcastClient`：TCP 广播客户端，支持连接/重连、握手、心跳响应、Tag 订阅、业务消息回调 |
+
+**服务端特性：**
+- 端口绑定失败无限重试、6 状态流转（IDLE→STARTING→LISTENING→STOPPING→STOPPED + ERROR）
+- 客户端握手：settings → confirm_settings → 分配 client_id（握手超时可配）
+- 双向活动检测心跳（服务端主导 ping/pong，活跃通信时零心跳开销）
+- Tag 过滤订阅/取消（subscribe/unsubscribe），仅推送给匹配客户端
+- 消息格式：`{"id":"...","timestamp":"...","topic":"...","content":...}`，线程安全发送
+- 每客户端独立消息队列（溢出丢弃最旧），连接数限制，按 client_id 踢出
+
+**客户端特性：**
+- 连接失败自动重试（1 秒间隔，无限次）
+- 握手自动回执 + 初始 Tag 自动订阅
+- 心跳自动响应（收到 ping 回 pong）
+- 业务消息回调通过 ZmThreadPool 投递到业务线程
+- 断线重连后自动恢复 Tag 订阅列表
+
+**通信协议：**
+```
+握手:     服务端 → settings →  客户端
+          客户端 → confirm_settings → 服务端
+心跳:     服务端 → ping → 客户端
+          客户端 → pong → 服务端
+订阅:     客户端 → subscribe/unsubscribe → 服务端
+业务:     服务端 → {id,topic,content} → 客户端
+帧格式:   [4字节大端长度][JSON body]
+```
+
+**上层集成（ZiMoService）：**
+- `BroadcastManager`：包装 `ZmBroadcastServer`，自管理事件循环线程
+- `NetDock`：通过 `OpenBroadcastServer()`/`CloseBroadcastServer()` 管理生命周期
+- `ServicePortal`：暴露 `BroadcastMessage()` 及 JRPC `broadcast` 方法供业务层调用
+- 前端控制面板显示 Broadcast 运行状态（状态/端口/连接数/发送数）
 
 ### service — Windows 服务框架
 
