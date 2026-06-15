@@ -573,7 +573,10 @@ void ZmBroadcastServer::OnClientEventCB(struct bufferevent* bev, short events, v
     else if (events & BEV_EVENT_TIMEOUT)
         DEFAULT_LOG_WARN("[BcServer] Client {} timeout", client->clientId);
 
-    if (client->m_owner)
+	else
+		return; // 非断开事件（如 WRITE），不处理
+
+	if (client->m_owner)
         client->m_owner->RemoveClient(client->clientId);
 }
 

@@ -24,7 +24,7 @@ ZmEvBaseRunLoop::~ZmEvBaseRunLoop()
 
 void ZmEvBaseRunLoop::freeEventObjects()
 {
-    DEFAULT_LOG_INFO("Free the event objects");
+    PUBLIC_LOG_INFO("Free the event objects");
 
     if (_eventCtrl)
     {
@@ -73,7 +73,7 @@ void ZmEvBaseRunLoop::Control(short events)
 {
     std::unique_lock<std::mutex> lock(_mutex_loop);
 
-    DEFAULT_LOG_INFO("Received control event: events={}", events);
+    PUBLIC_LOG_INFO("Received control event: events={}", events);
 
     if (IsRunning() || IsStopping())
     {
@@ -98,7 +98,7 @@ evdns_base* ZmEvBaseRunLoop::GetEventDnsBase()
 
 void ZmEvBaseRunLoop::Run()
 {
-    DEFAULT_LOG_INFO("The ZmEvBaseRunLoop is running");
+    PUBLIC_LOG_INFO("The ZmEvBaseRunLoop is running");
 
     zm_util_eventbase_init();
 
@@ -132,7 +132,7 @@ void ZmEvBaseRunLoop::Run()
                         if (*token)
                         {
                             evdns_base_nameserver_ip_add(_evdnsbase, token);
-                            DEFAULT_LOG_INFO("Add DNS nameserver to evdns_base: {}", token);
+                            PUBLIC_LOG_INFO("Add DNS nameserver to evdns_base: {}", token);
                         }
                         token = zm_strsep(&cursor, ",");
                     }
@@ -150,7 +150,7 @@ void ZmEvBaseRunLoop::Run()
         // #define EVLOOP_NONBLOCK          0x02
         // #define EVLOOP_NO_EXIT_ON_EMPTY  0x04
         int ret = event_base_loop(_evbase, EVLOOP_NO_EXIT_ON_EMPTY);
-        DEFAULT_LOG_INFO("ZmEvBaseRunLoop is exited ret:{}, unexpected:{}", ret, (0 == event_base_got_exit(_evbase)) ? 0 : 1);
+        PUBLIC_LOG_INFO("ZmEvBaseRunLoop is exited ret:{}, unexpected:{}", ret, (0 == event_base_got_exit(_evbase)) ? 0 : 1);
 
         // 先标记结束状态并通知等待者，消除 _evbase 释放与状态变更之间的不一致窗口
         {
@@ -165,7 +165,7 @@ void ZmEvBaseRunLoop::Run()
     }
     else
     {
-        DEFAULT_LOG_ERROR("Open event base failed");
+        PUBLIC_LOG_ERROR("Open event base failed");
         {
             std::lock_guard<std::mutex> lock(_mutex_loop);
             _b_run_finished = true;
@@ -173,7 +173,7 @@ void ZmEvBaseRunLoop::Run()
         _cv_loop.notify_one();
     }
 
-    DEFAULT_LOG_INFO("The ZmEvBaseRunLoop is stoped");
+    PUBLIC_LOG_INFO("The ZmEvBaseRunLoop is stoped");
 }
 
 void ZmEvBaseRunLoop::OnStopping()
@@ -183,7 +183,7 @@ void ZmEvBaseRunLoop::OnStopping()
 
 void ZmEvBaseRunLoop::OnEventCtrlCB(evutil_socket_t fd, short what, void* arg)
 {
-    DEFAULT_LOG_INFO("Received control event: fd={}, what={}, arg={}", (int)fd, what, arg);
+    PUBLIC_LOG_INFO("Received control event: fd={}, what={}, arg={}", (int)fd, what, arg);
 
     ZmEvBaseRunLoop* dockRunloop = (ZmEvBaseRunLoop*)arg;
 
@@ -211,5 +211,5 @@ void ZmEvBaseRunLoop::OnTimerCB(evutil_socket_t fd, short what, void* arg)
 {
     char buf[32];
     ZmSystem::CurrentTimeStr(buf, sizeof(buf));
-    DEFAULT_LOG_INFO("ZmEvBaseRunLoop:{} HeartbeatTime:{}", arg, buf);
+    PUBLIC_LOG_INFO("ZmEvBaseRunLoop:{} HeartbeatTime:{}", arg, buf);
 }

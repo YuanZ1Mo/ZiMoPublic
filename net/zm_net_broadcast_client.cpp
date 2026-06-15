@@ -34,6 +34,7 @@ ZmBroadcastClient::ZmBroadcastClient(const BcClientConfig& config, const BcClien
 	, m_handshakeDone(false)
 	, m_startTime(0)
 	, m_receivedCount(0)
+	, m_currentTags(config.initialTags)
 {
 }
 
@@ -235,7 +236,7 @@ void ZmBroadcastClient::DoConnect()
 		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_THREADSAFE);
 	if (!m_bev)
 	{
-		DEFAULT_LOG_ERROR("[BcClient] Failed to create bufferevent");
+		PUBLIC_LOG_ERROR("[BcClient] Failed to create bufferevent");
 		if (m_callbacks.onConnectFailed)
 			m_callbacks.onConnectFailed("Failed to create socket");
 		ScheduleRetry();
@@ -253,7 +254,7 @@ void ZmBroadcastClient::DoConnect()
 	sin.sin_port = htons(m_config.serverPort);
 	if (evutil_inet_pton(AF_INET, m_config.serverIp.c_str(), &sin.sin_addr) != 1)
 	{
-		DEFAULT_LOG_ERROR("[BcClient] Invalid server IP: {}", m_config.serverIp);
+		PUBLIC_LOG_ERROR("[BcClient] Invalid server IP: {}", m_config.serverIp);
 		bufferevent_free(m_bev);
 		m_bev = nullptr;
 		if (m_callbacks.onConnectFailed)
@@ -265,7 +266,7 @@ void ZmBroadcastClient::DoConnect()
 	if (bufferevent_socket_connect(m_bev, (struct sockaddr*)&sin, sizeof(sin)) != 0)
 	{
 		int err = EVUTIL_SOCKET_ERROR();
-		DEFAULT_LOG_ERROR("[BcClient] Connect failed immediately (err={})", err);
+		PUBLIC_LOG_ERROR("[BcClient] Connect failed immediately (err={})", err);
 		bufferevent_free(m_bev);
 		m_bev = nullptr;
 		if (m_callbacks.onConnectFailed)
@@ -274,7 +275,7 @@ void ZmBroadcastClient::DoConnect()
 		return;
 	}
 
-	DEFAULT_LOG_INFO("[BcClient] Connecting to {}:{}", m_config.serverIp, m_config.serverPort);
+	PUBLIC_LOG_INFO("[BcClient] Connecting to {}:{}", m_config.serverIp, m_config.serverPort);
 }
 
 // ============================================================================
@@ -377,7 +378,7 @@ void ZmBroadcastClient::DoDisconnect()
 	if (m_callbacks.onDisconnected)
 		m_callbacks.onDisconnected();
 
-	DEFAULT_LOG_INFO("[BcClient] Disconnected");
+	PUBLIC_LOG_INFO("[BcClient] Disconnected");
 }
 
 // ============================================================================
@@ -403,7 +404,7 @@ void ZmBroadcastClient::ScheduleRetry()
 	if (m_retryTimer)
 		evtimer_add(m_retryTimer, &tv);
 
-	DEFAULT_LOG_DEBUG("[BcClient] Retry scheduled in 1s");
+	PUBLIC_LOG_DEBUG("[BcClient] Retry scheduled in 1s");
 }
 
 void ZmBroadcastClient::OnRetryTimerCB(evutil_socket_t fd, short what, void* ctx)
@@ -422,7 +423,7 @@ void ZmBroadcastClient::OnConnectCB(struct bufferevent* bev, short events, void*
 
 	if (events & BEV_EVENT_CONNECTED)
 	{
-		DEFAULT_LOG_INFO("[BcClient] Connected to {}:{}",
+		PUBLIC_LOG_INFO("[BcClient] Connected to {}:{}",
 		                 client->m_config.serverIp, client->m_config.serverPort);
 
 		// 启用读写
@@ -444,13 +445,13 @@ void ZmBroadcastClient::OnConnectCB(struct bufferevent* bev, short events, void*
 		client->m_handshakeTimer = evtimer_new(evbase, OnHandshakeTimeoutCB, client);
 		evtimer_add(client->m_handshakeTimer, &tv);
 
-		DEFAULT_LOG_DEBUG("[BcClient] Handshake timer started ({}s)", client->m_config.handshakeTimeout);
+		PUBLIC_LOG_DEBUG("[BcClient] Handshake timer started ({}s)", client->m_config.handshakeTimeout);
 	}
 	else
 	{
 		// 连接失败（包含 BEV_EVENT_EOF、BEV_EVENT_ERROR）
 		int err = EVUTIL_SOCKET_ERROR();
-		DEFAULT_LOG_ERROR("[BcClient] Connection failed to {}:{} (err={})",
+		PUBLIC_LOG_ERROR("[BcClient] Connection failed to {}:{} (err={})",
 		                  client->m_config.serverIp, client->m_config.serverPort, err);
 
 		// 清理 bufferevent
@@ -498,16 +499,16 @@ void ZmBroadcastClient::OnEventCB(struct bufferevent* bev, short events, void* c
 
 	if (events & BEV_EVENT_EOF)
 	{
-		DEFAULT_LOG_INFO("[BcClient] Connection closed by server");
+		PUBLIC_LOG_INFO("[BcClient] Connection closed by server");
 	}
 	else if (events & BEV_EVENT_ERROR)
 	{
 		int err = EVUTIL_SOCKET_ERROR();
-		DEFAULT_LOG_ERROR("[BcClient] Connection error: {}", err);
+		PUBLIC_LOG_ERROR("[BcClient] Connection error: {}", err);
 	}
 	else if (events & BEV_EVENT_TIMEOUT)
 	{
-		DEFAULT_LOG_WARN("[BcClient] Connection timeout");
+		PUBLIC_LOG_WARN("[BcClient] Connection timeout");
 	}
 
 	// 断开后的清理与重连
@@ -545,7 +546,7 @@ void ZmBroadcastClient::OnEventCB(struct bufferevent* bev, short events, void* c
 void ZmBroadcastClient::OnHandshakeTimeoutCB(evutil_socket_t fd, short what, void* ctx)
 {
 	ZmBroadcastClient* client = (ZmBroadcastClient*)ctx;
-	DEFAULT_LOG_WARN("[BcClient] Handshake timeout for {}:{}",
+	PUBLIC_LOG_WARN("[BcClient] Handshake timeout for {}:{}",
 	                 client->m_config.serverIp, client->m_config.serverPort);
 
 	// 清理连接
@@ -578,7 +579,7 @@ void ZmBroadcastClient::HandleMessage(const std::string& json)
 	ZMJSON msg = zm_json_parse(json, error);
 	if (!error.empty() || !msg.is_object())
 	{
-		DEFAULT_LOG_WARN("[BcClient] Invalid JSON: {}", error);
+		PUBLIC_LOG_WARN("[BcClient] Invalid JSON: {}", error);
 		return;
 	}
 
@@ -603,7 +604,7 @@ void ZmBroadcastClient::HandleMessage(const std::string& json)
 		m_startTime = BcNowMillis();
 		m_state.store(ZM_BC_STATE_LISTENING, std::memory_order_release);
 
-		DEFAULT_LOG_INFO("[BcClient] Handshake complete with {}:{}",
+		PUBLIC_LOG_INFO("[BcClient] Handshake complete with {}:{}",
 		                 m_config.serverIp, m_config.serverPort);
 
 		// 发送当前订阅的 tag 列表
@@ -623,7 +624,7 @@ void ZmBroadcastClient::HandleMessage(const std::string& json)
 		pong["action"] = "pong";
 		SendJson(zm_json_dump(pong));
 
-		DEFAULT_LOG_DEBUG("[BcClient] Pong sent");
+		PUBLIC_LOG_DEBUG("[BcClient] Pong sent");
 		return;
 	}
 
@@ -654,7 +655,7 @@ void ZmBroadcastClient::HandleMessage(const std::string& json)
 		return;
 	}
 
-	DEFAULT_LOG_WARN("[BcClient] Unknown message: {}", json);
+	PUBLIC_LOG_WARN("[BcClient] Unknown message: {}", json);
 }
 
 // ============================================================================
@@ -720,7 +721,7 @@ void ZmBroadcastClient::ExecuteTask(const BcClientTask& task)
 		break;
 
 	case BC_CLIENT_TASK_SEND:
-		if (m_bev && m_handshakeDone)
+		if (m_bev)
 			BcFrameEncode(m_bev, task.json);
 		break;
 	}
