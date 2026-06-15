@@ -294,7 +294,8 @@ void ZmBroadcastServer::Stop()
         if (!m_state.compare_exchange_strong(expected, ZM_BC_STATE_STOPPING))
         {
             if (m_state.load() == ZM_BC_STATE_STOPPED ||
-                m_state.load() == ZM_BC_STATE_IDLE)
+                m_state.load() == ZM_BC_STATE_IDLE ||
+                m_state.load() == ZM_BC_STATE_STOPPING)
                 return;
         }
     }
@@ -848,6 +849,7 @@ bool ZmBroadcastServer::BroadcastAt(const std::string& topic, const std::string&
 // DoSend（事件循环线程中执行真正的发送）
 // ============================================================================
 
+
 void ZmBroadcastServer::DoSend(const BcMessage& msg, const std::string& clientId,
                                 bool isBroadcast, uint32_t delayMs, uint64_t timestampMs)
 {
@@ -879,8 +881,9 @@ void ZmBroadcastServer::DoSend(const BcMessage& msg, const std::string& clientId
         tv.tv_sec = actualDelay / 1000;
         tv.tv_usec = (actualDelay % 1000) * 1000;
 
-        struct event* timer = evtimer_new(evbase, OnDelayedSendCB, heapTask);
-        evtimer_add(timer, &tv);
+        // 定时器存到 heapTask 中，回调里统一释放
+        heapTask->timer = evtimer_new(evbase, OnDelayedSendCB, heapTask);
+        evtimer_add(heapTask->timer, &tv);
         return;
     }
 
@@ -1001,7 +1004,17 @@ void ZmBroadcastServer::DeliverToClient(BcClient* client, const std::string& jso
 void ZmBroadcastServer::OnDelayedSendCB(evutil_socket_t fd, short what, void* ctx)
 {
     BcScheduledTask* heapTask = (BcScheduledTask*)ctx;
-    if (!heapTask || !heapTask->m_server)
+    if (!heapTask)
+        return;
+
+    // 释放定时器（已在 heapTask->timer 中存储）
+    if (heapTask->timer)
+    {
+        event_free(heapTask->timer);
+        heapTask->timer = nullptr;
+    }
+
+    if (!heapTask->m_server)
     {
         delete heapTask;
         return;

@@ -240,8 +240,8 @@ private:
 	struct event* m_handshakeTimer;                     ///< 握手超时定时器
 	struct event* m_dispatchEvent;                      ///< 跨线程调度事件
 
-	bool m_handshakeDone;                               ///< 握手是否完成
-	uint64_t m_startTime;                               ///< 握手完成时间戳
+	std::atomic<bool> m_handshakeDone;                  ///< 握手是否完成
+    std::atomic<uint64_t> m_startTime;                  ///< 握手完成时间戳
 
 	std::atomic<uint64_t> m_receivedCount;              ///< 累计接收消息数
 	std::vector<std::string> m_currentTags;             ///< 当前订阅标签列表

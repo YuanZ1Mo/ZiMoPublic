@@ -17,6 +17,7 @@
 
 #include <cstring>
 #include <thread>
+#include <future>
 
 // ============================================================================
 // 构造 / 析构
@@ -64,9 +65,9 @@ uint16_t ZmBroadcastClient::GetServerPort() const
 
 uint64_t ZmBroadcastClient::GetRunningTime() const
 {
-	if (m_startTime == 0)
+	if (m_startTime.load(std::memory_order_acquire) == 0)
 		return 0;
-	return (BcNowMillis() - m_startTime) / 1000;
+	return (BcNowMillis() - m_startTime.load(std::memory_order_acquire)) / 1000;
 }
 
 uint64_t ZmBroadcastClient::GetReceivedCount() const
@@ -98,7 +99,7 @@ bool ZmBroadcastClient::Subscribe(const std::vector<std::string>& tags)
 	}
 
 	// 若已连接则立即发送标签订阅
-	if (m_handshakeDone)
+	if (m_handshakeDone.load(std::memory_order_acquire))
 	{
 		ZMJSON msg;
 		msg["action"] = "subscribe";
@@ -125,7 +126,7 @@ bool ZmBroadcastClient::Unsubscribe(const std::vector<std::string>& tags)
 	}
 
 	// 若已连接则立即发送取消订阅
-	if (m_handshakeDone)
+	if (m_handshakeDone.load(std::memory_order_acquire))
 	{
 		ZMJSON msg;
 		msg["action"] = "unsubscribe";
@@ -237,9 +238,11 @@ void ZmBroadcastClient::DoConnect()
 	if (!m_bev)
 	{
 		PUBLIC_LOG_ERROR("[BcClient] Failed to create bufferevent");
-		if (m_callbacks.onConnectFailed)
-			m_callbacks.onConnectFailed("Failed to create socket");
-		ScheduleRetry();
+		auto cbf = m_callbacks.onConnectFailed;
+		if (cbf)
+			cbf("Failed to create socket");
+		if (m_state.load() != ZM_BC_STATE_STOPPED)
+			ScheduleRetry();
 		return;
 	}
 
@@ -257,9 +260,11 @@ void ZmBroadcastClient::DoConnect()
 		PUBLIC_LOG_ERROR("[BcClient] Invalid server IP: {}", m_config.serverIp);
 		bufferevent_free(m_bev);
 		m_bev = nullptr;
-		if (m_callbacks.onConnectFailed)
-			m_callbacks.onConnectFailed("Invalid server IP: " + m_config.serverIp);
-		ScheduleRetry();
+		auto cbf = m_callbacks.onConnectFailed;
+		if (cbf)
+			cbf("Invalid server IP: " + m_config.serverIp);
+		if (m_state.load() != ZM_BC_STATE_STOPPED)
+			ScheduleRetry();
 		return;
 	}
 
@@ -269,9 +274,11 @@ void ZmBroadcastClient::DoConnect()
 		PUBLIC_LOG_ERROR("[BcClient] Connect failed immediately (err={})", err);
 		bufferevent_free(m_bev);
 		m_bev = nullptr;
-		if (m_callbacks.onConnectFailed)
-			m_callbacks.onConnectFailed("Connect failed immediately");
-		ScheduleRetry();
+		auto cbf = m_callbacks.onConnectFailed;
+		if (cbf)
+			cbf("Connect failed immediately");
+		if (m_state.load() != ZM_BC_STATE_STOPPED)
+			ScheduleRetry();
 		return;
 	}
 
@@ -281,6 +288,16 @@ void ZmBroadcastClient::DoConnect()
 // ============================================================================
 // 生命周期 — Disconnect
 // ============================================================================
+
+// ============================================================================
+// Disconnect 同步辅助结构
+// ============================================================================
+
+/** @brief 用于同步 Disconnect 操作的辅助结构 */
+struct BcDisconnectSync {
+	ZmBroadcastClient* client;
+	std::promise<void> promise;
+};
 
 void ZmBroadcastClient::Disconnect()
 {
@@ -308,22 +325,36 @@ schedule:
 	{
 		// 已在事件循环线程，直接断开
 		DoDisconnect();
-		// DoDisconnect 已清理 dispatchEvent，但 evLoop 还在运行（无事件可处理）
-		// 外部调用者需确保后续 stop evLoop
-		return;
 	}
-
-	// 从外部线程调度断开
-	if (m_evLoop && m_evLoop->IsLooped())
+	else
 	{
-		BcClientTask task;
-		task.type = BC_CLIENT_TASK_DISCONNECT;
-		ScheduleTask(task);
-
-		// 等待事件循环退出（DoDisconnect 会清理资源并调用 event_base_loopexit）
-		m_evLoop->Stop();
+		// 使用 event_base_once + promise/future 确保 DoDisconnect 执行
+		ZmEvBaseRunLoop* evLoop = m_evLoop;
+		if (evLoop && evLoop->IsLooped())
+		{
+			struct event_base* evbase = evLoop->GetEventBase();
+			if (evbase)
+			{
+				auto task = new BcDisconnectSync{this, {}};
+				auto future = task->promise.get_future();
+				event_base_once(evbase, -1, EV_TIMEOUT,
+					[](evutil_socket_t, short, void* arg) {
+						auto* t = static_cast<BcDisconnectSync*>(arg);
+						t->client->DoDisconnect();
+						t->promise.set_value();
+						delete t;
+					}, task, nullptr);
+				future.wait();
+			}
+			evLoop->Stop();
+		}
 	}
 
+	// 手动断开时回调通知
+	if (m_callbacks.onDisconnected)
+		m_callbacks.onDisconnected();
+
+	// 释放事件循环
 	if (m_evLoop)
 	{
 		delete m_evLoop;
@@ -361,8 +392,8 @@ void ZmBroadcastClient::DoDisconnect()
 		m_bev = nullptr;
 	}
 
-	m_handshakeDone = false;
-	m_startTime = 0;
+	m_handshakeDone.store(false);
+	m_startTime.store(0, std::memory_order_release);
 
 	// 停止事件循环（从外部线程调用 Stop 时会等待 loop 退出，
 	// 若从 loop 线程调用则仅设置退出标志，下一轮 loop 检查后退出）
@@ -375,8 +406,6 @@ void ZmBroadcastClient::DoDisconnect()
 
 	m_state.store(ZM_BC_STATE_STOPPED, std::memory_order_release);
 
-	if (m_callbacks.onDisconnected)
-		m_callbacks.onDisconnected();
 
 	PUBLIC_LOG_INFO("[BcClient] Disconnected");
 }
@@ -461,11 +490,12 @@ void ZmBroadcastClient::OnConnectCB(struct bufferevent* bev, short events, void*
 			client->m_bev = nullptr;
 		}
 
-		if (client->m_callbacks.onConnectFailed)
-			client->m_callbacks.onConnectFailed("Connection failed");
+		auto cbf = client->m_callbacks.onConnectFailed;
+		if (cbf)
+			cbf("Connection failed");
 
-		// 1 秒后重试
-		client->ScheduleRetry();
+		if (client->m_state.load() != ZM_BC_STATE_STOPPED)
+			client->ScheduleRetry();
 	}
 }
 
@@ -528,14 +558,14 @@ void ZmBroadcastClient::OnEventCB(struct bufferevent* bev, short events, void* c
 			client->m_bev = nullptr;
 		}
 
-		client->m_handshakeDone = false;
+		client->m_handshakeDone.store(false);
 
-		// 回调通知断开
-		if (client->m_callbacks.onDisconnected)
-			client->m_callbacks.onDisconnected();
+		auto cb = client->m_callbacks.onDisconnected;
+		if (cb)
+			cb();
 
-		// 自动重连
-		client->ScheduleRetry();
+		if (client->m_state.load() != ZM_BC_STATE_STOPPED)
+			client->ScheduleRetry();
 	}
 }
 
@@ -562,7 +592,7 @@ void ZmBroadcastClient::OnHandshakeTimeoutCB(evutil_socket_t fd, short what, voi
 		client->m_bev = nullptr;
 	}
 
-	client->m_handshakeDone = false;
+	client->m_handshakeDone.store(false);
 
 	// 自动重连
 	client->ScheduleRetry();
@@ -600,8 +630,8 @@ void ZmBroadcastClient::HandleMessage(const std::string& json)
 		}
 
 		// 握手完成
-		m_handshakeDone = true;
-		m_startTime = BcNowMillis();
+		m_handshakeDone.store(true);
+		m_startTime.store(BcNowMillis(), std::memory_order_release);
 		m_state.store(ZM_BC_STATE_LISTENING, std::memory_order_release);
 
 		PUBLIC_LOG_INFO("[BcClient] Handshake complete with {}:{}",

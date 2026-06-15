@@ -35,6 +35,10 @@ std::string BcFrameDecode(struct evbuffer* input)
                      | ((uint32_t)lenBuf[2] << 8)
                      | ((uint32_t)lenBuf[3]);
 
+    // 检查 body 长度是否超过合理上限（16 MB），防止恶意超大帧
+    if (bodyLen > 16 * 1024 * 1024)
+        return std::string();
+
     // body 数据不足则等待
     if (avail < 4 + (size_t)bodyLen)
         return std::string();

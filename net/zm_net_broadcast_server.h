@@ -329,6 +329,7 @@ private:
         uint64_t   timestampMs;     ///< 定时时间戳（0 = 不使用）
         bool       isBroadcast;     ///< true = Broadcast, false = Send
         ZmBroadcastServer* m_server; ///< 所属服务端回指针
+        struct event* timer;         ///< 延时定时器（仅延时/定时发送使用）
 
         BcScheduledTask()
             : type(BC_TASK_SEND)
@@ -336,6 +337,7 @@ private:
             , timestampMs(0)
             , isBroadcast(false)
             , m_server(nullptr)
+            , timer(nullptr)
         {}
     };
 
@@ -419,7 +421,7 @@ private:
 
     std::atomic<uint64_t> m_sentCount;                  ///< 累计发送成功数
     std::atomic<uint64_t> m_discardCount;               ///< 累计丢弃数
-    uint64_t m_startTime;                               ///< 启动成功时间戳（毫秒），非原子（仅事件循环线程读写）
+    std::atomic<uint64_t> m_startTime;                   ///< 启动成功时间戳（毫秒）
 
     int m_retryCount;                                   ///< 绑定重试计数（仅事件循环线程）
     std::thread::id m_loopThreadId;                     ///< 事件循环线程 ID（用于线程检测）
