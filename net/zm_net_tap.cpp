@@ -100,7 +100,7 @@ void ZmTapContext::Clear()
     for (size_t i = 0; i < m_count; i++)
     {
         ZM_TAP_CTX* item = m_slots[i].tap;
-        Drop(item, "By Clear");
+        DropImpl(item, "By Clear");
         FreeTap(item);
     }
     memset(m_slots, 0, TAP_ITEM_SIZE * m_capacity);
@@ -110,63 +110,81 @@ void ZmTapContext::Clear()
 
 void ZmTapContext::Drop(ZM_TAP_CTX* tap, const char* reason)
 {
-    /** 通过判断 tap->mode 可以有效防止重复释放 */
-    if (tap && tap->state != ZM_TAP_STATE_DROPPING)
-    {
-        tap->state = ZM_TAP_STATE_DROPPING;
+	if (!tap || tap->state == ZM_TAP_STATE_DROPPING) return;
 
-        PUBLIC_LOG_INFO("Dropping Tap: {}, Reason:{}", (void*)tap, reason);
+	// 立即标记 DROPPING 状态防止复用（跨线程安全：uint8_t 单字节原子写入）
+	tap->state = ZM_TAP_STATE_DROPPING;
+	PUBLIC_LOG_INFO("Dropping Tap: {}, Reason:{}", (void*)tap, reason);
 
-        if (tap->delegate)
-        {
-            tap->delegate->OnTapDrop(tap);
-        }
+	// 获取事件循环基以调度清理任务
+	auto* evbase = const_cast<event_base*>(tap->EventBase());
+	if (evbase)
+	{
+		std::string rsn(reason);
+		ScheduleInLoop(evbase, [this, tap, rsn]() {
+			DropImpl(tap, rsn.c_str());
+		});
+	}
+	else
+	{
+		// 无 evbase（池已销毁或未初始化），直接同步清理
+		DropImpl(tap, reason);
+	}
+}
 
-        CancelResolve(tap);
+void ZmTapContext::DropImpl(ZM_TAP_CTX* tap, const char* reason)
+{
+	if (!tap) return;
 
-        FreeRequesterEnd(tap);
+	if (tap->delegate)
+	{
+		tap->delegate->OnTapDrop(tap);
+	}
 
-        if (tap->ev_timeout)
-        {
-            event_free(tap->ev_timeout);
-            tap->ev_timeout = nullptr;
-        }
+	CancelResolve(tap);
 
-        // request 已改为内联存储，只需释放其内部的动态字符串
-        if (tap->request.host) { free(tap->request.host); tap->request.host = nullptr; }
-        if (tap->request.userinfo) { free(tap->request.userinfo); tap->request.userinfo = nullptr; }
-        if (tap->request.path) { free(tap->request.path); tap->request.path = nullptr; }
-        if (tap->request.useragent) { free(tap->request.useragent); tap->request.useragent = nullptr; }
+	FreeRequesterEnd(tap);
 
-        if (tap->requester_data)
-        {
-            free(tap->requester_data);
-            tap->requester_data = nullptr;
-        }
+	if (tap->ev_timeout)
+	{
+		event_free(tap->ev_timeout);
+		tap->ev_timeout = nullptr;
+	}
 
-        if (tap->onback_data)
-        {
-            free(tap->onback_data);
-            tap->onback_data = nullptr;
-        }
+	// request 已改为内联存储，只需释放其内部的动态字符串
+	if (tap->request.host) { free(tap->request.host); tap->request.host = nullptr; }
+	if (tap->request.userinfo) { free(tap->request.userinfo); tap->request.userinfo = nullptr; }
+	if (tap->request.path) { free(tap->request.path); tap->request.path = nullptr; }
+	if (tap->request.useragent) { free(tap->request.useragent); tap->request.useragent = nullptr; }
 
-        // 保存槽位引用后清除 TAP 状态
-        ZM_TAP_SLOT* slot = tap->_slot;
-        tap->Clear();
+	if (tap->requester_data)
+	{
+		free(tap->requester_data);
+		tap->requester_data = nullptr;
+	}
 
-        // 回收到空闲栈，供 Get() 快速复用（O(1)）
-        // 同时清除槽位回指，防止 ForEach 遍历到已回收的 TAP
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (slot)
-            {
-                slot->tap = nullptr;
-            }
-            m_free_stack.push_back(tap);
-        }
+	if (tap->onback_data)
+	{
+		free(tap->onback_data);
+		tap->onback_data = nullptr;
+	}
 
-        PUBLIC_LOG_INFO("Drop Tap: {} Over", (void*)tap);
-    }
+	// 保存槽位引用后清除 TAP 状态
+	ZM_TAP_SLOT* slot = tap->_slot;
+	tap->Clear();
+
+	// 回收到空闲栈，供 Get() 快速复用（O(1)）
+	// 同时清除槽位回指，防止 ForEach 遍历到已回收的 TAP
+	{
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if (slot)
+		{
+			slot->tap = nullptr;
+		}
+		m_free_stack.push_back(tap);
+	}
+
+	PUBLIC_LOG_INFO("Drop Tap: {} Over", (void*)tap);
 }
 
 void ZmTapContext::FreeRequesterEnd(ZM_TAP_CTX* tap)
@@ -295,6 +313,15 @@ ZM_TAP_CTX* ZmTapContext::Get()
 
 void ZmTapContext::SetDropTimer(ZM_TAP_CTX* tap, int seconds, int micros, uint32_t drop_timeout_error_code)
 {
+	if (!tap) return;
+
+	ScheduleInLoop(tap, [tap, seconds, micros, drop_timeout_error_code]() {
+		SetDropTimerImpl(tap, seconds, micros, drop_timeout_error_code);
+	});
+}
+
+void ZmTapContext::SetDropTimerImpl(ZM_TAP_CTX* tap, int seconds, int micros, uint32_t drop_timeout_error_code)
+{
     PUBLIC_LOG_INFO("SetDropTimer, Tap: {}, time: {}s+{}ms, drop timeout errorCode: {}", (void*)tap, seconds, micros, drop_timeout_error_code);
 
     if (seconds >= 0 || micros >= 0)
@@ -316,6 +343,46 @@ void ZmTapContext::SetDropTimer(ZM_TAP_CTX* tap, int seconds, int micros, uint32
             evtimer_del(tap->ev_timeout);
         }
     }
+}
+
+void ZmTapContext::Response(ZM_TAP_CTX* tap, const ZMJSON& jsResponse)
+{
+	if (!tap) return;
+
+	std::string rspJson = jsResponse.dump();
+	ScheduleInLoop(tap, [tap, rspJson]() {
+		if (tap->state != ZM_TAP_STATE_INUSE)
+		{
+			PUBLIC_LOG_WARN("TAP 已失效，丢弃响应，TAP:{}, state:{}", (void*)tap, tap->state);
+			return;
+		}
+
+		std::string err;
+		ZMJSON js = zm_json_parse(rspJson, err);
+		if (!err.empty())
+		{
+			PUBLIC_LOG_ERROR("响应 JSON 解析失败: {}，TAP:{}", err, (void*)tap);
+			tap->Drop("async response json parse error");
+			return;
+		}
+		ResponseImpl(tap, js);
+	});
+}
+
+void ZmTapContext::ResponseImpl(ZM_TAP_CTX* tap, const ZMJSON& jsResponse)
+{
+	ZmTapDelegate* back_delegate = BackChainPop(tap);
+	if (back_delegate)
+	{
+		std::string jstr = jsResponse.dump();
+		SetOnBackData(tap, jstr.size(), jstr.c_str());
+		back_delegate->OnTapDelegateBackEvent(tap);
+	}
+	else
+	{
+		PUBLIC_LOG_WARN("TAP 回传链为空，无法写入响应，TAP:{}", (void*)tap);
+		tap->Drop("back chain empty");
+	}
 }
 
 void ZmTapContext::SetOptData(ZM_TAP_CTX* tap, size_t optlen, const BYTE* optdata)
@@ -510,6 +577,56 @@ bool ZmTapContext::IsBackChainEmpty(ZM_TAP_CTX* tap)
     return true;
 }
 
+// ============================================================================
+// ZmTapContext — 跨线程调度
+// ============================================================================
+
+/**
+ * @brief 跨线程调度上下文（一次性事件，回调中自释放）
+ */
+struct ZmTapScheduleCtx
+{
+    std::function<void()> fn;       ///< 要执行的任务
+    struct event*         ev;       ///< libevent 调度事件（回调中 event_free）
+};
+
+/** @brief 调度事件回调：执行 fn 后释放事件和上下文 */
+static void OnZmTapScheduleCB(evutil_socket_t fd, short what, void* arg)
+{
+    if (arg == nullptr) return;
+    auto* ctx = static_cast<ZmTapScheduleCtx*>(arg);
+    if (ctx->fn)
+        ctx->fn();
+    if (ctx->ev)
+        event_free(ctx->ev);
+    delete ctx;
+}
+
+bool ZmTapContext::ScheduleInLoop(ZM_TAP_CTX* tap, std::function<void()> fn)
+{
+    if (tap == nullptr) return false;
+    struct event_base* evbase = const_cast<event_base*>(tap->EventBase());
+    return ScheduleInLoop(evbase, std::move(fn));
+}
+
+bool ZmTapContext::ScheduleInLoop(event_base* evbase, std::function<void()> fn)
+{
+    if (evbase == nullptr) return false;
+
+    auto* ctx = new ZmTapScheduleCtx{ std::move(fn), nullptr };
+
+    // fd=-1 手动触发事件，events=0 不监听任何 I/O，一次性执行后回调中自释放
+    ctx->ev = event_new(evbase, -1, 0, OnZmTapScheduleCB, ctx);
+    if (ctx->ev == nullptr)
+    {
+        delete ctx;
+        return false;
+    }
+    event_add(ctx->ev, nullptr);
+    event_active(ctx->ev, 0, 0);
+    return true;
+}
+
 
 // ============================================================================
 // BuffereventPairPool
@@ -670,18 +787,6 @@ void ZmTapDelegate::StopTapDelegate()
 {
     OnStopTap();
 
-    // 清理未触发的调度事件
-    {
-        std::lock_guard<std::mutex> lock(m_scheduleMutex);
-        for (auto* ctx : m_pendingScheduleCtx)
-        {
-            if (ctx->ev_schedule)
-                event_free(ctx->ev_schedule);
-            delete ctx;
-        }
-        m_pendingScheduleCtx.clear();
-    }
-
     if (m_evdelegate != nullptr)
     {
         event_free(m_evdelegate);
@@ -717,152 +822,6 @@ event_base* ZmTapDelegate::TapDelegateEventBase()
 evdns_base* ZmTapDelegate::TapDelegateEvdnsBase()
 {
     return m_evdnsbase;
-}
-
-// ============================================================================
-// 跨线程调度
-// ============================================================================
-
-bool ZmTapDelegate::ScheduleInLoop(std::function<void()> fn)
-{
-    if (m_evbase == nullptr)
-        return false;
-
-    ScheduleCtx* ctx = new ScheduleCtx();
-    ctx->ev_schedule = nullptr;
-    ctx->fn = std::move(fn);
-    ctx->owner = this;
-
-    // fd=-1 手动触发事件，events=0 不监听任何 I/O
-    ctx->ev_schedule = event_new(m_evbase, -1, 0, ZmTapDelegate::OnScheduleEventCB, ctx);
-    event_add(ctx->ev_schedule, nullptr);
-
-    {
-        std::lock_guard<std::mutex> lock(m_scheduleMutex);
-        m_pendingScheduleCtx.insert(ctx);
-    }
-
-    event_active(ctx->ev_schedule, EV_TIMEOUT, 0);
-    return true;
-}
-
-void ZmTapDelegate::OnScheduleEventCB(evutil_socket_t fd, short what, void* pctx)
-{
-    if (pctx == nullptr) return;
-    ScheduleCtx* ctx = (ScheduleCtx*)pctx;
-    ZmTapDelegate* self = ctx->owner;
-
-    if (self)
-    {
-        std::lock_guard<std::mutex> lock(self->m_scheduleMutex);
-        self->m_pendingScheduleCtx.erase(ctx);
-    }
-
-    if (ctx->ev_schedule)
-        event_free(ctx->ev_schedule);
-    if (ctx->fn)
-        ctx->fn();
-    delete ctx;
-}
-
-// ============================================================================
-// TAP 响应操作（同步，必须在事件循环线程中调用）
-// ============================================================================
-
-void ZmTapDelegate::Response(ZM_TAP_CTX* tap, const ZMJSON& jsResponse)
-{
-    ZmTapDelegate* back_delegate = ZmTapContext::BackChainPop(tap);
-    if (back_delegate)
-    {
-        std::string jstr = jsResponse.dump();
-        ZmTapContext::SetOnBackData(tap, jstr.size(), jstr.c_str());
-        back_delegate->OnTapDelegateBackEvent(tap);
-    }
-    else
-    {
-        PUBLIC_LOG_WARN("TAP 回传链为空，无法写入响应，TAP:{}", (void*)tap);
-        tap->Drop("back chain empty");
-    }
-}
-
-// ============================================================================
-// TAP 异步操作（可在任意线程调用，内部回投到事件循环线程）
-// ============================================================================
-
-void ZmTapDelegate::ResponseAsync(ZM_TAP_CTX* tap, const ZMJSON& jsResponse)
-{
-    std::string rspJson = jsResponse.dump();
-
-    bool scheduled = ScheduleInLoop([this, tap, rspJson]() {
-        // 校验 TAP 是否仍然存活
-        if (tap->state != ZM_TAP_STATE_INUSE)
-        {
-            PUBLIC_LOG_WARN("TAP 已失效，丢弃异步响应，TAP:{}, state:{}",
-                (void*)tap, tap->state);
-            return;
-        }
-
-        std::string err;
-        ZMJSON js = zm_json_parse(rspJson, err);
-        if (!err.empty())
-        {
-            PUBLIC_LOG_ERROR("异步响应 JSON 解析失败: {}，TAP:{}", err, (void*)tap);
-            tap->Drop("async response json parse error");
-            return;
-        }
-        Response(tap, js);
-    });
-
-    if (!scheduled)
-    {
-        PUBLIC_LOG_ERROR("ScheduleInLoop 调度失败，事件循环可能已停止，TAP:{}", (void*)tap);
-    }
-}
-
-void ZmTapDelegate::ResponseResultAsync(ZM_TAP_CTX* tap, const ZMJSON& jsResult)
-{
-    ZMJSON rsp;
-    rsp["result"] = jsResult;
-    ResponseAsync(tap, rsp);
-}
-
-void ZmTapDelegate::ResponseErrorAsync(ZM_TAP_CTX* tap, const ZMJSON& jsError)
-{
-    ZMJSON rsp;
-    rsp["error"] = jsError;
-    ResponseAsync(tap, rsp);
-}
-
-void ZmTapDelegate::SetDropTimerAsync(ZM_TAP_CTX* tap, int seconds, int micros, uint32_t drop_timeout_error_code)
-{
-    bool scheduled = ScheduleInLoop([tap, seconds, micros, drop_timeout_error_code]() {
-        ZmTapContext::SetDropTimer(tap, seconds, micros, drop_timeout_error_code);
-    });
-
-    if (!scheduled)
-    {
-        PUBLIC_LOG_ERROR("ScheduleInLoop 调度失败，SetDropTimerAsync 未执行，TAP:{}", (void*)tap);
-    }
-}
-
-void ZmTapDelegate::DropAsync(ZM_TAP_CTX* tap, const char* reason)
-{
-    std::string rsn(reason ? reason : "unknown");
-    bool scheduled = ScheduleInLoop([tap, rsn]() {
-        if (tap->state != ZM_TAP_STATE_INUSE)
-        {
-            PUBLIC_LOG_WARN("TAP 已失效，跳过重复 Drop，TAP:{}, state:{}, reason:{}",
-                (void*)tap, tap->state, rsn);
-            return;
-        }
-        tap->Drop(rsn.c_str());
-    });
-
-    if (!scheduled)
-    {
-        PUBLIC_LOG_ERROR("ScheduleInLoop 调度失败，DropAsync 未执行，TAP:{}, reason:{}",
-            (void*)tap, rsn);
-    }
 }
 
 // ============================================================================
