@@ -1035,6 +1035,9 @@ bool ZmHttpServer::BindEventBase(struct event_base* evbase)
     // 设置通用请求回调，所有进入的请求都走 OnHttp_RequestCB
     evhttp_set_gencb(m_evhttpd, ZmHttpServer::OnHttp_RequestCB, this);
 
+    // 不限制最大并发连接数（0 表示禁用限制），实际上限由线程池和系统资源决定
+    evhttp_set_max_connections(m_evhttpd, 0);
+
     do
     {
         if (m_local_port)
