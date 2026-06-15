@@ -4,6 +4,15 @@
 #include <event2/buffer.h>
 
 /**
+ * @brief socket 地址复用类型枚举
+ */
+enum class ZmSocketReuseType
+{
+    ZM_SO_REUSEADDR,           ///< 使用 SO_REUSEADDR 允许端口复用
+    ZM_SO_REUSEADDR_EXCLUSIVE  ///< 使用 SO_EXCLUSIVEADDRUSE 独占端口
+};
+
+/**
  * @brief 初始化 libevent 线程支持和信号处理
  *
  * 必须在 event_base_new() 之前调用，全局调用一次即可。
@@ -21,6 +30,48 @@ void zm_util_bufferevent_free(struct bufferevent* bev);
 size_t zm_util_bufferevent_output_len(struct bufferevent* bev);
 
 size_t zm_util_bufferevent_input_len(struct bufferevent* bev);
+
+/**
+ * @brief 创建非阻塞 TCP socket
+ *
+ * 根据目标地址解析地址族（IPv4/IPv6），创建对应协议族 socket，
+ * 设置 SO_REUSEADDR 和非阻塞模式。
+ *
+ * @param address     目标主机地址（IP 或域名，仅用于判断地址族）
+ * @param port        目标端口（仅用于 hints，不影响 socket 创建）
+ * @param reuse_type  地址复用策略
+ * @return            成功返回 socket 句柄，失败返回 -1
+ *
+ * @example
+ *   evutil_socket_t fd = zm_util_create_socket_nonblock("127.0.0.1", 37310,
+ *       ZmSocketReuseType::ZM_SO_REUSEADDR);
+ *   if (fd >= 0) {
+ *       struct bufferevent* bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
+ *       // ...
+ *   }
+ */
+evutil_socket_t zm_util_create_socket_nonblock(const char* address, uint16_t port,
+    ZmSocketReuseType reuse_type);
+
+/**
+ * @brief 对 bufferevent 发起异步 TCP 连接
+ *
+ * 解析目标地址后调用 bufferevent_socket_connect() 发起异步连接。
+ * 连接结果通过 bufferevent 的事件回调（BEV_EVENT_CONNECTED）通知。
+ *
+ * @param bev     已关联 socket 的 bufferevent 对象
+ * @param address 目标主机地址（IP 或域名）
+ * @param port    目标端口
+ * @return        0 成功发起连接，-1 失败
+ *
+ * @example
+ *   struct bufferevent* bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
+ *   if (zm_util_bufferevent_socket_connect(bev, "127.0.0.1", 37310) == 0) {
+ *       // 等待 BEV_EVENT_CONNECTED 回调
+ *   }
+ */
+int zm_util_bufferevent_socket_connect(struct bufferevent* bev, const char* address, uint16_t port);
+
 
 /**
  * @brief evbuffer 的 RAII 包装类，自动管理 evbuffer 的生命周期

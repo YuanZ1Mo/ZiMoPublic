@@ -97,6 +97,108 @@ size_t zm_util_bufferevent_input_len(struct bufferevent* bev)
     return buffer ? evbuffer_get_length(buffer) : 0;
 }
 
+evutil_socket_t zm_util_create_socket_nonblock(const char* address, uint16_t port,
+    ZmSocketReuseType reuse_type)
+{
+    if (address == nullptr || address[0] == '\0')
+    {
+        return -1;
+    }
+
+    (void)(port);
+
+    /* 根据地址字符串判断地址族（简单判断：含冒号为 IPv6，否则 IPv4） */
+    int family = AF_INET;
+    if (strchr(address, ':'))
+    {
+        family = AF_INET6;
+    }
+
+    evutil_socket_t fd = socket(family, SOCK_STREAM, 0);
+    if (fd < 0)
+    {
+        return -1;
+    }
+
+    /* 设置地址复用 */
+    int optval = 1;
+    if (reuse_type == ZmSocketReuseType::ZM_SO_REUSEADDR)
+    {
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+            reinterpret_cast<const char*>(&optval), sizeof(optval));
+    }
+
+    /* 设置为非阻塞模式 */
+    if (evutil_make_socket_nonblocking(fd) < 0)
+    {
+        evutil_closesocket(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+int zm_util_bufferevent_socket_connect(struct bufferevent* bev, const char* address, uint16_t port)
+{
+    if (bev == nullptr || address == nullptr || address[0] == '\0')
+    {
+        return -1;
+    }
+
+    /* 构造 sockaddr */
+    struct sockaddr_storage ss = {};
+    int ss_len = sizeof(ss);
+
+    if (evutil_parse_sockaddr_port(address, reinterpret_cast<struct sockaddr*>(&ss), &ss_len) < 0)
+    {
+        /* 尝试作为域名解析（本次同步解析，实际异步应使用 evdns） */
+        struct evutil_addrinfo hints;
+        struct evutil_addrinfo* ai = nullptr;
+
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+
+        char port_str[16];
+        snprintf(port_str, sizeof(port_str), "%u", port);
+
+        if (evutil_getaddrinfo(address, port_str, &hints, &ai) != 0)
+        {
+            return -1;
+        }
+
+        if (ai == nullptr)
+        {
+            return -1;
+        }
+
+        memcpy(&ss, ai->ai_addr, ai->ai_addrlen);
+        ss_len = static_cast<int>(ai->ai_addrlen);
+        evutil_freeaddrinfo(ai);
+    }
+    else
+    {
+        /* evutil_parse_sockaddr_port 成功，手动设置端口 */
+        if (ss.ss_family == AF_INET)
+        {
+            reinterpret_cast<struct sockaddr_in*>(&ss)->sin_port = htons(port);
+        }
+        else if (ss.ss_family == AF_INET6)
+        {
+            reinterpret_cast<struct sockaddr_in6*>(&ss)->sin6_port = htons(port);
+        }
+    }
+
+    /* 发起异步连接 */
+    if (bufferevent_socket_connect(bev, reinterpret_cast<struct sockaddr*>(&ss), ss_len) < 0)
+    {
+        return -1;
+    }
+
+    return 0;
+}
+
 // ZmEventBuffer
 
 /**
