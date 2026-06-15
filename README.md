@@ -1,6 +1,6 @@
 # ZiMoPublic
 
-ZiMo 生态的 C++ 公共基础库，为 ZiMoService 及其他上层项目提供网络通信、Windows 服务框架、SSL/TLS 安全、WebSocket、日志、JSON 处理、线程工具等通用能力。
+ZiMo 生态的 C++ 公共基础库，为 ZiMoService 及其他上层项目提供网络通信、Windows 服务框架、SSL/TLS 安全、日志、JSON 处理、线程工具等通用能力。
 
 ## 模块总览
 
@@ -15,7 +15,6 @@ ZiMoPublic/
 ├── spdlog/          # 定制版 spdlog 日志库 + zm_logger 封装
 ├── ssl/             # SSL/TLS 上下文管理、证书指纹校验
 ├── util/            # 通用工具（线程、字符串、文件、容器、加密、系统）
-└── websocket/       # WebSocket 服务端/客户端实现
 ```
 
 ## 各模块详解
@@ -216,33 +215,6 @@ ZiMoPublic/
 | `ZM_SSL_FINGERPRINT` | 指纹记录：hostname + port + 最多 8 条 SHA1 指纹 |
 | `ZmSSLFingerprint` | 指纹白名单管理器（单例）：注册/校验，支持 SNI、peer address 多种查找方式 |
 
-### websocket — WebSocket 实现
-
-#### zm_websocket_utils — 公共基类
-
-| 类型 | 说明 |
-|------|------|
-| `ZmMessageItem` | 消息载荷（堆分配内存 + 长度） |
-| `ZM_WS_CONTROL` | 位掩码控制事件：SEND / BOUND / CONNECTED / CLOSE |
-| `ZmMessageWSBase` | WebSocket 通信基类：状态管理 + 消息队列 + 控制事件抽象 |
-
-#### zm_websocket_server — 服务端
-
-| 类 | 说明 |
-|----|------|
-| `ZmMessageWSServer` | WebSocket 核心服务端：基于 libevent evhttp + evws，运行在独立事件循环线程 |
-| `ZmMessageServer` | 线程安全的同步包装层：`Start`/`Stop` 阻塞等待，`PostNotificationWithTopic` 广播 |
-
-特性：
-- 自动 WebSocket Upgrade 握手（evws_new_session）
-- 连接数限制、心跳配置（预留）、统计信息
-- 消息队列缓存 + 批量广播
-- 双回调注册方式（函数指针 / 成员函数模板）
-
-#### zm_websocket_client / zm_websocket_protocol
-
-WebSocket 客户端实现及底层协议帧编解码。
-
 ### spdlog — 日志系统
 
 #### zm_logger — 日志封装
@@ -305,7 +277,7 @@ STOPPED →(Start) STARTING → RUNNING →(Stop) STOPPING → STOPPED
 
 ### libevent / openssl — 第三方预编译库
 
-- **libevent**：事件驱动网络库，提供 `event_base`、`evhttp`、`evdns`、`evws`（WebSocket）、`bufferevent` 等
+- **libevent**：事件驱动网络库，提供 `event_base`、`evhttp`、`evdns`、`bufferevent` 等
 - **openssl**：SSL/TLS 加密库，提供 `SSL_CTX`、`BIO`、`X509` 等
 
 两个库均以预编译头文件 + 静态库形式引入，无需单独编译。
@@ -313,7 +285,6 @@ STOPPED →(Start) STARTING → RUNNING →(Stop) STOPPING → STOPPED
 ## 依赖关系
 
 ```
-websocket ──→ util ──→ spdlog
 net ────────→ ssl ──→ util
 net ────────→ json ──→ util
 net ────────→ libevent
