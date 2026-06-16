@@ -831,34 +831,57 @@ bool ZmHttpHead::IsEmpty()
 
 // ============================ ZmHttpServer ============================
 
-ZmHttpServer::ZmHttpServer(uint16_t local_port) : ZmThread("HTTPD"),
-    m_evbase(nullptr), m_evhttpd(nullptr), m_ctrl_event(nullptr), m_pool(nullptr),
-    m_local_port(local_port), m_port_bind_failed(false), m_shutdown_requested(false)
+ZmHttpServer::ZmHttpServer(struct event_base* evbase, uint16_t local_port)
+    : m_evbase(evbase), m_evhttpd(nullptr), m_pool(nullptr),
+      m_local_port(local_port), m_port_bind_failed(false)
 {}
 
 ZmHttpServer::~ZmHttpServer()
 {
-    FreeEventObjects();
+    Close();
 }
 
-void ZmHttpServer::OnStopping()
+bool ZmHttpServer::Init()
 {
-    m_shutdown_requested = true;
-    if (ZmThread::CurrentThreadID() == ThreadID())
+    // 初始化 libevent 线程支持（Windows 下调用 evthread_use_windows_threads）
+    // 必须在 event_base_new 之前调用，全局只需调用一次
+    zm_util_eventbase_init();
+
+    if (!m_evbase)
+        return false;
+
+    if (!BindEventBase(m_evbase))
+        return false;
+
+    // 创建工作线程池（线程复用，替代 thread-per-request）
+    m_pool = new ZmThreadPool(
+        (uint16_t)std::thread::hardware_concurrency());
+
+    return true;
+}
+
+void ZmHttpServer::Close()
+{
+    // ★ 先停线程池（join 所有 worker，确保不再有 REPLY 信号进入事件循环）
+    if (m_pool)
     {
-        // 同线程直接打断事件循环
-        OnControlClose();
+        delete m_pool;
+        m_pool = nullptr;
     }
-    else if (m_ctrl_event)
+
+    // 释放 evhttp（停止接受新连接）
+    if (m_evhttpd)
     {
-        // 跨线程通过事件通知，安全地由事件循环线程执行关闭
-        event_active(m_ctrl_event, ZM_HTTPD_CONTROL_CLOSE, 0);
+        evhttp_free(m_evhttpd);
+        m_evhttpd = nullptr;
     }
-    else if (m_evbase)
-    {
-        // 控制事件尚未创建（BindEventBase 未完成），直接打断事件循环
-        event_base_loopbreak(m_evbase);
-    }
+
+    // m_evbase 由外部管理生命周期，不在此释放
+}
+
+bool ZmHttpServer::IsOpen() const
+{
+    return m_evhttpd != nullptr;
 }
 
 uint16_t ZmHttpServer::LocalPort()
@@ -963,12 +986,6 @@ void ZmHttpServer::OnEvent_Control(evutil_socket_t fd, short what, void* ctx)
             ZmHttpdDoer* doer = (ZmHttpdDoer*)ctx;
             doer->SendReplyEnd();
         }
-        else if (ZmHttpServer::ZM_HTTPD_CONTROL_CLOSE & what)
-        {
-            // 外部线程请求关闭服务器
-            ZmHttpServer* hs = (ZmHttpServer*)ctx;
-            hs->OnControlClose();
-        }
     }
 }
 
@@ -985,27 +1002,6 @@ int ZmHttpServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t dle
 {
     // 返回 0 表示此路径不支持，Perform 中会将 0 覆盖为 404
     return m_on_request ? m_on_request(task, data, dlen) : 0;
-}
-
-void ZmHttpServer::Run()
-{
-    // 初始化 libevent 线程支持（Windows 下调用 evthread_use_windows_threads）
-    // 必须在 event_base_new 之前调用，全局只需调用一次
-    zm_util_eventbase_init();
-    FreeEventObjects();
-
-    m_evbase = event_base_new();
-    bool bindRet = BindEventBase(m_evbase);
-    // 检查 m_shutdown_requested 防止在 BindEventBase 完成前收到 Shutdown 导致进入事件循环
-    if (bindRet && !m_shutdown_requested)
-    {
-        // 创建工作线程池（线程复用，替代 thread-per-request）
-        m_pool = new ZmThreadPool(
-            (uint16_t)std::thread::hardware_concurrency());
-        event_base_dispatch(m_evbase);
-    }
-
-    FreeEventObjects();
 }
 
 bool ZmHttpServer::BindEventBase(struct event_base* evbase)
@@ -1056,16 +1052,13 @@ bool ZmHttpServer::BindEventBase(struct event_base* evbase)
 
     if (ret)
     {
-        // 创建控制事件用于接收外部线程的信号（Shutdown、Reply 等）
-        // fd=-1 表示不关联 socket，EV_PERSIST 允许重复触发
-        m_ctrl_event = event_new(evbase, -1, EV_PERSIST | EV_READ, ZmHttpServer::OnEvent_Control, (void*)this);
-        event_add(m_ctrl_event, nullptr);
+        // 端口绑定成功
     }
     else
     {
         m_port_bind_failed = true;
         // 绑定失败时释放已创建的 evhttp 对象，避免资源泄漏
-        // evbase 由 FreeEventObjects 在 Run() 中释放
+        // evbase 由外部管理生命周期
         if (m_evhttpd)
         {
             evhttp_free(m_evhttpd);
@@ -1075,43 +1068,6 @@ bool ZmHttpServer::BindEventBase(struct event_base* evbase)
 
     return ret;
 }
-
-void ZmHttpServer::OnControlClose()
-{
-    if (m_evbase)
-    {
-        // 打断事件循环，使 event_base_dispatch 返回
-        event_base_loopbreak(m_evbase);
-    }
-}
-
-void ZmHttpServer::FreeEventObjects()
-{
-    // 先停线程池（join 所有 worker，确保不再有任务访问 evbase）
-    if (m_pool)
-    {
-        delete m_pool;
-        m_pool = nullptr;
-    }
-
-    // 释放顺序: ctrl_event → evhttpd → evbase
-    if (m_ctrl_event)
-    {
-        event_free(m_ctrl_event);
-        m_ctrl_event = nullptr;
-    }
-    if (m_evhttpd)
-    {
-        evhttp_free(m_evhttpd);
-        m_evhttpd = nullptr;
-    }
-    if (m_evbase)
-    {
-        event_base_free(m_evbase);
-        m_evbase = nullptr;
-    }
-}
-
 
 // ============================ ZmJsonRpcServer ============================
 /*
@@ -1124,8 +1080,8 @@ void ZmHttpServer::FreeEventObjects()
 * -32000 to -32099             Server error (Reserved for implementation-defined server-errors).
 */
 
-ZmJsonRpcServer::ZmJsonRpcServer(const char* root_uri, uint16_t local_port)
-    : ZmHttpServer(local_port)
+ZmJsonRpcServer::ZmJsonRpcServer(struct event_base* evbase, const char* root_uri, uint16_t local_port)
+    : ZmHttpServer(evbase, local_port)
 {
     if (root_uri)
     {

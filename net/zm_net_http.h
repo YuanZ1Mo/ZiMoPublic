@@ -352,41 +352,41 @@ private:
 
 
 /**
- * @brief 多线程 HTTP 服务器，基于 libevent 事件循环驱动
+ * @brief 多线程 HTTP 服务器，基于外部 libevent 事件循环驱动
  *
- * 继承自 ZmThread，在独立线程中运行 libevent 的事件循环。每个进入的 HTTP 请求
- * 会被分配给一个 ZmHttpdDoer 工作线程处理，不会阻塞事件循环接收新请求。
+ * 不再继承 ZmThread。构造函数接受外部 event_base，不创建独立事件循环线程。
+ * 每个进入的 HTTP 请求会被分配给线程池中的工作线程处理，不阻塞事件循环接收新请求。
  *
  * 线程交互:
- *   - 事件循环线程: 接收请求 → 创建 ZmHttpdDoer → 启动工作线程
+ *   - 事件循环线程: 接收请求 → 创建 ZmHttpdDoer → 提交到线程池
  *   - 工作线程:     执行 Perform() → 通过 event_active 通知事件循环线程发送响应
  *   - 事件循环线程: 收到通知 → SendReply() → 启动 1 秒定时器 → 延迟释放资源
  *
+ * @note 事件循环由外部（如 ZmEvBaseRunLoop）管理，ZmHttpServer 不负责事件循环的启停
+ *
  * @example 基本使用
  * @code
- *   ZmHttpServer server(8080);
+ *   ZmHttpServer server(evbase, 8080);
  *   server.SetRequestCallback([](ZmHttpdTask* task, const BYTE* data, size_t dlen) -> int {
  *       task->PutReplyHeader("Content-type", "text/plain");
  *       task->SetReplyData((const BYTE*)"hello", 5);
  *       return 200;
  *   });
- *   server.Startup();
+ *   server.Init();
  * @endcode
  */
-class ZmHttpServer : public ZmThread
+class ZmHttpServer
 {
 public:
     /**
      * @brief 事件循环内部控制事件类型，用于线程间通信
      *
      * 通过 event_active 的 what 参数传递，事件循环线程根据类型执行对应操作:
-     *   - ZM_HTTPD_CONTROL_CLOSE:     通知事件循环退出（Shutdown 调用）
      *   - ZM_HTTPD_CONTROL_REPLY:     工作线程请求发送 HTTP 响应
      *   - ZM_HTTPD_CONTROL_REPLY_END: 定时器到期，释放 ZmHttpdDoer 资源
      */
     enum
     {
-        ZM_HTTPD_CONTROL_CLOSE     = 0x0100,   ///< 通知事件循环退出
         ZM_HTTPD_CONTROL_REPLY     = 0x0200,   ///< 工作线程请求发送响应
         ZM_HTTPD_CONTROL_REPLY_END = 0x0400    ///< 响应发送完成，延迟释放资源
     };
@@ -402,12 +402,25 @@ public:
 
     /**
      * @brief 构造 HTTP 服务器
-     * @param local_port  监听端口号
+     * @param evbase     外部 libevent 事件循环对象（不由此类接管生命周期）
+     * @param local_port 监听端口号
      */
-    ZmHttpServer(uint16_t local_port);
+    ZmHttpServer(struct event_base* evbase, uint16_t local_port);
 
-    /** @brief 析构，释放所有 libevent 资源 */
+    /** @brief 析构，释放 evhttp 和控制事件（不释放外部 event_base） */
     virtual ~ZmHttpServer();
+
+    /**
+     * @brief 初始化 HTTP 服务器：绑定端口、创建工作线程池和控制事件
+     * @return true 初始化成功
+     */
+    bool Init();
+
+    /** @brief 关闭 HTTP 服务器：停止线程池、释放控制事件和 evhttp（不释放外部 event_base） */
+    void Close();
+
+    /** @brief 查询服务器是否已初始化 */
+    bool IsOpen() const;
 
     /** @brief 获取监听端口号 */
     uint16_t           LocalPort();
@@ -440,7 +453,7 @@ public:
      * @param request  libevent 请求对象
      * @param arg      ZmHttpServer 实例指针
      *
-     * @note 创建 ZmHttpdDoer 工作线程处理请求，线程启动失败时返回 503
+     * @note 创建 ZmHttpdDoer 并提交到线程池处理请求
      */
     static void OnHttp_RequestCB(struct evhttp_request* request, void* arg);
 
@@ -473,48 +486,18 @@ protected:
     virtual int  OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t dlen);
 
     /**
-     * @brief 线程主函数（ZmThread 虚函数重写）
-     *
-     * 执行流程:
-     *   1. 初始化 libevent 线程支持
-     *   2. 创建 event_base 和 evhttp 服务器
-     *   3. 绑定端口并进入事件循环（阻塞）
-     *   4. 事件循环退出后释放资源
-     */
-    virtual void Run();
-
-    /**
-    * @brief 关闭 HTTP 服务器，安全终止事件循环
-    *
-    * 根据调用者所在线程采取不同策略:
-    *   - 事件循环线程内: 直接调用 event_base_loopbreak
-    *   - 其他线程且控制事件已创建: 通过 event_active 发送关闭信号
-    *   - 其他线程且事件循环尚未初始化: 通过 event_base_loopbreak 直接打断
-    */
-    virtual void OnStopping() override;
-
-    /**
      * @brief 将 libevent HTTP 服务器绑定到指定 event_base
      * @param evbase  libevent 事件循环对象
      * @return        true 绑定成功，false 端口绑定失败
      */
     bool BindEventBase(struct event_base* evbase);
 
-    /** @brief 通过 event_base_loopbreak 终止事件循环 */
-    void OnControlClose();
-
-    /** @brief 按顺序释放 ctrl_event → evhttpd → evbase，全部置 nullptr */
-    void FreeEventObjects();
-
 private:
-    /** @brief libevent 事件循环对象 */
+    /** @brief libevent 事件循环对象（外部传入，不由此类释放） */
     struct event_base* m_evbase;
 
     /** @brief libevent HTTP 服务器对象 */
     struct evhttp*     m_evhttpd;
-
-    /** @brief 用于接收外部线程控制信号的事件（关闭、响应等） */
-    struct event*      m_ctrl_event;
 
     /** @brief 工作线程池（复用线程处理请求，替代 thread-per-request） */
     ZmThreadPool*      m_pool;
@@ -524,9 +507,6 @@ private:
 
     /** @brief 端口绑定是否失败（BindEventBase 中设置） */
     bool               m_port_bind_failed;
-
-    /** @brief 是否已请求关闭（防止 Shutdown 后仍进入事件循环） */
-    bool               m_shutdown_requested;
 
     /** @brief 通用 HTTP 请求处理回调 */
     OnHttpdRequestCB   m_on_request;
@@ -601,10 +581,11 @@ public:
 
     /**
      * @brief 构造 JSON-RPC 服务器
-     * @param root_uri     RPC 请求的 URI 前缀，仅匹配此前缀的请求走 RPC 流程，为空或 nullptr 时所有请求走 RPC
-     * @param local_port   监听端口号
+     * @param evbase      外部 libevent 事件循环对象
+     * @param root_uri    RPC 请求的 URI 前缀，仅匹配此前缀的请求走 RPC 流程，为空或 nullptr 时所有请求走 RPC
+     * @param local_port  监听端口号
      */
-    ZmJsonRpcServer(const char* root_uri, uint16_t local_port);
+    ZmJsonRpcServer(struct event_base* evbase, const char* root_uri, uint16_t local_port);
 
     /** @brief 析构 */
     virtual ~ZmJsonRpcServer();
