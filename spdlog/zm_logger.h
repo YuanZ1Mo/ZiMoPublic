@@ -26,8 +26,8 @@ public:
         bool is_default = false;
         size_t max_file_size = 1024 * 1024 * 10; // 10MB
         int max_files = 10;
-        // 日志格式：时间 | logger名 | 进程ID | 线程ID | 级别 | 源文件 | 函数名 | 行号 | 内容
-        std::string pattern = "[%Y-%m-%d %H:%M:%S.%e] [%n] [%P] [%t] [%l] [%s] [%!] [%#] %v";
+        // 日志格式：时间 | logger名 | 进程ID | 线程ID | 线程名 | 级别 | 源文件 | 函数名 | 行号 | 内容
+        std::string pattern = "[%Y-%m-%d %H:%M:%S.%e] [%n] [%P] [%t] [%T] [%l] [%s] [%!] [%#] %v";
     };
 
     RotatingLoggerBase(RotatingLoggerBase&&) = delete;

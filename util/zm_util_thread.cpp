@@ -5,7 +5,7 @@
 
 
 /// 全局线程池实例, 供 InvokeLater / InvokeCancel 使用
-ZmThreadPool g_zm_thread_pool;
+ZmThreadPool g_zm_thread_pool(4, "GlobalThreadPool");
 
 
 // ============================ ZmThread ============================
@@ -258,16 +258,55 @@ void ZmThread::runInternal(std::stop_token st, std::promise<void> started)
 
 // ============================ ZmThreadPool ============================
 
+/// worker 线程编号（启动时设定，配合 m_poolName 实时拼线程名，SetPoolName 后自动生效）
+thread_local int t_workerIndex = -1;
+
+/// 拼 worker 全名：PoolName-WT#N
+static std::string buildWorkerName(const std::string& poolName, int idx)
+{
+    return poolName + "-WT#" + std::to_string(idx);
+}
+
+// --- 线程命名辅助 ---
+
+void ZmThreadPool::SetThreadName(const std::string& name)
+{
+#ifdef _WIN32
+    typedef HRESULT(WINAPI* PFN_SetThreadDescription)(HANDLE, PCWSTR);
+    static auto pfn = (PFN_SetThreadDescription)GetProcAddress(
+        GetModuleHandleA("kernel32.dll"), "SetThreadDescription");
+    if (pfn)
+    {
+        int len = MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, NULL, 0);
+        if (len > 0)
+        {
+            std::wstring wname(len - 1, 0);
+            MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, wname.data(), len);
+            pfn(GetCurrentThread(), wname.c_str());
+        }
+    }
+#endif
+}
+
 // --- 构造 / 析构 ---
 
-ZmThreadPool::ZmThreadPool(uint16_t threadCount)
-    : m_initSize(threadCount)
+ZmThreadPool::ZmThreadPool(uint16_t threadCount, const std::string& poolName)
+    : m_poolName(poolName)
+    , m_initSize(threadCount)
 {
     for (uint16_t i = 0; i < threadCount; i++)
     {
-        m_workers.emplace_back([this](std::stop_token st) { workerProc(st); });
+        int idx = i;
+        m_workers.emplace_back([this, idx](std::stop_token st) {
+            t_workerIndex = idx;
+            SetThreadName(buildWorkerName(m_poolName, idx));
+            workerProc(st);
+        });
     }
-    m_timerThread = std::jthread([this](std::stop_token st) { timerProc(st); });
+    m_timerThread = std::jthread([this](std::stop_token st) {
+        SetThreadName(m_poolName + "-Timer");
+        timerProc(st);
+    });
 }
 
 ZmThreadPool::~ZmThreadPool()
@@ -316,6 +355,33 @@ uint32_t ZmThreadPool::Submit(std::function<void()> task, uint32_t delayMs)
     return id;
 }
 
+uint32_t ZmThreadPool::Submit(std::function<void()> task, const std::string& taskName, uint32_t delayMs)
+{
+    // 执行前线程名 → "PoolName-TaskName-WT#N"，执行后恢复 "PoolName-WT#N"
+    // 名字始终从 m_poolName 实时拼，SetPoolName 后立即生效
+    auto namedTask = [this, task = std::move(task), taskName]() {
+        SetThreadName(m_poolName + "-" + taskName + "-WT#" + std::to_string(t_workerIndex));
+        task();
+        SetThreadName(buildWorkerName(m_poolName, t_workerIndex));
+    };
+
+    return Submit(std::move(namedTask), delayMs);
+}
+
+void ZmThreadPool::SetPoolName(const std::string& name)
+{
+    m_poolName = name;
+    // 向每个 worker 提交重命名任务：worker 执行时用 t_workerIndex + 新 m_poolName 拼名
+    std::string newName = name;  // 拷贝一份，避免捕获 this
+    int total = (int)m_workers.size();
+    for (int i = 0; i < total; i++)
+    {
+        submitImmediate([newName]() {
+            SetThreadName(buildWorkerName(newName, t_workerIndex));
+        });
+    }
+}
+
 bool ZmThreadPool::Cancel(uint32_t taskId)
 {
     std::unique_lock lock(m_delayMutex);
@@ -348,10 +414,20 @@ uint32_t ZmThreadPool::InvokeLater(std::function<void()> executor, uint32_t dela
     return g_zm_thread_pool.Submit(std::move(executor), delayMs);
 }
 
+uint32_t ZmThreadPool::InvokeLater(std::function<void()> executor, const std::string& taskName, uint32_t delayMs)
+{
+    return g_zm_thread_pool.Submit(std::move(executor), taskName, delayMs);
+}
+
 uint32_t ZmThreadPool::InvokeLater(std::function<void(void*)> executor, void* param, uint32_t delayMs)
 {
     // 将 void* 参数通过 lambda 捕获包装成无参 function
     return g_zm_thread_pool.Submit([executor, param]() { executor(param); }, delayMs);
+}
+
+uint32_t ZmThreadPool::InvokeLater(std::function<void(void*)> executor, void* param, const std::string& taskName, uint32_t delayMs)
+{
+    return g_zm_thread_pool.Submit([executor, param]() { executor(param); }, taskName, delayMs);
 }
 
 bool ZmThreadPool::InvokeCancel(uint32_t taskId)
@@ -453,7 +529,12 @@ void ZmThreadPool::submitImmediate(std::function<void()> task)
         // 自动增长: 所有 worker 都忙且未达上限时, 新建一个 worker
         if (m_idleCount == 0 && m_workers.size() < ZM_POOL_MAX_THREADS)
         {
-            m_workers.emplace_back([this](std::stop_token st) { workerProc(st); });
+            int idx = (int)m_workers.size();
+            m_workers.emplace_back([this, idx](std::stop_token st) {
+                t_workerIndex = idx;
+                SetThreadName(buildWorkerName(m_poolName, idx));
+                workerProc(st);
+            });
         }
     }
     m_taskCv.notify_one();

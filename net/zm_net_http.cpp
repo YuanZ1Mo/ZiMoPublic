@@ -318,23 +318,6 @@ int ZmHttpUtil::ParseStatusCode(const char* statusLine, const char* limit)
     return statusCode;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // ============================ ZmHttpdTask ============================
 
 /** @brief 全局请求 ID 计数器，线程安全自增 */
@@ -832,7 +815,7 @@ bool ZmHttpHead::IsEmpty()
 // ============================ ZmHttpServer ============================
 
 ZmHttpServer::ZmHttpServer(struct event_base* evbase, uint16_t local_port)
-    : m_evbase(evbase), m_evhttpd(nullptr), m_pool(nullptr),
+    : m_evbase(evbase), m_evhttpd(nullptr), m_poolName(), m_pool(nullptr),
       m_local_port(local_port), m_port_bind_failed(false)
 {}
 
@@ -854,8 +837,13 @@ bool ZmHttpServer::Init()
         return false;
 
     // 创建工作线程池（线程复用，替代 thread-per-request）
-    m_pool = new ZmThreadPool(
-        (uint16_t)std::thread::hardware_concurrency());
+    {
+        std::string poolName = m_poolName.empty()
+            ? "ZmHttpServer:" + std::to_string(m_local_port)
+            : m_poolName;
+        m_pool = new ZmThreadPool(
+            (uint16_t)std::thread::hardware_concurrency(), poolName);
+    }
 
     return true;
 }
@@ -882,6 +870,13 @@ void ZmHttpServer::Close()
 bool ZmHttpServer::IsOpen() const
 {
     return m_evhttpd != nullptr;
+}
+
+void ZmHttpServer::SetPoolName(const std::string& name)
+{
+    m_poolName = name;
+    if (m_pool)
+        m_pool->SetPoolName(name);
 }
 
 uint16_t ZmHttpServer::LocalPort()
@@ -961,7 +956,7 @@ void ZmHttpServer::OnHttp_RequestCB(struct evhttp_request* request, void* arg)
     {
         ZmHttpServer* server = (ZmHttpServer*)arg;
         ZmHttpdDoer* doer = new ZmHttpdDoer(server, request);
-        server->m_pool->Submit([doer]() { doer->Process(); });
+        server->m_pool->Submit([doer]() { doer->Process(); }, "Doer");
     }
     else
     {
@@ -1093,6 +1088,9 @@ ZmJsonRpcServer::ZmJsonRpcServer(struct event_base* evbase, const char* root_uri
         // 使 OnHttpdRequest 中所有请求都走 RPC 流程
         memset(m_root_uri, 0, sizeof(m_root_uri));
     }
+
+    std::string poolName = "ZmJsonRpcServer:" + std::to_string(local_port);
+    SetPoolName(poolName);
 }
 
 ZmJsonRpcServer::~ZmJsonRpcServer()

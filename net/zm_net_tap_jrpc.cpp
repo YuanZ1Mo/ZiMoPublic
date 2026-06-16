@@ -8,12 +8,28 @@
 
 ZmTapDelegateJRPC::ZmTapDelegateJRPC()
 	: ZmTapDelegate()
+	, m_threadPool(nullptr)
 {
 	TapDelegateName("ZmTapDelegateJRPC");
+	m_threadPool = new ZmThreadPool(4, "JrpcDelegate");
 }
 
 ZmTapDelegateJRPC::~ZmTapDelegateJRPC()
 {
+	if (m_threadPool)
+	{
+		delete m_threadPool;
+		m_threadPool = nullptr;
+	}
+}
+
+void ZmTapDelegateJRPC::StopThreadPool()
+{
+	if (m_threadPool)
+	{
+		delete m_threadPool;
+		m_threadPool = nullptr;
+	}
 }
 
 // ============================================================================
@@ -117,9 +133,9 @@ void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app
 		ZmTapContext::BackChainPush(tap, this);
 		std::string reqCopy((const char*)tap->requester_data);
 		auto cb = m_tapDelegateJrpcRequestReadCB;
-		ZmThreadPool::InvokeLater([tap, reqCopy, cb]() {
+		m_threadPool->Submit([tap, reqCopy, cb]() {
 			cb(tap, reqCopy.c_str());
-		});
+			}, "Business");
 	}
 	// 无外部回调：直接返回错误
 	else

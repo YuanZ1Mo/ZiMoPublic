@@ -355,8 +355,9 @@ public:
     /**
      * @brief 构造线程池并启动 worker 线程和 timer 线程
      * @param threadCount  初始 worker 线程数量, 默认 4
+     * @param poolName     线程池名称, worker 线程命名为 "PoolName-W#N", 默认 "ZmThreadPool"
      */
-    explicit ZmThreadPool(uint16_t threadCount = 4);
+    explicit ZmThreadPool(uint16_t threadCount = 4, const std::string& poolName = "ZmThreadPool");
 
     /**
      * @brief 析构时停止所有线程 (request_stop + notify + join)
@@ -384,6 +385,15 @@ public:
      * @endcode
      */
     uint32_t Submit(std::function<void()> task, uint32_t delayMs = 0);
+
+    /**
+     * @brief 提交任务到线程池（带任务名，调试时线程名临时切换为 taskName）
+     * @param task      任务函数
+     * @param taskName  任务名称（Windows 下通过 SetThreadDescription 设置，VS 调试器可见）
+     * @param delayMs   延迟毫秒数, 0 表示立即执行
+     * @return delayMs > 0 时返回任务 ID, delayMs = 0 时返回 0
+     */
+    uint32_t Submit(std::function<void()> task, const std::string& taskName, uint32_t delayMs = 0);
 
     /**
      * @brief 提交带返回值的任务, 立即执行
@@ -414,6 +424,14 @@ public:
     }
 
     /**
+     * @brief 设置线程池名称（影响后续自动增长 worker 命名和任务名恢复后的 worker 名）
+     * @param name  新名称，已有 worker 不会立即改名，但下次 Submit(task, taskName) 恢复时生效
+     *
+     * @note 适用于子类在构造后自定义池名，如 ZmJsonRpcServer 可改为 "JRPC-39440"
+     */
+    void SetPoolName(const std::string& name);
+
+    /**
      * @brief 取消延迟任务
      * @param taskId  Submit 返回的任务 ID
      * @return true 取消成功, false 任务已执行或 ID 无效
@@ -439,6 +457,15 @@ public:
     static uint32_t InvokeLater(std::function<void()> executor, uint32_t delayMs = 0);
 
     /**
+     * @brief 通过全局线程池提交延迟任务 (无参，带任务名)
+     * @param executor  任务函数
+     * @param taskName  任务名称（调试时线程名临时切换为此名）
+     * @param delayMs   延迟毫秒数
+     * @return 任务 ID
+     */
+    static uint32_t InvokeLater(std::function<void()> executor, const std::string& taskName, uint32_t delayMs = 0);
+
+    /**
      * @brief 通过全局线程池提交延迟任务 (带 void* 参数)
      * @param executor  任务函数
      * @param param     传给 executor 的参数
@@ -446,6 +473,16 @@ public:
      * @return 任务 ID
      */
     static uint32_t InvokeLater(std::function<void(void*)> executor, void* param, uint32_t delayMs = 0);
+
+    /**
+     * @brief 通过全局线程池提交延迟任务 (带 void* 参数，带任务名)
+     * @param executor  任务函数
+     * @param param     传给 executor 的参数
+     * @param taskName  任务名称（调试时线程名临时切换为此名）
+     * @param delayMs   延迟毫秒数
+     * @return 任务 ID
+     */
+    static uint32_t InvokeLater(std::function<void(void*)> executor, void* param, const std::string& taskName, uint32_t delayMs = 0);
 
     /**
      * @brief 通过全局线程池取消延迟任务
@@ -476,6 +513,9 @@ private:
      */
     void submitImmediate(std::function<void()> task);
 
+    /** @brief 设置当前线程的 OS 级调试名称（Windows SetThreadDescription） */
+    static void SetThreadName(const std::string& name);
+
     struct DelayedTask {
         uint32_t id;                       ///< 任务 ID, 由 Submit 分配
         std::function<void()> task;        ///< 任务函数
@@ -483,6 +523,7 @@ private:
     };
 
     // --- 成员变量 ---
+    std::string m_poolName;                         ///< 线程池名称（worker 命名前缀）
     std::vector<std::jthread> m_workers;           ///< worker 线程集合
     uint16_t m_initSize;                            ///< 初始 worker 线程数
     std::jthread m_timerThread;                     ///< 延迟任务调度线程

@@ -5,6 +5,8 @@
 
 #include "zm_net_tap.h"
 
+class ZmThreadPool;
+
 /** @brief JRPC 请求读取回调函数类型
  *  @param tap     触发该回调的 TAP 上下文
  *  @param reqData JRPC 请求 JSON 字符串 */
@@ -15,7 +17,7 @@ using TapDelegateJrpcRequestReadCB = std::function<void(ZM_TAP_CTX* tap, const c
  *
  * 继承 ZmTapDelegate，实现基于长度前缀帧格式（4 字节大端长度 + JSON 体）的 JRPC 解析。
  * 工作于 ZM_DELEGATE_MODE_PROXY_INTERNAL_JRPC 模式，由 Hub 代理在协议探测后切换至此。
- * 业务处理通过 ZmThreadPool::InvokeLater 投递到工作线程，避免阻塞事件循环。
+ * 内部维护独立线程池，业务处理不阻塞事件循环，也不与其他模块共用全局池。
  */
 class ZmTapDelegateJRPC : public ZmTapDelegate
 {
@@ -26,6 +28,9 @@ public:
 	/** @brief 设置 JRPC 请求到达时的外部回调
 	 *  @param cb 回调函数，参数为 TAP 上下文和请求 JSON 字符串 */
 	void SetJrpcRequestReadCB(TapDelegateJrpcRequestReadCB cb);
+
+	/** @brief 停止内部线程池（join 所有 worker，确保无人持有 TAP 指针后再清 TAP 上下文） */
+	void StopThreadPool();
 
 public:
 	// --- ZmTapDelegate 接口实现 ---
@@ -68,6 +73,9 @@ private:
 
 	/** @brief JRPC 请求到达时的外部回调 */
 	TapDelegateJrpcRequestReadCB m_tapDelegateJrpcRequestReadCB;
+
+	/** @brief 独立线程池（JRPC 业务处理，不阻塞事件循环，不与全局池共享） */
+	ZmThreadPool* m_threadPool;
 };
 
 #endif  // ZM_NET_TAP_JRPC_H

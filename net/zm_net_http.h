@@ -422,6 +422,12 @@ public:
     /** @brief 查询服务器是否已初始化 */
     bool IsOpen() const;
 
+    /**
+     * @brief 设置内部线程池名称（调试时 VS 线程列表可见）
+     * @param name  新名称，如 "JRPC-39440"
+     */
+    void SetPoolName(const std::string& name);
+
     /** @brief 获取监听端口号 */
     uint16_t           LocalPort();
 
@@ -498,6 +504,9 @@ private:
 
     /** @brief libevent HTTP 服务器对象 */
     struct evhttp*     m_evhttpd;
+
+    /** @brief 期望的线程池名称（Init 前设置则用此名，否则默认 "Http-{port}"） */
+    std::string        m_poolName;
 
     /** @brief 工作线程池（复用线程处理请求，替代 thread-per-request） */
     ZmThreadPool*      m_pool;

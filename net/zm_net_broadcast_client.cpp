@@ -175,7 +175,7 @@ bool ZmBroadcastClient::Connect()
 	// 创建内部线程池（用于业务消息回调）
 	if (!m_threadPool)
 	{
-		m_threadPool = new ZmThreadPool(2);
+		m_threadPool = new ZmThreadPool(2, "BroadcastClient");
 	}
 
 	// 使用 event_base_once 在事件循环线程中执行 DoConnect
@@ -649,7 +649,7 @@ void ZmBroadcastClient::HandleMessage(const std::string& json)
 		{
 			m_threadPool->Submit([cb = m_callbacks.onMessage, topic, content]() {
 				cb(topic, content);
-			});
+				}, "Submit");
 		}
 		return;
 	}
