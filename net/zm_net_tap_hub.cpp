@@ -1,5 +1,6 @@
 #include "zm_net_tap_hub.h"
 
+#include "zm_net_tap_jrpc.h"
 #include "zm_net_ip.h"
 #include "../util/zm_util_libevent.h"
 #include "../spdlog/zm_logger.h"

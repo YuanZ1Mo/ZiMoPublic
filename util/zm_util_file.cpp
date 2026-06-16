@@ -3,7 +3,8 @@
 #include "zm_util_sys.h"
 #include "../spdlog/zm_logger.h"
 
-#include <openssl/evp.h>
+#include <../openssl/include/openssl/evp.h>
+
 #include <Shlwapi.h>
 #pragma comment(lib, "Shlwapi.lib")
 

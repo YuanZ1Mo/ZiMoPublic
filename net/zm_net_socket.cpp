@@ -5,12 +5,13 @@
 
 #include "zm_net_socket.h"
 
-
 #include "zm_net_dns.h"
 #include "../spdlog/zm_logger.h"
 #include "../util/zm_util_sys.h"
 
-#include <openssl/include/openssl/err.h>
+#include "../ssl/zm_ssl_ctx.h"
+#include <../openssl/include/openssl/ssl.h>
+#include <../openssl/include/openssl/err.h>
 
 #include <mstcpip.h>
 #include <atomic>

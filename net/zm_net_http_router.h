@@ -31,13 +31,16 @@
 #ifndef ZM_NET_HTTP_ROUTER_H
 #define ZM_NET_HTTP_ROUTER_H
 
-#include "zm_net_http.h"
+#include "../util/zm_util_str.h"  // for BYTE typedef
 
 #include <functional>
 #include <string>
 #include <vector>
 #include <map>
 #include <memory>
+
+// 前向声明（头文件中仅通过指针使用）
+class ZmHttpdTask;
 
 /**
  * @brief HTTP 路由分发器

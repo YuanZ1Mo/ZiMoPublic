@@ -8,10 +8,24 @@
 
 #ifndef ZM_SSL_CTX_H
 #define ZM_SSL_CTX_H
+
 #include "../util/zm_util_str.h"
 
-#include <openssl/include/openssl/ssl.h>
-#include <event2/util.h>
+#include <../libevent/include/event2/util.h>
+
+#include <cstdint>
+
+// OpenSSL 结构体前向声明（头文件中仅通过指针使用）
+struct ssl_st;
+struct ssl_ctx_st;
+struct x509_st;
+struct bio_st;
+struct buf_mem_st;
+typedef struct ssl_st SSL;
+typedef struct ssl_ctx_st SSL_CTX;
+typedef struct x509_st X509;
+typedef struct bio_st BIO;
+typedef struct buf_mem_st BUF_MEM;
 
 /**
  * @brief X509 证书信息结构体

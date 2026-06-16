@@ -1,5 +1,8 @@
 #include "zm_net_request_channel.h"
+
 #include "../spdlog/zm_logger.h"
+
+#include <../libevent/include/event2/event.h>
 
 ZmNetRequestChannel::ZmNetRequestChannel()
     : m_notifyEvent(nullptr)

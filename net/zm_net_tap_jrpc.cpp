@@ -1,6 +1,9 @@
 #include "zm_net_tap_jrpc.h"
+
 #include "../spdlog/zm_logger.h"
 #include "../util/zm_util_thread.h"
+
+#include <../libevent/include/event2/buffer.h>
 
 // ============================================================================
 // 构造与析构

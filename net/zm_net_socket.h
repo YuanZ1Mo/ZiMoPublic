@@ -11,11 +11,15 @@
 #ifndef ZM_NET_SOCKET_H
 #define ZM_NET_SOCKET_H
 
+#include <../libevent/include/event2/util.h>
 
-#include "../ssl/zm_ssl_ctx.h"
-#include <event2/util.h>
+#include <string>
 
-#include <memory>
+// OpenSSL 结构体前向声明（头文件中仅通过指针成员使用）
+struct bio_st;
+struct ssl_ctx_st;
+typedef struct bio_st BIO;
+typedef struct ssl_ctx_st SSL_CTX;
 
 //#define ZM_SOCKET_SEND_ERROR                4000001
 //#define ZM_SOCKET_RECEIVE_ERROR             4000002

@@ -1,11 +1,11 @@
 #ifndef ZM_SERVICE_BASE_H_
 #define ZM_SERVICE_BASE_H_
 
+#include "../util/zm_util_str.h"
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include "../util/zm_util_str.h"
 #include <tchar.h>
-
 #include <vector>
 
 // Windows 服务基类

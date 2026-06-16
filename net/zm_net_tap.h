@@ -6,16 +6,20 @@
 
 #include "zm_net_http.h"
 
+#include <../libevent/include/event2/bufferevent.h>
+#include <../libevent/include/event2/event.h>
+#include <../libevent/include/event2/listener.h>
+
 #include <atomic>
 #include <deque>
 #include <functional>
 #include <mutex>
 #include <vector>
 
-#include <event2/bufferevent.h>
-#include <event2/event.h>
-#include <event2/dns.h>
-#include <event2/listener.h>
+
+// libevent DNS 结构体前向声明（头文件中仅通过指针使用）
+struct evdns_base;
+struct evdns_getaddrinfo_request;
 
 /** @brief 回传代理链最大长度 */
 #define ZM_TAP_DELEGATE_CHAIN_MAX   4

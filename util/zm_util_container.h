@@ -6,6 +6,7 @@
 #include <functional>
 #include <stack>
 #include <unordered_set>
+#include <vector>
 
 /**
  * @brief 动态字节缓冲区，用于网络 I/O 等场景的读写缓冲

@@ -1,7 +1,9 @@
 #ifndef ZM_UTIL_LIBEVENT_H
 #define ZM_UTIL_LIBEVENT_H
 
-#include <event2/buffer.h>
+#include <../libevent/include/event2/buffer.h>
+
+struct bufferevent;
 
 /**
  * @brief socket 地址复用类型枚举

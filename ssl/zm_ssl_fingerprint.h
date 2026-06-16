@@ -1,13 +1,16 @@
 #ifndef ZM_SSL_FINGERPRINT_H
 #define ZM_SSL_FINGERPRINT_H
 
-
 #include "../net/zm_net_ip.h"
 #include "../util/zm_util_container.h"
 
 #include <mutex>
 
-#include <openssl/include/openssl/ssl.h>
+// OpenSSL 结构体前向声明（头文件中仅通过指针使用）
+struct ssl_st;
+struct x509_st;
+typedef struct ssl_st SSL;
+typedef struct x509_st X509;
 
 /**
  * @brief 每个主机允许存储的最大证书指纹数量

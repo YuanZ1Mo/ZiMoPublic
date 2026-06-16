@@ -6,8 +6,6 @@
 #include <windows.h>
 #include <shellapi.h>
 
-#pragma warning(disable:4018)
-#pragma warning(disable:4996)
 
 static const char g_hexUpper[17] = "0123456789ABCDEF";
 static const char g_hexLower[17] = "0123456789abcdef";

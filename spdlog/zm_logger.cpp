@@ -1,9 +1,9 @@
 #include "zm_logger.h"
-#include "pattern_formatter.h"
+
+#include <pattern_formatter.h>
 
 #include <cstdlib>
 #include <filesystem>
-
 #ifdef _WIN32
 #include <windows.h>
 #endif

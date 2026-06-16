@@ -11,6 +11,8 @@
 
 #include "zm_net_broadcast_base.h"
 
+#include <../libevent/include/event2/util.h>
+
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -19,7 +21,6 @@
 #include <thread>
 #include <vector>
 
-#include <event2/util.h>
 
 struct event_base;
 struct bufferevent;

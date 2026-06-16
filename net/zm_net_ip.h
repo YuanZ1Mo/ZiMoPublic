@@ -7,7 +7,8 @@
 #ifndef ZM_NET_IP_H
 #define ZM_NET_IP_H
 
-#include <event2/util.h>
+#include <../libevent/include/event2/util.h>
+
 #include <string>
 #include <vector>
 

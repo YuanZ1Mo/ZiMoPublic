@@ -2,9 +2,11 @@
 #define ZM_NET_TAP_HUB_H
 
 #include "zm_net_tap.h"
-#include "zm_net_tap_jrpc.h"
 
-#include <event2/listener.h>
+#include <../libevent/include/event2/listener.h>
+
+// 前向声明（头文件中仅通过指针使用）
+class ZmTapDelegateJRPC;
 
 // ============================================================================
 // ZmTapHubBase — 监听基础设施

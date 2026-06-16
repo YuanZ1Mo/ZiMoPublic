@@ -1,4 +1,6 @@
 #include "zm_net_http_router.h"
+
+#include "zm_net_http.h"
 #include "../util/zm_util_str.h"
 #include "../spdlog/zm_logger.h"
 

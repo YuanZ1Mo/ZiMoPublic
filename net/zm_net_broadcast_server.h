@@ -19,6 +19,8 @@
 
 #include "zm_net_broadcast_base.h"
 
+#include <../libevent/include/event2/util.h>
+
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -28,7 +30,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include <event2/util.h>
 
 struct event_base;
 struct evconnlistener;

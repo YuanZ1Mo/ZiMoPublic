@@ -12,6 +12,8 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
+#include <cstdint>
+#include <string>
 
 
 // ============================ ZmThread (C++20 jthread) ============================

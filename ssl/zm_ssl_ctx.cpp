@@ -5,14 +5,13 @@
 
 #include "zm_ssl_ctx.h"
 
-//#include "zm_ssl_smxengine.h"
 #include "zm_ssl_fingerprint.h"
-//#include "../util/zm_util_crypto.h"
 #include "../util/zm_util_file.h"
 
-#include <openssl/include/openssl/pkcs12.h>
-#include <openssl/crypto.h>
-#include <openssl/include/openssl/err.h>
+#include <../openssl/include/openssl/ssl.h>
+#include <../openssl/include/openssl/pkcs12.h>
+#include <../openssl/include/openssl/crypto.h>
+#include <../openssl/include/openssl/err.h>
 
 /**
  * @brief 获取 OpenSSL 错误描述字符串

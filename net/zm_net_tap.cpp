@@ -1,9 +1,10 @@
 #include "zm_net_tap.h"
 
-#include "../util/zm_util_libevent.h"
 #include "zm_net_dns.h"
+#include "../util/zm_util_libevent.h"
 #include "../spdlog/zm_logger.h"
 
+#include <../libevent/include/event2/dns.h>
 
 
 void ZM_TAP_CTX::Clear()

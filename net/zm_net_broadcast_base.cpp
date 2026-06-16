@@ -5,8 +5,8 @@
 
 #include "zm_net_broadcast_base.h"
 
-#include <event2/buffer.h>
-#include <event2/bufferevent.h>
+#include <../libevent/include/event2/buffer.h>
+#include <../libevent/include/event2/bufferevent.h>
 
 #include <random>
 #include <sstream>

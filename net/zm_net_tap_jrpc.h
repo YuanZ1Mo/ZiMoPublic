@@ -1,9 +1,9 @@
 #ifndef ZM_NET_TAP_JRPC_H
 #define ZM_NET_TAP_JRPC_H
 
-#include <string>
-
 #include "zm_net_tap.h"
+
+#include <string>
 
 class ZmThreadPool;
 

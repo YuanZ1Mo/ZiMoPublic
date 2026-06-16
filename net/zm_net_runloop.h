@@ -2,8 +2,13 @@
 #define DOCK_RUNLOOP_H
 
 #include "../util/zm_util_thread.h"
-#include "../libevent/include/event2/dns.h"
-#include "../libevent/include/event2/event.h"
+
+#include <../libevent/include/event2/util.h>
+
+// libevent 结构体前向声明（头文件中仅通过指针成员使用）
+struct event_base;
+struct evdns_base;
+struct event;
 
 /** ZmEvBaseRunLoop 心跳定时器间隔（秒） */
 #define ZM_DOCK_HEARTBEAT_SEC   60

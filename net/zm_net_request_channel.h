@@ -1,6 +1,8 @@
 #ifndef ZM_NET_REQUEST_CHANNEL_H
 #define ZM_NET_REQUEST_CHANNEL_H
 
+#include <../libevent/include/event2/util.h>
+
 #include <string>
 #include <future>
 #include <memory>
@@ -9,7 +11,8 @@
 #include <atomic>
 #include <functional>
 
-#include <event2/event.h>
+// libevent 结构体前向声明（头文件中仅通过指针成员使用）
+struct event;
 
 /**
  * @brief 单个异步请求项，包含请求数据、序列号和响应 promise

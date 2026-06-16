@@ -17,14 +17,17 @@
 
 #include "../json/zm_json.h"
 #include "../util/zm_util_str.h"
-#include "../util/zm_util_thread.h"
+
+#include <../libevent/include/event2/http.h>
+#include <../libevent/include/event2/keyvalq_struct.h>
+#include <../libevent/include/event2/event.h>
 
 #include <stdint.h>
 
-#include <event2/http.h>
-#include <event2/keyvalq_struct.h>
-#include <event2/event.h>
-#include <event2/buffer.h>
+
+// 前向声明（头文件中仅通过指针使用）
+class ZmThreadPool;
+struct evbuffer;
 
 
 /*

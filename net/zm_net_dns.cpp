@@ -1,7 +1,5 @@
 #include "zm_net_dns.h"
 
-//#include "../log/y_log.h"
-
 #include "../util/zm_util_thread.h"
 #include "../util/zm_util_str.h"
 #include "../util/zm_util_sys.h"

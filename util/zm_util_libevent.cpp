@@ -2,12 +2,10 @@
 
 #include "../spdlog/zm_logger.h"
 
-#include <openssl/include/openssl/ssl.h>
-
-#include <event2/event.h>
-#include <event2/thread.h>
-#include <event2/bufferevent_ssl.h>
-
+#include <../openssl/include/openssl/ssl.h>
+#include <../libevent/include/event2/event.h>
+#include <../libevent/include/event2/thread.h>
+#include <../libevent/include/event2/bufferevent_ssl.h>
 
 
 void OnLibEventFatalCB(int err)

@@ -6,6 +6,9 @@
 #include "zm_net_dns.h"
 #include "zm_util_str.h"
 
+#include <../libevent/include/event2/dns.h>
+#include <../libevent/include/event2/event.h>
+
 enum { CONTROL_LOOP_SUCCESS = 0x0200, };
 
 ZmEvBaseRunLoop::ZmEvBaseRunLoop(const std::string& name): ZmThread(name)
