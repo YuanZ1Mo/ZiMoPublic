@@ -128,7 +128,7 @@ void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app
 		(void*)tap, (const char*)tap->requester_data);
 
 	// 有外部回调：拷贝数据后投递到工作线程，业务层使用 delegate 的异步方法操作 TAP
-	if (m_tapDelegateJrpcRequestReadCB)
+	if (m_tapDelegateJrpcRequestReadCB && m_threadPool)
 	{
 		ZmTapContext::BackChainPush(tap, this);
 		std::string reqCopy((const char*)tap->requester_data);
