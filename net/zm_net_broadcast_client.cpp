@@ -7,7 +7,6 @@
 
 #include "../spdlog/zm_logger.h"
 #include "../json/zm_json.h"
-#include "zm_net_runloop.h"
 #include "../util/zm_util_thread.h"
 
 #include <event2/bufferevent.h>
@@ -27,7 +26,7 @@ ZmBroadcastClient::ZmBroadcastClient(const BcClientConfig& config, const BcClien
 	: m_config(config)
 	, m_callbacks(cbs)
 	, m_state(ZM_BC_STATE_IDLE)
-	, m_evLoop(nullptr)
+	, m_threadPool(nullptr)
 	, m_bev(nullptr)
 	, m_retryTimer(nullptr)
 	, m_handshakeTimer(nullptr)
@@ -42,6 +41,12 @@ ZmBroadcastClient::ZmBroadcastClient(const BcClientConfig& config, const BcClien
 ZmBroadcastClient::~ZmBroadcastClient()
 {
 	Disconnect();
+	// 兜底清理（Disconnect 正常路径已清理，此处防止异常路径泄漏）
+	if (m_threadPool)
+	{
+		delete m_threadPool;
+		m_threadPool = nullptr;
+	}
 }
 
 // ============================================================================
@@ -158,42 +163,24 @@ bool ZmBroadcastClient::Connect()
 		return false;
 	}
 
-	// 参数检查
-	if (m_config.serverIp.empty() || m_config.serverPort == 0 || !m_config.threadPool)
+	// 参数检查：外部事件循环必填
+	if (m_config.serverIp.empty() || m_config.serverPort == 0 || !m_config.evbase)
 	{
 		m_state.store(ZM_BC_STATE_ERROR, std::memory_order_release);
 		if (m_callbacks.onError)
-			m_callbacks.onError("Invalid config: serverIp/serverPort/threadPool required");
+			m_callbacks.onError("Invalid config: serverIp/serverPort/evbase required");
 		return false;
 	}
 
-	// 创建事件循环线程
-	m_evLoop = new ZmEvBaseRunLoop("ZmBroadcastClient");
-	if (!m_evLoop->Loop())
+	// 创建内部线程池（用于业务消息回调）
+	if (!m_threadPool)
 	{
-		delete m_evLoop;
-		m_evLoop = nullptr;
-		m_state.store(ZM_BC_STATE_ERROR, std::memory_order_release);
-		if (m_callbacks.onError)
-			m_callbacks.onError("Failed to start event loop");
-		return false;
+		m_threadPool = new ZmThreadPool(2);
 	}
 
 	// 使用 event_base_once 在事件循环线程中执行 DoConnect
 	// 此时 dispatchEvent 尚未创建，不能走 ScheduleTask 路径
-	struct event_base* evbase = m_evLoop->GetEventBase();
-	if (!evbase)
-	{
-		m_evLoop->Stop();
-		delete m_evLoop;
-		m_evLoop = nullptr;
-		m_state.store(ZM_BC_STATE_ERROR, std::memory_order_release);
-		if (m_callbacks.onError)
-			m_callbacks.onError("event_base is null");
-		return false;
-	}
-
-	event_base_once(evbase, -1, EV_TIMEOUT,
+	event_base_once(m_config.evbase, -1, EV_TIMEOUT,
 		[](evutil_socket_t, short, void* ctx) {
 			ZmBroadcastClient* client = (ZmBroadcastClient*)ctx;
 			client->DoConnect();
@@ -214,7 +201,7 @@ void ZmBroadcastClient::DoConnect()
 	// 记录事件循环线程 ID
 	m_loopThreadId = std::this_thread::get_id();
 
-	struct event_base* evbase = m_evLoop->GetEventBase();
+	struct event_base* evbase = m_config.evbase;
 	if (!evbase)
 	{
 		m_state.store(ZM_BC_STATE_ERROR, std::memory_order_release);
@@ -326,39 +313,30 @@ schedule:
 		// 已在事件循环线程，直接断开
 		DoDisconnect();
 	}
-	else
+	else if (m_config.evbase)
 	{
-		// 使用 event_base_once + promise/future 确保 DoDisconnect 执行
-		ZmEvBaseRunLoop* evLoop = m_evLoop;
-		if (evLoop && evLoop->IsLooped())
-		{
-			struct event_base* evbase = evLoop->GetEventBase();
-			if (evbase)
-			{
-				auto task = new BcDisconnectSync{this, {}};
-				auto future = task->promise.get_future();
-				event_base_once(evbase, -1, EV_TIMEOUT,
-					[](evutil_socket_t, short, void* arg) {
-						auto* t = static_cast<BcDisconnectSync*>(arg);
-						t->client->DoDisconnect();
-						t->promise.set_value();
-						delete t;
-					}, task, nullptr);
-				future.wait();
-			}
-			evLoop->Stop();
-		}
+		// 使用 event_base_once + promise/future 确保 DoDisconnect 在事件循环线程执行
+		auto task = new BcDisconnectSync{this, {}};
+		auto future = task->promise.get_future();
+		event_base_once(m_config.evbase, -1, EV_TIMEOUT,
+			[](evutil_socket_t, short, void* arg) {
+				auto* t = static_cast<BcDisconnectSync*>(arg);
+				t->client->DoDisconnect();
+				t->promise.set_value();
+				delete t;
+			}, task, nullptr);
+		future.wait();
 	}
 
 	// 手动断开时回调通知
 	if (m_callbacks.onDisconnected)
 		m_callbacks.onDisconnected();
 
-	// 释放事件循环
-	if (m_evLoop)
+	// 释放内部线程池
+	if (m_threadPool)
 	{
-		delete m_evLoop;
-		m_evLoop = nullptr;
+		delete m_threadPool;
+		m_threadPool = nullptr;
 	}
 }
 
@@ -395,14 +373,7 @@ void ZmBroadcastClient::DoDisconnect()
 	m_handshakeDone.store(false);
 	m_startTime.store(0, std::memory_order_release);
 
-	// 停止事件循环（从外部线程调用 Stop 时会等待 loop 退出，
-	// 若从 loop 线程调用则仅设置退出标志，下一轮 loop 检查后退出）
-	if (m_evLoop)
-	{
-		struct event_base* evbase = m_evLoop->GetEventBase();
-		if (evbase)
-			event_base_loopexit(evbase, nullptr);
-	}
+	// 事件循环由外部管理，不在此停止
 
 	m_state.store(ZM_BC_STATE_STOPPED, std::memory_order_release);
 
@@ -416,9 +387,7 @@ void ZmBroadcastClient::DoDisconnect()
 
 void ZmBroadcastClient::ScheduleRetry()
 {
-	if (!m_evLoop)
-		return;
-	struct event_base* evbase = m_evLoop->GetEventBase();
+	struct event_base* evbase = m_config.evbase;
 	if (!evbase)
 		return;
 
@@ -469,7 +438,7 @@ void ZmBroadcastClient::OnConnectCB(struct bufferevent* bev, short events, void*
 		}
 
 		// 启动握手超时定时器
-		struct event_base* evbase = client->m_evLoop->GetEventBase();
+		struct event_base* evbase = client->m_config.evbase;
 		struct timeval tv = {client->m_config.handshakeTimeout, 0};
 		client->m_handshakeTimer = evtimer_new(evbase, OnHandshakeTimeoutCB, client);
 		evtimer_add(client->m_handshakeTimer, &tv);
@@ -676,9 +645,9 @@ void ZmBroadcastClient::HandleMessage(const std::string& json)
 		m_receivedCount.fetch_add(1, std::memory_order_relaxed);
 
 		// 通过线程池回调业务层
-		if (m_callbacks.onMessage && m_config.threadPool)
+		if (m_callbacks.onMessage && m_threadPool)
 		{
-			m_config.threadPool->Submit([cb = m_callbacks.onMessage, topic, content]() {
+			m_threadPool->Submit([cb = m_callbacks.onMessage, topic, content]() {
 				cb(topic, content);
 			});
 		}

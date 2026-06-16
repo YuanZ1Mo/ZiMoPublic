@@ -2,7 +2,7 @@
  * @file zm_net_broadcast_client.h
  * @brief TCP 广播客户端
  *
- * 基于 libevent + ZmEvBaseRunLoop 实现的 TCP 广播客户端，
+ * 基于 libevent 实现的 TCP 广播客户端，事件循环由外部提供，线程池内部创建，
  * 与服务端配套使用，自动处理握手、心跳、标签订阅和消息回调。
  */
 
@@ -21,9 +21,9 @@
 
 #include <event2/util.h>
 
+struct event_base;
 struct bufferevent;
 struct event;
-class ZmEvBaseRunLoop;
 class ZmThreadPool;
 
 // ============================================================================
@@ -39,12 +39,12 @@ struct BcClientConfig
 	uint16_t    serverPort;             ///< 服务端端口号
 	int         handshakeTimeout;       ///< 握手超时秒数，默认 10
 	std::vector<std::string> initialTags; ///< 初始订阅的 tag 列表
-	ZmThreadPool* threadPool;           ///< 业务层消息回调线程池（必填）
+	struct event_base* evbase;          ///< 外部事件循环对象（必填，不由此类接管生命周期）
 
 	BcClientConfig()
 		: serverPort(0)
 		, handshakeTimeout(10)
-		, threadPool(nullptr)
+		, evbase(nullptr)
 	{}
 };
 
@@ -85,7 +85,7 @@ struct BcClientCallbacks
  *   BcClientConfig cfg;
  *   cfg.serverIp = "127.0.0.1";
  *   cfg.serverPort = 39640;
- *   cfg.threadPool = &myPool;
+ *   cfg.evbase = myRunLoop->GetEventBase();
  *   cfg.initialTags = {"tag1", "tag2"};
  *
  *   BcClientCallbacks cbs;
@@ -106,7 +106,7 @@ public:
 
 	/**
 	 * @brief 构造广播客户端
-	 * @param config  客户端配置（threadPool 必填）
+	 * @param config  客户端配置（evbase 必填，线程池由内部创建）
 	 * @param cbs     事件回调集合
 	 */
 	ZmBroadcastClient(const BcClientConfig& config, const BcClientCallbacks& cbs);
@@ -234,7 +234,7 @@ private:
 	BcClientCallbacks m_callbacks;                      ///< 回调副本
 	std::atomic<ZM_BROADCAST_STATE> m_state;            ///< 当前状态
 
-	ZmEvBaseRunLoop*   m_evLoop;                        ///< 内部事件循环线程
+	ZmThreadPool*      m_threadPool;                    ///< 内部线程池（业务消息回调）
 	struct bufferevent* m_bev;                          ///< libevent bufferevent
 	struct event* m_retryTimer;                         ///< 重试定时器
 	struct event* m_handshakeTimer;                     ///< 握手超时定时器
