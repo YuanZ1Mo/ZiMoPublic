@@ -34,7 +34,6 @@ struct event_base;
 struct evconnlistener;
 struct bufferevent;
 struct event;
-class ZmEvBaseRunLoop;
 
 // ============================================================================
 // 服务端配置
@@ -51,7 +50,7 @@ struct BcServerConfig
     int         heartbeatTime;      ///< 心跳超时秒数，默认 60
     int         handshakeTimeout;   ///< 握手超时秒数，默认 10
     size_t      clientQueueMaxSize; ///< 每客户端消息队列上限，默认 1024
-    ZmEvBaseRunLoop* evLoop;        ///< 事件循环线程（必填）
+    struct event_base* evbase;      ///< 外部事件循环对象（必填，不由此类接管生命周期）
 
     BcServerConfig()
         : listenIp("0.0.0.0")
@@ -60,7 +59,7 @@ struct BcServerConfig
         , heartbeatTime(60)
         , handshakeTimeout(10)
         , clientQueueMaxSize(1024)
-        , evLoop(nullptr)
+        , evbase(nullptr)
     {}
 };
 
@@ -103,7 +102,7 @@ struct BcServerCallbacks
  * @code
  *   BcServerConfig cfg;
  *   cfg.listenPort = 8080;
- *   cfg.evLoop = myRunLoop;
+ *   cfg.evbase = myRunLoop->GetEventBase();
  *
  *   BcServerCallbacks cbs;
  *   cbs.onClientOnline = [](const BcClientInfo& info) { ... };
@@ -123,7 +122,7 @@ public:
 
     /**
      * @brief 构造广播服务端
-     * @param config  服务端配置（evLoop 必填）
+     * @param config  服务端配置（evbase 必填）
      * @param cbs     事件回调集合
      */
     ZmBroadcastServer(const BcServerConfig& config, const BcServerCallbacks& cbs);
@@ -143,7 +142,7 @@ public:
      * 异步操作: 内部向事件循环投递绑定任务，结果通过 onListenSuccess / onListenFailed 回调通知。
      *
      * @return true  任务已投递
-     * @return false 状态不允许启动（非 IDLE/STOPPED）或 evLoop 未设置
+     * @return false 状态不允许启动（非 IDLE/STOPPED）或 evbase 未设置
      */
     bool Start();
 

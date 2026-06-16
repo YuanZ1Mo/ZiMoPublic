@@ -152,34 +152,17 @@ bool ZmBroadcastServer::Start()
         return false;
     }
 
-    if (!m_config.evLoop)
+    if (!m_config.evbase)
     {
         m_state.store(ZM_BC_STATE_ERROR);
         if (m_callbacks.onListenFailed)
-            m_callbacks.onListenFailed("evLoop is null");
-        return false;
-    }
-
-    if (!m_config.evLoop->IsLooped())
-    {
-        m_state.store(ZM_BC_STATE_ERROR);
-        if (m_callbacks.onListenFailed)
-            m_callbacks.onListenFailed("evLoop is not running");
+            m_callbacks.onListenFailed("evbase is null");
         return false;
     }
 
     // 使用 event_base_once 调度 DoStart() 到事件循环线程，
     // 避免 Start() 时 m_dispatchEvent 尚未创建，ScheduleTask 无法投递。
-    struct event_base* evbase = m_config.evLoop->GetEventBase();
-    if (!evbase)
-    {
-        m_state.store(ZM_BC_STATE_ERROR);
-        if (m_callbacks.onListenFailed)
-            m_callbacks.onListenFailed("event_base is null");
-        return false;
-    }
-
-    event_base_once(evbase, -1, EV_TIMEOUT,
+    event_base_once(m_config.evbase, -1, EV_TIMEOUT,
         [](evutil_socket_t, short, void* ctx) {
             ZmBroadcastServer* server = (ZmBroadcastServer*)ctx;
             server->DoStart();
@@ -190,7 +173,7 @@ bool ZmBroadcastServer::Start()
 
 void ZmBroadcastServer::DoStart()
 {
-    struct event_base* evbase = m_config.evLoop->GetEventBase();
+    struct event_base* evbase = m_config.evbase;
     if (!evbase)
     {
         m_state.store(ZM_BC_STATE_ERROR);
@@ -372,7 +355,7 @@ void ZmBroadcastServer::OnAcceptConnCB(struct evconnlistener* listener,
         }
     }
 
-    struct event_base* evbase = server->m_config.evLoop->GetEventBase();
+    struct event_base* evbase = server->m_config.evbase;
 
     // 创建 bufferevent
     struct bufferevent* bev = bufferevent_socket_new(evbase, fd,
@@ -489,7 +472,7 @@ void ZmBroadcastServer::OnClientReadCB(struct bufferevent* bev, void* ctx)
             ZmBroadcastServer* server = client->m_owner;
 
             // 启动心跳检测定时器
-            struct event_base* evbase = server->m_config.evLoop->GetEventBase();
+            struct event_base* evbase = server->m_config.evbase;
             int pingInterval = server->m_config.heartbeatTime / 2;
             if (pingInterval < 1) pingInterval = 1;
 
@@ -867,7 +850,7 @@ void ZmBroadcastServer::DoSend(const BcMessage& msg, const std::string& clientId
     // 如果需延迟，创建一次性定时器
     if (actualDelay > 0)
     {
-        struct event_base* evbase = m_config.evLoop->GetEventBase();
+        struct event_base* evbase = m_config.evbase;
 
         // 将任务数据拷贝到堆上
         BcScheduledTask* heapTask = new BcScheduledTask();
