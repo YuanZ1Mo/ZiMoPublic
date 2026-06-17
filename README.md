@@ -250,10 +250,10 @@ PUBLIC_LOG_ERROR(...)    PUBLIC_LOG_CRITICAL(...)
 | 文件 | 说明 |
 |------|------|
 | `zm_util_thread.h` | `ZmThread` — 基于 C++20 `std::jthread` 的线程封装（同步启停、状态管理、协作停止、AutoDelete）；`ZmThreadPool` — 线程池（立即/延迟执行、自动增长、任务取消） |
-| `zm_util_str.h` | 字符串工具：Unicode/ANSI 适配（`String` typedef）、`zm_strndup`、`zm_strsep`、十六进制字符判断 |
+| `zm_util_str.h` | 字符串工具：Unicode/ANSI 适配（`String` typedef）、编码转换（UTF8_To_Unicode/Unicode_To_UTF8 含 std::string/std::wstring 重载）、URL 编解码（URLDecode 含 std::string 重载）、`zm_strndup`、`zm_strsep` |
 | `zm_util_container.h` | 容器工具：动态数组（`ZmArrayList`）、字节缓冲区（`ZmByteBuffer`）、字符串列表（`ZmStringList`） |
 | `zm_util_crypto.h` | 加密工具 |
-| `zm_util_file.h` | 文件 I/O 工具 |
+| `zm_util_file.h` | 文件 I/O 工具：`Read`/`Write`/`ReadString`/`ReadEx`、`Copy`/`Rename`/`Delete`/`DeleteDir`、`Exists`/`IsDirectory`/`GetSize`、`MakeDirs`、`MD5HashHex` |
 | `zm_util_libevent.h` | libevent 辅助函数 |
 | `zm_util_sys.h` | 系统工具 |
 | `zm_util_win_os.h` | Windows 操作系统相关工具 |
