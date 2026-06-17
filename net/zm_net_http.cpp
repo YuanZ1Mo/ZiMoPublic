@@ -18,6 +18,7 @@
 #include <atomic>
 
 
+#define JRPC_VERSION "2.0"
 
  // ============================================================================
  // ZmHttpUtil
@@ -995,6 +996,8 @@ void ZmHttpServer::Perform(ZmHttpdTask* task)
     {
         code = 404;
     }
+    // 在 Server 响应头中附带服务端版本号
+    task->PutReplyHeader("ZmHttpServer-Version", ZIMO_SERVER_VERSION);
     task->SetReply(code);
 }
 
@@ -1173,6 +1176,32 @@ int ZmJsonRpcServer::OnJsonRpcRequest(ZmHttpdTask* task, const char* method, con
         : (m_on_jsonrpc_call ? m_on_jsonrpc_call(method, params, result, error) : -1);
 }
 
+void ZmJsonRpcServer::BuildJsonRpcResponse(ZmHttpdTask* task, const ZMJSON& rsp_envelope)
+{
+    // 从 task 中获取 callback 参数（JSONP 支持），无需外部捕获
+    std::string callback = task->GetQueryValue("callback");
+
+    std::string body;
+    std::string content_type;
+
+    if (callback.empty())
+    {
+        // 标准 JSON 响应
+        body = rsp_envelope.dump();
+        content_type = "application/json; charset=UTF-8";
+    }
+    else
+    {
+        // JSONP 响应格式: callback(jsonString)
+        body = callback + "(" + rsp_envelope.dump() + ")";
+        content_type = "application/javascript";
+    }
+
+    task->SetReply(200);
+    task->PutReplyHeader("Content-type", content_type.c_str());
+    task->SetReplyData((const BYTE*)body.data(), body.size());
+}
+
 
 /*
 * -32700	Parse error	JSON 解析错误
@@ -1197,21 +1226,13 @@ int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
     ZMJSON       rsp_reply;
     ZMJSON       rsp_result;
     ZMJSON       rsp_error;
-    std::string  callback;
-    std::string  rsp_content_type;
-    std::string  rsp_server;
-    std::string  rsp_body;
-    std::string  jsonbody;
     ZmByteBuffer buf(dlen, data);
-
-    // 获取 JSONP 回调函数名（非空时响应格式为 callback(json)）
-    callback = task->GetQueryValue("callback");
 
     // GET 请求通过 query string 的 jsonbody 参数传递 Base64 编码的 JSON 请求体
     // 例如: GET /rpc?callback=auth&jsonbody=eyJtZXRob2QiOiJsb2dpbiJ9
     if (EVHTTP_REQ_GET == task->Method())
     {
-        jsonbody = task->GetQueryValue("jsonbody");
+        std::string jsonbody = task->GetQueryValue("jsonbody");
         if (!jsonbody.empty())
         {
             // Base64Decode 内部会重新分配 buf 大小为解码后的预期长度
@@ -1223,70 +1244,71 @@ int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
     ZMJSON request = zm_json_parse(buf.Str(), errmsg);
     if (errmsg.empty())
     {
+        // 构造响应信封的基础部分（id / jsonrpc / method），捕获给 reply 闭包
         //id 原样回传，便于客户端匹配响应
         if (!request["id"].is_null())
         {
             rsp_reply["id"] = request["id"];
         }
 
-        // 构造 JSON-RPC 2.0 标准响应
-        rsp_reply["jsonrpc"] = "2.0";
-
-        std::string method = zm_json_get_str(request, "method");
-        if (!method.empty())
+        // 校验 JSON-RPC 版本号，必须为 JRPC_VERSION
+        std::string jsonrpc_ver = zm_json_get_str(request, "jsonrpc");
+        if (jsonrpc_ver != JRPC_VERSION)
         {
-            ZMJSON params = request["params"];
-            if (!params.is_object())
-            {
-                // JSON-RPC 2.0: params 必须是对象
-                errcode = -32602;
-                errmsg = "Invalid params";
-            }
-            // 异步路径优先：设置了异步回调则忽略同步回调
-            else if (m_on_jsonrpc_async)
-            {
-                // 阻止 Worker 线程自动触发 REPLY 信号，等待异步处理完成
-                task->DeferReply();
-
-                // 构造响应信封的基础部分（jsonrpc / id / method），捕获给 reply 闭包
-                ZMJSON rsp_envelope;
-                rsp_envelope["jsonrpc"] = "2.0";
-                if (!request["id"].is_null())
-                    rsp_envelope["id"] = request["id"];
-                rsp_envelope["method"] = method;
-
-                // 异步回调：业务层在完成处理后调用 reply(result, error) 发送响应
-                m_on_jsonrpc_async(task, method, params,
-                    [task, rsp_envelope](const ZMJSON& result, const ZMJSON& error) {
-                        ZMJSON rsp = rsp_envelope;
-                        if (!result.is_null()) rsp["result"] = result;
-                        if (!error.is_null())  rsp["error"] = error;
-
-                        std::string body = rsp.dump();
-                        task->SetReply(200);
-                        task->PutReplyHeader("Content-type", "application/json; charset=utf-8");
-                        task->SetReplyData((const BYTE*)body.c_str(), body.size());
-                        // 投递 REPLY 信号到 HTTP 服务器的 event loop → SendReply → evhttp_send_reply
-                        task->SendDeferredReply();
-                    });
-
-                return 200; // 异步处理中，响应稍后到达
-            }
-            else if (OnJsonRpcRequest(task, method.c_str(), params, rsp_result, rsp_error) < 0)
-            {
-                // 回调返回 < 0 表示该 method 不存在
-                errcode = -32601;
-                errmsg = "Method not found";
-            }
-
-            // 将请求中的 method 原样回传，便于客户端匹配响应
-            rsp_reply["method"] = method;
+            errcode = -32600;
+            errmsg = "Invalid Request: jsonrpc must be " JRPC_VERSION;
         }
         else
         {
-            // 缺少 method 字段
-            errcode = -32600;
-            errmsg = "Invalid Request";
+            // 构造 JSON-RPC 2.0 标准响应
+            rsp_reply["jsonrpc"] = jsonrpc_ver;
+
+            std::string method = zm_json_get_str(request, "method");
+            if (!method.empty())
+            {
+                // 将请求中的 method 原样回传，便于客户端匹配响应
+                rsp_reply["method"] = method;
+
+                ZMJSON params = request["params"];
+                if (!params.is_object())
+                {
+                    // JSON-RPC 2.0: params 必须是对象
+                    errcode = -32602;
+                    errmsg = "Invalid params";
+                }
+                // 异步路径优先：设置了异步回调则忽略同步回调
+                else if (m_on_jsonrpc_async)
+                {
+                    // 阻止 Worker 线程自动触发 REPLY 信号，等待异步处理完成
+                    task->DeferReply();
+
+                    // 异步回调：业务层在完成处理后调用 reply(result, error) 发送响应
+                    m_on_jsonrpc_async(task, method, params,
+                        [this, task, rsp_reply](const ZMJSON& result, const ZMJSON& error) mutable {
+                            if (!result.is_null()) rsp_reply["result"] = result;
+                            if (!error.is_null())  rsp_reply["error"] = error;
+
+                            // 通过共用方法构造响应（自动处理 JSONP callback 和 Server 头）
+                            BuildJsonRpcResponse(task, rsp_reply);
+                            // 投递 REPLY 信号到 HTTP 服务器的 event loop → SendReply → evhttp_send_reply
+                            task->SendDeferredReply();
+                        });
+
+                    return 200; // 异步处理中，响应稍后到达
+                }
+                else if (OnJsonRpcRequest(task, method.c_str(), params, rsp_result, rsp_error) < 0)
+                {
+                    // 回调返回 < 0 表示该 method 不存在
+                    errcode = -32601;
+                    errmsg = "Method not found";
+                }
+            }
+            else
+            {
+                // 缺少 method 字段
+                errcode = -32600;
+                errmsg = "Invalid Request, Method field is required";
+            }
         }
     }
     else
@@ -1313,31 +1335,7 @@ int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
         rsp_reply["result"] = rsp_result;
     }
 
-    // 根据是否有 JSONP callback 选择响应格式
-    if (callback.empty())
-    {
-        // 标准 JSON 响应
-        rsp_body = ZMJSON(rsp_reply).dump();
-        rsp_content_type = "application/json; charset=UTF-8; callback=empty";
-    }
-    else
-    {
-        // JSONP 响应格式: callback(jsonString)
-        rsp_body.erase();
-        rsp_body.append(callback);
-        rsp_body.append("(");
-        rsp_body.append(ZMJSON(rsp_reply).dump());
-        rsp_body.append(")");
-        rsp_content_type = "application/javascript";
-    }
-
-    // 在 Server 响应头中附带服务端版本号
-    rsp_server = "zimo_serrver_version=";
-    rsp_server.append(ZIMO_SERVER_VERSION);
-
-    task->PutReplyHeader("Content-type", rsp_content_type.c_str());
-    task->PutReplyHeader("Server", rsp_server.c_str());
-    task->SetReplyData((const BYTE*)rsp_body.data(), rsp_body.size());
+    BuildJsonRpcResponse(task, rsp_reply);
 
     // JSON-RPC 层面的错误通过响应体中的 error 字段传达，HTTP 层面始终返回 200
     return 200;

@@ -720,6 +720,21 @@ protected:
      */
     virtual int OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t dlen);
 
+    /**
+     * @brief 构造 JSON-RPC HTTP 响应并写入 task（同步和异步路径共用）
+     *
+     * 根据请求中是否携带 callback 参数自动选择响应格式：
+     * - 无 callback → 标准 JSON 响应，Content-Type: application/json
+     * - 有 callback → JSONP 格式 callback(json)，Content-Type: application/javascript
+     *
+     * 同时设置 Server 响应头（含服务端版本号）、HTTP 状态码 200 和响应体。
+     * 调用者负责触发实际发送（同步路径由框架自动发送，异步路径需调用 SendDeferredReply）。
+     *
+     * @param task         请求上下文对象（从中读取 callback 参数）
+     * @param rsp_envelope 已填充 jsonrpc/id/method/result/error 的响应 JSON 对象
+     */
+    void BuildJsonRpcResponse(ZmHttpdTask* task, const ZMJSON& rsp_envelope);
+
 private:
     /** @brief JSON-RPC 请求回调（不带 task 参数） */
     OnJsonRpcRequestCB      m_on_jsonrpc_call;
