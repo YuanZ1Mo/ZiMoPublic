@@ -13,6 +13,7 @@
 #include "../spdlog/zm_logger.h"
 
 #include <../libevent/include/event2/bufferevent.h>
+#include <../libevent/include/event2/buffer.h>
 
 #include <atomic>
 
@@ -455,6 +456,33 @@ void ZmHttpdTask::SetReplyBuf(struct evbuffer* buf)
         // 将源 buffer 的全部内容移动到响应缓冲区（源 buffer 被消费）
         evbuffer_remove_buffer(buf, m_reply_buf, evbuffer_get_length(buf));
     }
+}
+
+int ZmHttpdTask::SetReplyFile(int fd, ev_off_t offset, ev_off_t length)
+{
+    if (fd < 0)
+        return -1;
+
+    // 使用 evbuffer_file_segment 替代已废弃的 evbuffer_add_file
+    // EVBUF_FS_CLOSE_ON_FREE: 段释放时自动 close(fd)
+    // EVBUF_FS_DISABLE_SENDFILE: 禁用 Windows TransmitFile，只用 mmap
+    struct evbuffer_file_segment* seg = evbuffer_file_segment_new(
+        fd, offset, length,
+        EVBUF_FS_CLOSE_ON_FREE);
+    if (!seg)
+        return -1;
+
+    // 添加到响应缓冲区（evbuffer 增加段引用计数）
+    if (evbuffer_add_file_segment(m_reply_buf, seg, 0, length) != 0)
+    {
+        // 失败时释放段，EVBUF_FS_CLOSE_ON_FREE 会触发 close(fd)
+        evbuffer_file_segment_free(seg);
+        return -1;
+    }
+
+    // 释放本地引用（evbuffer 仍持有引用，fd 不会在此处关闭）
+    evbuffer_file_segment_free(seg);
+    return 0;
 }
 
 void ZmHttpdTask::ClearReplyBody()

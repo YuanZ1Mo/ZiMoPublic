@@ -260,6 +260,20 @@ public:
     void SetReplyBuf(struct evbuffer* buf = nullptr);
 
     /**
+     * @brief 零拷贝方式向响应缓冲区添加文件内容
+     *
+     * 使用 evbuffer_file_segment 替代已废弃的 evbuffer_add_file，
+     * 支持 mmap/sendfile 零拷贝。函数接管 fd 所有权，
+     * 传输完成后由 libevent 自动关闭 fd。
+     *
+     * @param fd      文件描述符（函数接管所有权，成功后调用者不应再操作 fd）
+     * @param offset  文件读取起始偏移量（字节）
+     * @param length  读取长度（字节数）
+     * @return 0 成功，-1 失败（调用者需自行 close(fd)）
+     */
+    int SetReplyFile(int fd, ev_off_t offset, ev_off_t length);
+
+    /**
      * @brief 清空已写入的响应体数据（保留状态码和响应头）
      *
      * 适用于异常恢复场景：handler 部分写入后抛异常，
