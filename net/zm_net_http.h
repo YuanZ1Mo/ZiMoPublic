@@ -331,6 +331,40 @@ protected:
 
     /** @brief 响应体缓冲区 */
     struct evbuffer*                    m_reply_buf;
+
+    /** @brief 请求体原始 evbuffer（由 Perform 设置，用于分块读取大文件） */
+    struct evbuffer*                    m_input_buf;
+
+public:
+    /**
+     * @brief 获取请求体原始 evbuffer，用于分块读取大文件上传
+     * @return 请求体缓冲区指针，无请求体时返回 nullptr
+     *
+     * @note 配合 DrainInputBody() 使用：evbuffer_copyout 读取一块 → 处理 → DrainInputBody 排空已处理数据
+     * @example
+     *   struct evbuffer* in = task->GetInputBuffer();
+     *   while (evbuffer_get_length(in) > 0) {
+     *       BYTE buf[262144];
+     *       size_t n = evbuffer_copyout(in, buf, sizeof(buf));
+     *       _write(fd, buf, n);
+     *       task->DrainInputBody(n);
+     *   }
+     */
+    struct evbuffer* GetInputBuffer() const;
+
+    /**
+     * @brief 设置请求体原始 evbuffer 引用（由 ZmHttpServer::Perform 调用）
+     * @param buf 请求体缓冲区指针
+     */
+    void SetInputBuffer(struct evbuffer* buf);
+
+    /**
+     * @brief 从请求体缓冲区头部排空指定字节数
+     * @param len 要排空的字节数
+     *
+     * @note 与 GetInputBuffer() 配合使用，每次处理完一块数据后调用
+     */
+    void DrainInputBody(size_t len);
 };
 
 class ZmHttpHead

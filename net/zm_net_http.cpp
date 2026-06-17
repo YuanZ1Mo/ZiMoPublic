@@ -340,6 +340,7 @@ ZmHttpdTask::ZmHttpdTask(struct evhttp_request* request) : m_request(request), m
     }
     // 创建用于存储响应体的 evbuffer，后续通过 SetReplyData 写入
     m_reply_buf = evbuffer_new();
+    m_input_buf = nullptr;
 }
 
 ZmHttpdTask::~ZmHttpdTask()
@@ -483,6 +484,22 @@ int ZmHttpdTask::SetReplyFile(int fd, ev_off_t offset, ev_off_t length)
     // 释放本地引用（evbuffer 仍持有引用，fd 不会在此处关闭）
     evbuffer_file_segment_free(seg);
     return 0;
+}
+
+void ZmHttpdTask::SetInputBuffer(struct evbuffer* buf)
+{
+    m_input_buf = buf;
+}
+
+struct evbuffer* ZmHttpdTask::GetInputBuffer() const
+{
+    return m_input_buf;
+}
+
+void ZmHttpdTask::DrainInputBody(size_t len)
+{
+    if (m_input_buf && len > 0)
+        evbuffer_drain(m_input_buf, len);
 }
 
 void ZmHttpdTask::ClearReplyBody()
@@ -971,6 +988,7 @@ void ZmHttpServer::Perform(ZmHttpdTask* task)
 
     struct evbuffer* inbuf = evhttp_request_get_input_buffer(task->Request());
     size_t           dlen = evbuffer_get_length(inbuf);
+    task->SetInputBuffer(inbuf);
     int              code = OnHttpdRequest(task, evbuffer_pullup(inbuf, dlen), dlen);
     // OnHttpdRequest 返回 0 表示该路径未被任何回调处理，默认 404
     if (code == 0)
