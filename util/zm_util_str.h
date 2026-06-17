@@ -363,6 +363,13 @@ public:
     static void   Unicode_To_UTF8(ZmByteBuffer& output, const wchar_t* wstr, size_t len = 0);
 
     /**
+     * @brief 宽字符串转 UTF-8
+     * @param wstr 宽字符串
+     * @return UTF-8 编码字符串，输入为空时返回空
+     */
+    static std::string Unicode_To_UTF8(const std::wstring& wstr);
+
+    /**
      * @brief 将 UTF-8 编码字符串转换为 ASCII
      * @param output 转换结果输出缓冲区
      * @param utf8   输入的 UTF-8 字符串
@@ -377,6 +384,13 @@ public:
      * @param len    输入字符串长度，为 0 时自动计算
      */
     static void   UTF8_To_Unicode(ZmByteBuffer& output, const char* utf8, size_t len = 0);
+
+    /**
+     * @brief UTF-8 字符串转宽字符串
+     * @param utf8 UTF-8 编码的字符串
+     * @return 宽字符串，输入为空时返回空
+     */
+    static std::wstring UTF8_To_Unicode(const std::string& utf8);
 
     /**
      * @brief 将 UTF-8 编码字符串转换为 ANSI 编码
@@ -440,6 +454,13 @@ public:
      * @return 解码后的字符串指针
      */
     static char* URLDecode(ZmByteBuffer& output, const char* input);
+
+    /**
+     * @brief URL 百分号解码（%XX → 原始字节，+ → 空格）
+     * @param str 含百分号编码的 URL 字符串
+     * @return 解码后的字符串
+     */
+    static std::string URLDecode(const std::string& str);
 
     /**
      * @brief 检查字符串是否为合法的 Base64 编码

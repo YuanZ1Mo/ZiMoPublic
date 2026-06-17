@@ -462,6 +462,16 @@ void ZmString::Unicode_To_UTF8(ZmByteBuffer& output, const wchar_t* wstr, size_t
     WideCharToMultiByte(CP_UTF8, 0, wstr, wlen, output.Str(), u8len, 0, 0);
 }
 
+std::string ZmString::Unicode_To_UTF8(const std::wstring& wstr)
+{
+    if (wstr.empty()) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), NULL, 0, NULL, NULL);
+    if (len <= 0) return "";
+    std::string result(len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), &result[0], len, NULL, NULL);
+    return result;
+}
+
 void ZmString::UTF8_To_Ascii(ZmByteBuffer& output, const char* utf8, size_t len)
 {
     int u8len = len ? (int)len : -1;
@@ -499,6 +509,16 @@ void ZmString::UTF8_To_Ansi(ZmByteBuffer& output, const char* utf8, size_t len)
             WideCharToMultiByte(CP_ACP, 0, buffer.get(), wlen, output.Str(), alen, NULL, NULL);
         }
     }
+}
+
+std::wstring ZmString::UTF8_To_Unicode(const std::string& utf8)
+{
+    if (utf8.empty()) return L"";
+    int len = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), NULL, 0);
+    if (len <= 0) return L"";
+    std::wstring result(len, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), &result[0], len);
+    return result;
 }
 
 void ZmString::OptimizeHexMixed(const char* hexmixed, char* output)
@@ -623,6 +643,33 @@ char* ZmString::URLDecode(ZmByteBuffer& output, const char* input)
     }
     *pout = '\0';
     return output.Str();
+}
+
+std::string ZmString::URLDecode(const std::string& str)
+{
+    std::string result;
+    result.reserve(str.size());
+    for (size_t i = 0; i < str.size(); i++)
+    {
+        if (str[i] == '%' && i + 2 < str.size())
+        {
+            int h = zm_hex_to_char(str[i + 1]);
+            int l = zm_hex_to_char(str[i + 2]);
+            if (h >= 0 && l >= 0)
+            {
+                result += (char)((h << 4) | l);
+                i += 2;
+                continue;
+            }
+        }
+        else if (str[i] == '+')
+        {
+            result += ' ';
+            continue;
+        }
+        result += str[i];
+    }
+    return result;
 }
 
 #define xx 255  // xx 标记无效字符，用于解码时检测非法输入
