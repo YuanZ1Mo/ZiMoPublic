@@ -265,7 +265,7 @@ ZM_TAP_CTX* ZmTapContext::Get()
     ZM_TAP_SLOT* new_slots = nullptr;
     if (need_expand)
     {
-        PUBLIC_LOG_INFO("Tap container pool size is insufficient, try expanding it, Current size: {}", m_count);
+        PUBLIC_LOG_INFO("Tap container pool size is insufficient, try expanding it, Current TAP size: {}, Current capacity size: {}, new capacity size: {}", m_count, m_capacity, new_capacity);
         new_slots = (ZM_TAP_SLOT*)malloc(TAP_ITEM_SIZE * new_capacity);
         if (new_slots)
         {
@@ -298,12 +298,12 @@ ZM_TAP_CTX* ZmTapContext::Get()
             free(m_slots);
             m_slots = new_slots;
             m_capacity = new_capacity;
-            PUBLIC_LOG_INFO("The total size of the tap pool after expansion: {}", m_capacity);
         }
         // 将新 tap 放入槽位，建立双向关联
         m_slots[m_count].tap = tap;
         tap->_slot = &m_slots[m_count];
         m_count++;
+        PUBLIC_LOG_INFO("there are no idle TAP objects available. Create a new Tap. The current number of TAPs is: {}, and the total capacity is: {}", m_count, m_capacity);
     }
 
     tap->SetTapContext(this);
@@ -694,7 +694,18 @@ void BuffereventPairPool::ReleaseHalf(void* slotPtr, bool is_pair1)
     auto* s = static_cast<PairPoolSlot*>(slotPtr);
 
     if (is_pair1)
+    {
         s->pair1_done = true;
+
+        // pair[1] 被业务 Drop 且 pair[0] 仍在等待响应
+        // 通过事件系统触发 BEV_EVENT_EOF，OnResponseEvent 在下一轮事件循环执行
+        // 零重入、零 buffer 操作、pair 完整保留
+        if (!s->pair0_done)
+        {
+            bufferevent_trigger_event(s->pair[0], BEV_EVENT_EOF,
+                BEV_OPT_DEFER_CALLBACKS);
+        }
+    }
     else
         s->pair0_done = true;
 
@@ -1045,14 +1056,31 @@ bool ZmTapContextEventHandler::OnPairAcceptBev(void* ctx, struct bufferevent* be
 
     if (delegate == nullptr || bev == nullptr)
     {
-        if (bev) bufferevent_free(bev);
+        if (bev)
+        {
+            if (on_bev_free)
+            {
+                on_bev_free(slot, true);
+            }
+            else
+            {
+                bufferevent_free(bev);
+            }
+        }
         return false;
     }
 
     ZmTapContext* context = delegate->TapContext();
     if (context == nullptr)
     {
-        bufferevent_free(bev);
+        if (on_bev_free)
+        {
+            on_bev_free(slot, true);
+        }
+        else
+        {
+            bufferevent_free(bev);
+        }
         return false;
     }
 
@@ -1060,7 +1088,14 @@ bool ZmTapContextEventHandler::OnPairAcceptBev(void* ctx, struct bufferevent* be
     ZM_TAP_CTX* tap = context->Get();
     if (tap == nullptr)
     {
-        bufferevent_free(bev);
+        if (on_bev_free)
+        {
+            on_bev_free(slot, true);
+        }
+        else
+        {
+            bufferevent_free(bev);
+        }
         return false;
     }
 
