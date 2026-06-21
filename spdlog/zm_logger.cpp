@@ -4,6 +4,8 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <mutex>
+#include <unordered_map>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -56,6 +58,46 @@ public:
 std::shared_ptr<spdlog::logger> g_default_logger = nullptr;
 std::shared_ptr<spdlog::logger> g_public_logger = nullptr;
 
+// 共享 sink 管理：以日志文件路径为 key，同路径的 logger 共用同一个 rotating_file_sink_mt
+// 避免多个 sink 写同一文件时大小追踪分裂和旋转冲突
+struct SharedSinkEntry
+{
+    std::shared_ptr<spdlog::sinks::rotating_file_sink_mt> sink;
+    int refcount = 0;
+};
+static std::mutex g_shared_sinks_mutex;
+static std::unordered_map<std::string, SharedSinkEntry> g_shared_sinks;
+
+// 获取或创建共享 sink（调用方需确保线程安全，内部加锁）
+static std::shared_ptr<spdlog::sinks::rotating_file_sink_mt> acquire_shared_sink(
+    const std::string& path, std::size_t max_size, std::size_t max_files)
+{
+    std::lock_guard<std::mutex> lock(g_shared_sinks_mutex);
+    auto it = g_shared_sinks.find(path);
+    if (it != g_shared_sinks.end())
+    {
+        ++it->second.refcount;
+        return it->second.sink;
+    }
+    // 新建 sink 并加入 map
+    SharedSinkEntry entry;
+    entry.sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(path, max_size, max_files);
+    entry.refcount = 1;
+    g_shared_sinks[path] = std::move(entry);
+    return g_shared_sinks[path].sink;
+}
+
+// 释放共享 sink，引用计数归零时销毁
+static void release_shared_sink(const std::string& path)
+{
+    std::lock_guard<std::mutex> lock(g_shared_sinks_mutex);
+    auto it = g_shared_sinks.find(path);
+    if (it != g_shared_sinks.end() && --it->second.refcount <= 0)
+    {
+        g_shared_sinks.erase(it);
+    }
+}
+
 RotatingLoggerBase::RotatingLoggerBase(const Config& config)
     : config_(config)
 {
@@ -68,8 +110,15 @@ RotatingLoggerBase::~RotatingLoggerBase()
 
 void RotatingLoggerBase::CreateLogger()
 {
+    // 先清理旧 logger（如果存在）
     spdlog::drop(config_.logger_name);
-    logger_ = spdlog::rotating_logger_mt(config_.logger_name, get_log_path(), config_.max_file_size, config_.max_files);
+
+    // 获取或创建共享 sink（同路径复用，避免多 sink 写同一文件）
+    std::string path = get_log_path();
+    auto sink = acquire_shared_sink(path, config_.max_file_size, config_.max_files);
+
+    // 创建 logger 并绑定共享 sink
+    logger_ = std::make_shared<spdlog::logger>(config_.logger_name, std::move(sink));
 
     // 注入自定义 pattern flag: %T = 线程名
     spdlog::pattern_formatter::custom_flags customFlags;
@@ -79,6 +128,9 @@ void RotatingLoggerBase::CreateLogger()
     logger_->set_formatter(std::move(formatter));
 
     logger_->flush_on(spdlog::level::trace);
+
+    // 注册到 spdlog 全局 registry，使 spdlog::get() 和 spdlog::drop() 可用
+    spdlog::register_logger(logger_);
 
     if (config_.is_default)
     {
@@ -96,6 +148,9 @@ void RotatingLoggerBase::ReleaseLogger()
             spdlog::set_default_logger(nullptr);
         }
         logger_.reset();
+
+        // 释放共享 sink，引用计数归零时自动销毁 sink
+        release_shared_sink(get_log_path());
     }
 }
 
