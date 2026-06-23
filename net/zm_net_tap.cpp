@@ -115,7 +115,7 @@ void ZmTapContext::Drop(ZM_TAP_CTX* tap, const char* reason)
 
 	// 立即标记 DROPPING 状态防止复用（跨线程安全：uint8_t 单字节原子写入）
 	tap->state = ZM_TAP_STATE_DROPPING;
-	PUBLIC_LOG_INFO("Dropping Tap: {}, Reason:{}", (void*)tap, reason);
+	//PUBLIC_LOG_INFO("Dropping Tap: {}, Reason:{}", (void*)tap, reason);
 
 	// 获取事件循环基以调度清理任务
 	auto* evbase = const_cast<event_base*>(tap->EventBase());
@@ -185,7 +185,7 @@ void ZmTapContext::DropImpl(ZM_TAP_CTX* tap, const char* reason)
 		m_free_stack.push_back(tap);
 	}
 
-	PUBLIC_LOG_INFO("Drop Tap: {} Over", (void*)tap);
+	//PUBLIC_LOG_INFO("Drop Tap: {} Over", (void*)tap);
 }
 
 void ZmTapContext::FreeRequesterEnd(ZM_TAP_CTX* tap)
@@ -323,7 +323,7 @@ void ZmTapContext::SetDropTimer(ZM_TAP_CTX* tap, int seconds, int micros, uint32
 
 void ZmTapContext::SetDropTimerImpl(ZM_TAP_CTX* tap, int seconds, int micros, uint32_t drop_timeout_error_code)
 {
-    PUBLIC_LOG_INFO("SetDropTimer, Tap: {}, time: {}s+{}ms, drop timeout errorCode: {}", (void*)tap, seconds, micros, drop_timeout_error_code);
+    //PUBLIC_LOG_INFO("SetDropTimer, Tap: {}, time: {}s+{}ms, drop timeout errorCode: {}", (void*)tap, seconds, micros, drop_timeout_error_code);
 
     if (seconds >= 0 || micros >= 0)
     {
@@ -485,7 +485,7 @@ void ZmTapContext::EvDnsResolve(ZM_TAP_CTX* tap, const char* hostname, uint16_t 
 
 void ZmTapContext::CancelResolve(ZM_TAP_CTX* tap)
 {
-    PUBLIC_LOG_INFO("Tap: {}, CancelResolve", (void*)tap);
+    //PUBLIC_LOG_INFO("Tap: {}, CancelResolve", (void*)tap);
 
     if (tap->dns_request)
     {

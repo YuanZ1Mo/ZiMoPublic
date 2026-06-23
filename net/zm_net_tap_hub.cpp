@@ -357,7 +357,7 @@ bool ZmTapHubProxy::OnTapRequesterAccept(ZM_TAP_CTX* tap, evutil_socket_t fd, st
 {
 	ZM_UNUSED(address);
 
-	PUBLIC_LOG_INFO("HubProxy setting up probe callbacks for Tap: {}", (void*)tap);
+	//PUBLIC_LOG_INFO("HubProxy setting up probe callbacks for Tap: {}", (void*)tap);
 
 	/** 设置 4 字节读水位线，确保首包至少包含协议魔数 */
 	bufferevent_setwatermark(tap->requester_bev, EV_READ, 4, 0);
@@ -468,7 +468,7 @@ void ZmTapHubProxy::OnProtocolDetectReadCB(struct bufferevent* bev, void* ctx)
 			return;
 		}
 
-		PUBLIC_LOG_INFO("HubProxy probe detected JRPC protocol, switching delegate for Tap: {}", (void*)tap);
+		//PUBLIC_LOG_INFO("HubProxy probe detected JRPC protocol, switching delegate for Tap: {}", (void*)tap);
 		evbuffer_drain(input, 4);
 		self->SwitchDelegate(tap, self->m_delegate_jrpc);
 	}
@@ -491,7 +491,7 @@ void ZmTapHubProxy::OnProtocolDetectEventCB(struct bufferevent* bev, short event
 
 	if (events & (BEV_EVENT_EOF | BEV_EVENT_ERROR))
 	{
-		PUBLIC_LOG_INFO("Probe connection closed/error, dropping Tap: {}", (void*)tap);
+		//PUBLIC_LOG_INFO("Probe connection closed/error, dropping Tap: {}", (void*)tap);
 		tap->delegate->OnTapRequesterEvent(tap, bev, events);
 
 		if (ZmTapContext::IsBackChainEmpty(tap))
@@ -524,6 +524,6 @@ void ZmTapHubProxy::SwitchDelegate(ZM_TAP_CTX* tap, ZmTapDelegate* new_delegate)
 		tap);
 	bufferevent_setwatermark(tap->requester_bev, EV_READ, 0, ZM_BUF_WATERMARK_HIGH);
 
-	PUBLIC_LOG_INFO("SwitchDelegate: {} -> {}, Tap: {}",
-		old_delegate->TapDelegateName(), new_delegate->TapDelegateName(), (void*)tap);
+	//PUBLIC_LOG_INFO("SwitchDelegate: {} -> {}, Tap: {}",
+	//	old_delegate->TapDelegateName(), new_delegate->TapDelegateName(), (void*)tap);
 }

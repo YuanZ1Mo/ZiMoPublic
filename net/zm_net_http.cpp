@@ -605,8 +605,8 @@ public:
         evhttp_send_reply(m_request, m_status_code, m_reason.empty() ? nullptr : m_reason.c_str(), m_reply_buf);
 
         // 打印响应返回日志，包含追踪 ID 便于关联请求和响应
-        PUBLIC_LOG_INFO("[响应#{}] ← {} {}", m_id, m_status_code,
-            m_reason.empty() ? "(no reason)" : m_reason.c_str());
+        //PUBLIC_LOG_INFO("[响应#{}] ← {} {}", m_id, m_status_code,
+        //    m_reason.empty() ? "(no reason)" : m_reason.c_str());
 
         // 创建 1 秒一次性定时器，到期后由 OnEvent_Timer 回调触发 SendReplyEnd
         struct timeval tv = { 1, 0 };
@@ -957,23 +957,23 @@ void ZmHttpServer::Perform(ZmHttpdTask* task)
         }
     }
 
-    // 打印请求接收日志，包含追踪 ID 便于关联请求和响应
-    {
-        const char* method = nullptr;
-        switch (task->Method())
-        {
-        case EVHTTP_REQ_GET:     method = "GET";     break;
-        case EVHTTP_REQ_POST:    method = "POST";    break;
-        case EVHTTP_REQ_PUT:     method = "PUT";     break;
-        case EVHTTP_REQ_DELETE:  method = "DELETE";  break;
-        case EVHTTP_REQ_OPTIONS: method = "OPTIONS"; break;
-        case EVHTTP_REQ_PATCH:   method = "PATCH";   break;
-        case EVHTTP_REQ_HEAD:    method = "HEAD";    break;
-        default:                 method = "UNKNOWN"; break;
-        }
-        PUBLIC_LOG_INFO("[请求#{}] → {} {} 来自 {}", task->Id(), method,
-            task->Uri() ? task->Uri() : "(null)", task->Ip() ? task->Ip() : "(null)");
-    }
+    //// 打印请求接收日志，包含追踪 ID 便于关联请求和响应
+    //{
+    //    const char* method = nullptr;
+    //    switch (task->Method())
+    //    {
+    //    case EVHTTP_REQ_GET:     method = "GET";     break;
+    //    case EVHTTP_REQ_POST:    method = "POST";    break;
+    //    case EVHTTP_REQ_PUT:     method = "PUT";     break;
+    //    case EVHTTP_REQ_DELETE:  method = "DELETE";  break;
+    //    case EVHTTP_REQ_OPTIONS: method = "OPTIONS"; break;
+    //    case EVHTTP_REQ_PATCH:   method = "PATCH";   break;
+    //    case EVHTTP_REQ_HEAD:    method = "HEAD";    break;
+    //    default:                 method = "UNKNOWN"; break;
+    //    }
+    //    PUBLIC_LOG_INFO("[请求#{}] → {} {} 来自 {}", task->Id(), method,
+    //        task->Uri() ? task->Uri() : "(null)", task->Ip() ? task->Ip() : "(null)");
+    //}
 
     // 自动添加 CORS 跨域响应头，允许所有来源访问
     task->PutReplyHeader("Access-Control-Allow-Origin", "*");

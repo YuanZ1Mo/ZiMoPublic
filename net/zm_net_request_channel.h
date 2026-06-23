@@ -125,11 +125,11 @@ public:
     void SubmitAsync(const std::string& request_json, std::function<void(std::string)> callback);
 
     /**
-     * @brief 排空并异步处理所有待处理请求（仅事件循环线程调用）
+     * @brief 循环排空所有待处理请求（仅事件循环线程调用）
      *
-     * 原子地取出队列中所有请求，逐个调用 m_handler 处理。
-     * 每个请求携带一个回调闭包，回调中 set_value 对应的 promise。
-     * 处理过程中新提交的请求留待下次 Drain 处理，避免单次调用饥饿。
+     * 最多 kMaxRounds 轮循环：每轮原子交换队列并逐条调用 m_handler 处理。
+     * 每轮处理期间新入队的请求会在下一轮被取出，消除 event_active 竞态窗口。
+     * 达到上限后若队列未空则返回，由后续 SubmitAsync 的 event_active 再调度。
      */
     void Drain();
 

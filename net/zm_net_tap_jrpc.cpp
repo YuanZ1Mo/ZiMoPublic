@@ -76,7 +76,7 @@ void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app
 	if (tap->delegate->TapDelegateMode() != m_mode)
 		return;
 
-	PUBLIC_LOG_INFO("Received JRPC message forwarded by HUB, TAP:{}, datalen: {}", (void*)tap, datalen);
+	//PUBLIC_LOG_INFO("Received JRPC message forwarded by HUB, TAP:{}, datalen: {}", (void*)tap, datalen);
 
 	// 首次到达：解析 4 字节长度头
 	if (tap->requester_data_len == 0)
@@ -127,8 +127,8 @@ void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app
 	if (tap->requester_received_len < tap->requester_data_len)
 		return;
 
-	PUBLIC_LOG_INFO("Received JRPC message forwarded by HUB, TAP:{}, content:{}",
-		(void*)tap, (const char*)tap->requester_data);
+	//PUBLIC_LOG_INFO("Received JRPC message forwarded by HUB, TAP:{}, content:{}",
+	//	(void*)tap, (const char*)tap->requester_data);
 
 	// 有外部回调：拷贝数据后投递到工作线程，业务层使用 delegate 的异步方法操作 TAP
 	if (m_tapDelegateJrpcRequestReadCB && m_threadPool)
@@ -163,8 +163,8 @@ void ZmTapDelegateJRPC::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app
  */
 void ZmTapDelegateJRPC::OnTapDelegateBackEvent(ZM_TAP_CTX* tap)
 {
-	PUBLIC_LOG_INFO("Received reply message from JRPC external callback, TAP:{}, onback_data={}",
-		(void*)tap, (const char*)tap->onback_data);
+	//PUBLIC_LOG_INFO("Received reply message from JRPC external callback, TAP:{}, onback_data={}",
+	//	(void*)tap, (const char*)tap->onback_data);
 
 	tap->delegate = this;
 	WriteResponse(tap, (const char*)tap->onback_data, tap->onback_dlen);
@@ -184,7 +184,7 @@ void ZmTapDelegateJRPC::OnTapDelegateBackEvent(ZM_TAP_CTX* tap)
  */
 void ZmTapDelegateJRPC::WriteResponse(ZM_TAP_CTX* tap, const char* json_str, size_t data_len)
 {
-	PUBLIC_LOG_INFO("Received JRPC Response, TAP:{}, content: {}", (void*)tap, json_str);
+	//PUBLIC_LOG_INFO("Received JRPC Response, TAP:{}, content: {}", (void*)tap, json_str);
 
 	uint32_t rsp_len = htonl((uint32_t)data_len);
 
@@ -208,6 +208,6 @@ void ZmTapDelegateJRPC::WriteResponse(ZM_TAP_CTX* tap, const char* json_str, siz
 
 	if (ZmTapContext::IsBackChainEmpty(tap))
 	{
-		ZmTapContext::SetDropTimer(tap, 30);
+		tap->Drop();
 	}
 }

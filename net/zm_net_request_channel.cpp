@@ -140,45 +140,58 @@ void ZmNetRequestChannel::SubmitAsync(const std::string& request_json,
 
 void ZmNetRequestChannel::Drain()
 {
-    // 原子地取出所有待处理请求（交换 deque 避免长期持锁）
-    std::deque<std::shared_ptr<ZmNetRequestItem>> pending;
+    // ★ 循环排空直至队列为空，消除 event_active 竞态窗口：
+    //    当 Worker 线程在 Drain() 执行期间通过 SubmitAsync/Submit 入队新请求时，
+    //    其 event_active 调用可能因 event 正处于 ACTIVE/回调中而成为 no-op。
+    //    循环可确保在本轮事件处理中清空队列，不依赖 event_active 的再调度。
+    //    设置上限轮次防止极端高频入队时饿死事件循环中的其他事件（如响应回调）。
+    static constexpr int kMaxRounds = 64;
+
+    for (int round = 0; round < kMaxRounds; ++round)
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        pending.swap(m_queue);
-    }
-
-    if (pending.empty())
-        return;
-
-    for (auto& req : pending)
-    {
-        // 按值捕获 shared_ptr 确保异步回调触发前 ZmNetRequestItem 存活
-        auto requestJson = req->request_json;
-
-        if (req->direct_callback)
+        // 原子地取出所有待处理请求（交换 deque 避免长期持锁）
+        std::deque<std::shared_ptr<ZmNetRequestItem>> pending;
         {
-            // SubmitAsync 路径：直接回调（在事件循环线程中触发，零额外线程）
-            // 用 shared_ptr 包装避免 move-only lambda 导致 std::function 构造失败
-            auto direct_cb = std::make_shared<std::function<void(std::string)>>(
-                std::move(req->direct_callback));
-            m_handler(requestJson,
-                [direct_cb](std::string response) {
-                    (*direct_cb)(std::move(response));
-                });
+            std::lock_guard<std::mutex> lock(m_mutex);
+            pending.swap(m_queue);
         }
-        else
+
+        if (pending.empty())
+            return;
+
+        for (auto& req : pending)
         {
-            // Submit 路径：通过 promise/future 通知等待线程
-            m_handler(requestJson,
-                [req](std::string response) {
-                    try
-                    {
-                        req->response_promise.set_value(std::move(response));
-                    }
-                    catch (const std::future_error&) {}
-                });
+            // 按值捕获 shared_ptr 确保异步回调触发前 ZmNetRequestItem 存活
+            auto requestJson = req->request_json;
+
+            if (req->direct_callback)
+            {
+                // SubmitAsync 路径：直接回调（在事件循环线程中触发，零额外线程）
+                // 用 shared_ptr 包装避免 move-only lambda 导致 std::function 构造失败
+                auto direct_cb = std::make_shared<std::function<void(std::string)>>(
+                    std::move(req->direct_callback));
+                m_handler(requestJson,
+                    [direct_cb](std::string response) {
+                        (*direct_cb)(std::move(response));
+                    });
+            }
+            else
+            {
+                // Submit 路径：通过 promise/future 通知等待线程
+                m_handler(requestJson,
+                    [req](std::string response) {
+                        try
+                        {
+                            req->response_promise.set_value(std::move(response));
+                        }
+                        catch (const std::future_error&) {}
+                    });
+            }
         }
     }
+    // 若达到上限后队列仍未空（极端超载场景），剩余请求将由后续 SubmitAsync 的
+    // event_active 唤醒处理。EV_PERSIST 回调返回后 event 被 deactivate，
+    // 新到来的 SubmitAsync 调用 event_active 即可重新激活。
 }
 
 // ============================================================================
