@@ -4,6 +4,8 @@
 /** @brief bufferevent 创建选项：关闭时释放 fd、延迟回调、线程安全 */
 #define ZM_EVENT_BEV_OPTIONS BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_THREADSAFE
 
+#include "zm_bufferevent_pair_pool.h"
+
 #include "zm_net_http.h"
 
 #include <../libevent/include/event2/bufferevent.h>
@@ -71,11 +73,6 @@ typedef enum
     ZM_DELEGATE_MODE_DNR_ASYNC = 3,            /** 异步域名解析器（已废弃） */
 } ZM_DELEGATE_MODE;
 
-/** @brief bufferevent_pair 池归还回调类型
- *  @param slot      池槽位指针
- *  @param is_pair1  true 表示 pair[1]（TAP 端），false 表示 pair[0]（响应端） */
-typedef void(*ZmTapBevFreeCB)(void* slot, bool is_pair1);
-
 /** @brief TAP 状态枚举 */
 typedef enum
 {
@@ -129,9 +126,8 @@ public:
     char           seq_num[16];               ///< 消息序号（原子自增生成，唯一标识）
     ZM_TAP_SLOT*   _slot;                     ///< 回指 pool 中的槽位，扩容时被 ZmTapContext 同步更新
 
-    /// bufferevent_pair 池化支持：当 requester_bev 来自池时，FreeRequesterEnd 通过回调归还
-    ZmTapBevFreeCB on_bev_free;               ///< bufferevent 释放回调（nullptr 表示直接 free）
-    void*          bev_pool_slot;              ///< 池槽位指针，传给 on_bev_free
+    /// bufferevent_pair 池化支持：当 requester_bev 来自池时非空，FreeRequesterEnd 通过它归还
+    BuffereventPairHandle* pair_handle;       ///< 池句柄，非空时由池管理生命周期
 
 public:
     /**
@@ -250,69 +246,6 @@ private:
     std::vector<ZM_TAP_CTX*> m_free_stack;    /** 空闲 TAP 栈，Get/Drop 均 O(1) */
 };
 
-// ============================================================================
-// BuffereventPairPool — bufferevent_pair 对象池
-// ============================================================================
-
-class BuffereventPairPool;
-
-/** @brief 池中单个槽位，持有一对 bufferevent_pair */
-struct PairPoolSlot
-{
-    struct bufferevent*  pair[2];   ///< pair[0] 响应端，pair[1] TAP 端
-    bool                 in_use;    ///< 是否正在使用中
-    bool                 pair0_done;///< pair[0] 是否已归还
-    bool                 pair1_done;///< pair[1] 是否已归还
-    BuffereventPairPool* owner;     ///< 回指所属池，供 ReleaseHalf 归还
-};
-
-/**
- * @brief bufferevent_pair 对象池，消除高并发下的 socketpair 系统调用和堆分配开销
- *
- * 预创建固定数量的 bufferevent_pair，空闲时 O(1) 获取，两端都归还后自动回收。
- * 池耗尽时自动扩容（每次创建一个新 pair，归还后进入空闲栈复用）。
- * 使用 std::deque 保证扩容时已外借的槽位指针不失效。
- */
-class BuffereventPairPool
-{
-public:
-    BuffereventPairPool();
-    ~BuffereventPairPool();
-
-    /** @brief 预创建池
-     *  @param evbase   libevent 事件循环基
-     *  @param capacity 预创建 pair 数量 */
-    void Init(struct event_base* evbase, int capacity);
-
-    /** @brief 销毁池中所有 pair（含运行时扩容的） */
-    void Shutdown();
-
-    /** @brief 获取一个可用槽位（O(1) 从空闲栈弹出，池耗尽时自动扩容）
-     *  @return 槽位指针，仅在 bufferevent_pair_new 失败时返回 nullptr */
-    PairPoolSlot* Acquire();
-
-    /** @brief 归还 pair 的某一端
-     *  @param slot      槽位指针
-     *  @param is_pair1  true 表示 pair[1]（TAP 端），false 表示 pair[0]（响应端）
-     *  @note 由 FreeRequesterEnd 和 OnResponseRead/Event 调用 */
-    static void ReleaseHalf(void* slot, bool is_pair1);
-
-    /** @brief 槽位回空闲栈（由 ReleaseHalf 内部调用） */
-    void ReturnToFreeStack(PairPoolSlot* slot);
-
-private:
-    /** @brief 池耗尽时创建一个新槽位并推入空闲栈
-     *  @return true 创建成功，false bufferevent_pair_new 失败 */
-    bool Grow();
-
-    /** @brief 重置 pair 的 evbuffer 状态，清空残留数据 */
-    static void ResetPair(PairPoolSlot* slot);
-
-    struct event_base*         m_evbase;
-    std::deque<PairPoolSlot>   m_slots;          ///< 槽位队列（deque 保证 push_back 不失效已有指针）
-    std::vector<PairPoolSlot*> m_free_stack;     ///< 空闲槽位栈
-};
-
 /**
  * @brief TAP 协议委托基类，子类实现具体的协议处理逻辑
  *
@@ -413,13 +346,12 @@ public:
     /** @brief 接受 bufferevent 注入 — OnPairAcceptConn 的变体，用于已创建的 bufferevent（如 bufferevent_pair）
      *  @param ctx  Hub 代理 delegate
      *  @param bev  已创建的 bufferevent（如 bufferevent_pair 的一端），成功后由 TAP 接管生命周期
-     *  @param slot 可选，bufferevent_pair 池槽位指针；非空时设置 TAP 的 bev_pool_slot
-     *  @param on_bev_free 可选，池归还回调；非空时设置 TAP 的 on_bev_free
+     *  @param handle 可选，池句柄指针；非空时设置 TAP 的 pair_handle
      *  @return true 成功创建 TAP 并触发协议探测，false 失败（bev 已释放）
      *  @note  必须在事件循环线程中调用
      *  @note  用于进程内零拷贝通信，bev 无需关联 socket fd */
     static bool OnPairAcceptBev(void* ctx, struct bufferevent* bev,
-                                void* slot = nullptr, ZmTapBevFreeCB on_bev_free = nullptr);
+                                BuffereventPairHandle* handle = nullptr);
     static void OnRequesterEventCB(struct bufferevent* requester_bev, short events, void* ctx);
     static void OnRequesterReadCB(struct bufferevent* requester_bev, void* ctx);
     static void OnRequesterWriteCB(struct bufferevent* requester_bev, void* ctx);

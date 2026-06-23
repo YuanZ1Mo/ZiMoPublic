@@ -206,6 +206,11 @@ void ZmTapDelegateJRPC::WriteResponse(ZM_TAP_CTX* tap, const char* json_str, siz
 		PUBLIC_LOG_ERROR("bufferevent_flush failed, TAP:{}, ret:{}", (void*)tap, ret);
 	}
 
+	// ★ 标记数据已写出：后续 tap->Drop() → ReleasePair1 看到此标记跳
+	//    过 EOF 触发，pair0 读到响应数据后自行回收，从根源消灭双回调。
+	if (tap->pair_handle)
+		tap->pair_handle->MarkDataWritten();
+
 	if (ZmTapContext::IsBackChainEmpty(tap))
 	{
 		tap->Drop();

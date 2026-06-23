@@ -22,8 +22,7 @@ void ZM_TAP_CTX::Clear()
     onback_dlen = 0;
     state = ZM_TAP_STATE_NONE;
     _slot = nullptr;
-    on_bev_free = nullptr;
-    bev_pool_slot = nullptr;
+    pair_handle = nullptr;
     drop_timeout_error_code = 0;
     requester_data_len = 0;
     requester_received_len = 0;
@@ -190,12 +189,11 @@ void ZmTapContext::DropImpl(ZM_TAP_CTX* tap, const char* reason)
 
 void ZmTapContext::FreeRequesterEnd(ZM_TAP_CTX* tap)
 {
-    // 若来自 bufferevent_pair 池，通过回调归还而非直接释放
-    if (tap->on_bev_free && tap->bev_pool_slot)
+    // 若来自 bufferevent_pair 池，只发EOF信号, 业务侧自己回收pair
+    if (tap->pair_handle)
     {
-        tap->on_bev_free(tap->bev_pool_slot, true);
-        tap->bev_pool_slot = nullptr;
-        tap->on_bev_free = nullptr;
+        tap->pair_handle->Pair1EOF();
+        tap->pair_handle = nullptr;
     }
     else
     {
@@ -631,147 +629,6 @@ bool ZmTapContext::ScheduleInLoop(event_base* evbase, std::function<void()> fn)
 
 // ============================================================================
 // BuffereventPairPool
-BuffereventPairPool::BuffereventPairPool() : m_evbase(nullptr) {}
-BuffereventPairPool::~BuffereventPairPool() { Shutdown(); }
-
-void BuffereventPairPool::Init(struct event_base* evbase, int capacity)
-{
-    m_evbase = evbase;
-    for (int i = 0; i < capacity; i++)
-    {
-        m_slots.emplace_back();
-        auto& slot = m_slots.back();
-        slot.pair[0] = nullptr;
-        slot.pair[1] = nullptr;
-        slot.in_use = false;
-        slot.pair0_done = false;
-        slot.pair1_done = false;
-        slot.owner = this;
-
-        struct bufferevent* p[2] = { nullptr, nullptr };
-        if (bufferevent_pair_new(m_evbase, ZM_EVENT_BEV_OPTIONS, p) == 0)
-        {
-            slot.pair[0] = p[0];
-            slot.pair[1] = p[1];
-            m_free_stack.push_back(&slot);
-        }
-    }
-    PUBLIC_LOG_INFO("BuffereventPairPool initialized: capacity={}, created={}",
-        capacity, (int)m_free_stack.size());
-}
-
-void BuffereventPairPool::Shutdown()
-{
-    for (auto& slot : m_slots)
-    {
-        if (slot.pair[0]) { bufferevent_free(slot.pair[0]); slot.pair[0] = nullptr; }
-        if (slot.pair[1]) { bufferevent_free(slot.pair[1]); slot.pair[1] = nullptr; }
-    }
-    m_free_stack.clear();
-    m_slots.clear();
-    m_evbase = nullptr;
-}
-
-PairPoolSlot* BuffereventPairPool::Acquire()
-{
-    if (m_free_stack.empty())
-    {
-        if (!Grow())
-            return nullptr;
-    }
-
-    auto* slot = m_free_stack.back();
-    m_free_stack.pop_back();
-    slot->in_use = true;
-    slot->pair0_done = false;
-    slot->pair1_done = false;
-    return slot;
-}
-
-void BuffereventPairPool::ReleaseHalf(void* slotPtr, bool is_pair1)
-{
-    if (slotPtr == nullptr) return;
-    auto* s = static_cast<PairPoolSlot*>(slotPtr);
-
-    if (is_pair1)
-    {
-        s->pair1_done = true;
-
-        // pair[1] 被业务 Drop 且 pair[0] 仍在等待响应
-        // 通过事件系统触发 BEV_EVENT_EOF，OnResponseEvent 在下一轮事件循环执行
-        // 零重入、零 buffer 操作、pair 完整保留
-        if (!s->pair0_done)
-        {
-            bufferevent_trigger_event(s->pair[0], BEV_EVENT_EOF,
-                BEV_OPT_DEFER_CALLBACKS);
-        }
-    }
-    else
-        s->pair0_done = true;
-
-    if (s->pair0_done && s->pair1_done)
-    {
-        ResetPair(s);
-        s->in_use = false;
-        if (s->owner)
-            s->owner->ReturnToFreeStack(s);
-    }
-}
-
-void BuffereventPairPool::ReturnToFreeStack(PairPoolSlot* slot)
-{
-    m_free_stack.push_back(slot);
-}
-
-bool BuffereventPairPool::Grow()
-{
-    m_slots.emplace_back();
-    auto& slot = m_slots.back();
-    slot.pair[0] = nullptr;
-    slot.pair[1] = nullptr;
-    slot.in_use = false;
-    slot.pair0_done = false;
-    slot.pair1_done = false;
-    slot.owner = this;
-
-    struct bufferevent* p[2] = { nullptr, nullptr };
-    if (bufferevent_pair_new(m_evbase, ZM_EVENT_BEV_OPTIONS, p) != 0)
-    {
-        m_slots.pop_back();
-        return false;
-    }
-    slot.pair[0] = p[0];
-    slot.pair[1] = p[1];
-    m_free_stack.push_back(&slot);
-
-    PUBLIC_LOG_INFO("BuffereventPairPool grow: total slots={}", (int)m_slots.size());
-    return true;
-}
-
-void BuffereventPairPool::ResetPair(PairPoolSlot* slot)
-{
-    // ★ 必须先 disable，否则下次 bufferevent_enable 是 no-op，
-    //    数据在 setcb 前到达时不会触发读回调，导致请求永久卡住
-    if (slot->pair[0])
-    {
-        bufferevent_disable(slot->pair[0], EV_READ | EV_WRITE);
-        struct evbuffer* input = bufferevent_get_input(slot->pair[0]);
-        struct evbuffer* output = bufferevent_get_output(slot->pair[0]);
-        if (input)  evbuffer_drain(input, evbuffer_get_length(input));
-        if (output) evbuffer_drain(output, evbuffer_get_length(output));
-        bufferevent_setcb(slot->pair[0], nullptr, nullptr, nullptr, nullptr);
-    }
-    if (slot->pair[1])
-    {
-        bufferevent_disable(slot->pair[1], EV_READ | EV_WRITE);
-        struct evbuffer* input = bufferevent_get_input(slot->pair[1]);
-        struct evbuffer* output = bufferevent_get_output(slot->pair[1]);
-        if (input)  evbuffer_drain(input, evbuffer_get_length(input));
-        if (output) evbuffer_drain(output, evbuffer_get_length(output));
-        bufferevent_setcb(slot->pair[1], nullptr, nullptr, nullptr, nullptr);
-    }
-}
-
 // ============================================================================
 // ZmTapDelegate
 ZmTapDelegate::ZmTapDelegate()
@@ -1050,7 +907,7 @@ bool ZmTapContextEventHandler::OnPairAcceptConn(void* ctx, evutil_socket_t fd)
  * @note 调用后 bev 由 TAP 接管生命周期（BEV_OPT_CLOSE_ON_FREE），调用者不应再操作 bev
  */
 bool ZmTapContextEventHandler::OnPairAcceptBev(void* ctx, struct bufferevent* bev,
-                                                void* slot, ZmTapBevFreeCB on_bev_free)
+                                                BuffereventPairHandle* handle)
 {
     ZmTapDelegate* delegate = (ZmTapDelegate*)ctx;
 
@@ -1058,14 +915,8 @@ bool ZmTapContextEventHandler::OnPairAcceptBev(void* ctx, struct bufferevent* be
     {
         if (bev)
         {
-            if (on_bev_free)
-            {
-                on_bev_free(slot, true);
-            }
-            else
-            {
+            if (!handle)
                 bufferevent_free(bev);
-            }
         }
         return false;
     }
@@ -1073,14 +924,8 @@ bool ZmTapContextEventHandler::OnPairAcceptBev(void* ctx, struct bufferevent* be
     ZmTapContext* context = delegate->TapContext();
     if (context == nullptr)
     {
-        if (on_bev_free)
-        {
-            on_bev_free(slot, true);
-        }
-        else
-        {
+        if (!handle)
             bufferevent_free(bev);
-        }
         return false;
     }
 
@@ -1088,14 +933,8 @@ bool ZmTapContextEventHandler::OnPairAcceptBev(void* ctx, struct bufferevent* be
     ZM_TAP_CTX* tap = context->Get();
     if (tap == nullptr)
     {
-        if (on_bev_free)
-        {
-            on_bev_free(slot, true);
-        }
-        else
-        {
+        if (!handle)
             bufferevent_free(bev);
-        }
         return false;
     }
 
@@ -1104,8 +943,7 @@ bool ZmTapContextEventHandler::OnPairAcceptBev(void* ctx, struct bufferevent* be
     tap->SetEventBase(delegate->TapDelegateEventBase());
     tap->SetEvDnsBase(delegate->TapDelegateEvdnsBase());
     tap->requester_bev = bev;
-    tap->bev_pool_slot = slot;
-    tap->on_bev_free = on_bev_free;
+    tap->pair_handle = handle;
     strncpy_s(tap->requester_ip, "127.0.0.1", sizeof(tap->requester_ip));
     tap->requester_port = 0;
     tap->state = ZM_TAP_STATE_INUSE;
