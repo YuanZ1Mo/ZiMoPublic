@@ -1158,22 +1158,63 @@ void ZmJsonRpcServer::SetJsonRpcCB(OnJsonRpcRequestCB oncall)
     m_on_jsonrpc_call = oncall;
 }
 
-void ZmJsonRpcServer::SetJsonRpcCBEx(OnJsonRpcRequestCBEx oncall_ex)
-{
-    m_on_jsonrpc_call_ex = oncall_ex;
-}
-
 void ZmJsonRpcServer::SetJsonRpcCBAsync(OnJsonRpcRequestCBAsync oncall_async)
 {
-    m_on_jsonrpc_async = oncall_async;
+    m_on_jsonrpc_call_async = oncall_async;
 }
 
 int ZmJsonRpcServer::OnJsonRpcRequest(ZmHttpdTask* task, const char* method, const ZMJSON& params,
     ZMJSON& result, ZMJSON& error)
 {
-    // 优先使用带 task 参数的 CBEx，其次使用不带 task 参数的 CB，都没有则返回 -1
-    return m_on_jsonrpc_call_ex ? m_on_jsonrpc_call_ex(task, method, params, result, error)
-        : (m_on_jsonrpc_call ? m_on_jsonrpc_call(method, params, result, error) : -1);
+    return m_on_jsonrpc_call ? m_on_jsonrpc_call(task, method, params, result, error) : -1;
+}
+
+bool ZmJsonRpcServer::OnJsonRpcRequestAsync(ZmHttpdTask* task, std::string method, const ZMJSON& params,
+    ZMJSON& reply)
+{
+    if (m_on_jsonrpc_call_async)
+    {
+        // 阻止 Worker 线程自动触发 REPLY 信号，等待异步处理完成
+        task->DeferReply();
+
+        // 异步回调：业务层在完成处理后调用 reply(result, error) 发送响应
+        // reply 按值捕获（拷贝 rsp_reply），确保 OnHttpdRequest 返回后字段不丢失
+        m_on_jsonrpc_call_async(task, method, params,
+            [this, task, reply](const ZMJSON& result, const ZMJSON& error) mutable
+            {
+                OnJsonRpcAsyncReply(this, task, reply, result, error);
+            });
+
+        return true; // 异步处理中，响应稍后到达
+    }
+
+    return  false;
+}
+
+void ZmJsonRpcServer::OnJsonRpcAsyncReply(ZmJsonRpcServer* server, ZmHttpdTask* task, ZMJSON& reply,
+    const ZMJSON& result, const ZMJSON& error)
+{
+    // JSON-RPC 2.0 规范: 响应中 result 和 error 二选一
+    if (!error.empty())
+    {
+        reply["error"] = error;
+    }
+    else if(!result.empty())
+    {
+        reply["result"] = result;
+    }
+    else
+    {
+        ZMJSON rsp_error;
+        rsp_error["code"] = -32603;
+        rsp_error["message"] = "Invalid Response, the response must contain either error or result";
+        reply["error"] = rsp_error;
+    }
+
+    // 通过共用方法构造响应（自动处理 JSONP callback 和 Server 头）
+    server->BuildJsonRpcResponse(task, reply);
+    // 投递 REPLY 信号到 HTTP 服务器的 event loop → SendReply → evhttp_send_reply
+    task->SendDeferredReply();
 }
 
 void ZmJsonRpcServer::BuildJsonRpcResponse(ZmHttpdTask* task, const ZMJSON& rsp_envelope)
@@ -1277,23 +1318,8 @@ int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
                     errmsg = "Invalid params";
                 }
                 // 异步路径优先：设置了异步回调则忽略同步回调
-                else if (m_on_jsonrpc_async)
+                else if(OnJsonRpcRequestAsync(task, method, params, rsp_reply))
                 {
-                    // 阻止 Worker 线程自动触发 REPLY 信号，等待异步处理完成
-                    task->DeferReply();
-
-                    // 异步回调：业务层在完成处理后调用 reply(result, error) 发送响应
-                    m_on_jsonrpc_async(task, method, params,
-                        [this, task, rsp_reply](const ZMJSON& result, const ZMJSON& error) mutable {
-                            if (!result.is_null()) rsp_reply["result"] = result;
-                            if (!error.is_null())  rsp_reply["error"] = error;
-
-                            // 通过共用方法构造响应（自动处理 JSONP callback 和 Server 头）
-                            BuildJsonRpcResponse(task, rsp_reply);
-                            // 投递 REPLY 信号到 HTTP 服务器的 event loop → SendReply → evhttp_send_reply
-                            task->SendDeferredReply();
-                        });
-
                     return 200; // 异步处理中，响应稍后到达
                 }
                 else if (OnJsonRpcRequest(task, method.c_str(), params, rsp_result, rsp_error) < 0)
@@ -1323,6 +1349,15 @@ int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
         rsp_error.clear();
         rsp_error["code"] = errcode;
         rsp_error["message"] = errmsg;
+    }
+    else
+    {
+        if (rsp_error.empty() && rsp_result.empty())
+        {
+            rsp_error.clear();
+            rsp_error["code"] = -32603;
+            rsp_error["message"] = "Invalid Response, the response must contain either error or result";
+        }
     }
 
     // JSON-RPC 2.0 规范: 响应中 result 和 error 二选一

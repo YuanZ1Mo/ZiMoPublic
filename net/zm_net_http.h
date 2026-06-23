@@ -606,19 +606,10 @@ public:
      * @param error   输出错误对象
      * @return        >= 0 表示方法已处理，< 0 表示方法未找到
      */
-    typedef std::function<int(ZmHttpdTask*, const std::string&, const ZMJSON&,
-        ZMJSON&, ZMJSON&)> OnJsonRpcRequestCBEx;
-
-    /**
-     * @brief JSON-RPC 请求处理回调（不带 task 参数）
-     * @param method  RPC 方法名
-     * @param params  RPC 参数对象
-     * @param result  输出结果对象
-     * @param error   输出错误对象
-     * @return        >= 0 表示方法已处理，< 0 表示方法未找到
-     */
-    typedef std::function<int(const std::string&, const ZMJSON&,
-        ZMJSON&, ZMJSON&)> OnJsonRpcRequestCB;
+    typedef std::function<int(ZmHttpdTask* task, const std::string& method,
+        const ZMJSON& params,
+        ZMJSON& result, ZMJSON& error)>
+        OnJsonRpcRequestCB;
 
     /**
      * @brief JSON-RPC 异步请求处理回调（优先级最高）
@@ -664,18 +655,12 @@ public:
     static ZMJSON MakeError(int code, const char* message);
 
     /**
-     * @brief 设置 JSON-RPC 请求回调（不带 task 参数）
-     * @param oncall  回调函数
-     */
-    void SetJsonRpcCB(OnJsonRpcRequestCB oncall);
-
-    /**
      * @brief 设置 JSON-RPC 请求回调（带 task 参数，优先级更高）
      * @param oncall_ex  回调函数
      *
      * @note 同时设置了 CBEx 和 CB 时，优先使用 CBEx
      */
-    void SetJsonRpcCBEx(OnJsonRpcRequestCBEx oncall_ex);
+    void SetJsonRpcCB(OnJsonRpcRequestCB oncall);
 
     /**
      * @brief 设置 JSON-RPC 异步请求回调（优先级最高）
@@ -701,6 +686,19 @@ protected:
      */
     virtual int OnJsonRpcRequest(ZmHttpdTask* task, const char* method, const ZMJSON& params,
         ZMJSON& result, ZMJSON& error);
+
+    /**
+    * @brief 分发 JSON-RPC 请求到注册的异步回调（虚函数，子类可重写）
+    * @param task    请求上下文对象
+    * @param method  RPC 方法名
+    * @param params  RPC 参数对象
+    * @param reply   输出结果对象
+    * @return        true 表示方法已回调到异步函数，false 表示没设置
+    *
+    * @note 分发优先级: CBEx > CB > 返回 -1
+    */
+    virtual bool OnJsonRpcRequestAsync(ZmHttpdTask* task, std::string method, const ZMJSON& params,
+        ZMJSON& reply);
 
     /**
      * @brief 处理 HTTP 请求，解析 JSON-RPC 协议并构造响应（重写父类虚函数）
@@ -735,15 +733,23 @@ protected:
      */
     void BuildJsonRpcResponse(ZmHttpdTask* task, const ZMJSON& rsp_envelope);
 
-private:
-    /** @brief JSON-RPC 请求回调（不带 task 参数） */
-    OnJsonRpcRequestCB      m_on_jsonrpc_call;
+    /**
+     * @brief 异步 JRPC 请求的回复回调（静态成员函数，供 OnJsonRpcRequestAsync 中 std::bind 使用）
+     * @param server  ZmJsonRpcServer 实例指针
+     * @param task    请求上下文对象
+     * @param reply   响应信封 JSON 对象引用
+     * @param result  业务层返回的结果对象（is_null() 表示无结果）
+     * @param error   业务层返回的错误对象（is_null() 表示无错误）
+     */
+    static void OnJsonRpcAsyncReply(ZmJsonRpcServer* server, ZmHttpdTask* task, ZMJSON& reply,
+        const ZMJSON& result, const ZMJSON& error);
 
+private:
     /** @brief JSON-RPC 请求回调（带 task 参数，优先使用） */
-    OnJsonRpcRequestCBEx    m_on_jsonrpc_call_ex;
+    OnJsonRpcRequestCB    m_on_jsonrpc_call;
 
     /** @brief JSON-RPC 异步请求回调（优先级最高，设置后忽略同步回调） */
-    OnJsonRpcRequestCBAsync m_on_jsonrpc_async;
+    OnJsonRpcRequestCBAsync m_on_jsonrpc_call_async;
 
     /** @brief RPC 请求的 URI 前缀，匹配此前缀的请求走 RPC 流程 */
     char                    m_root_uri[128];
