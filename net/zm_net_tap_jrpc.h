@@ -22,7 +22,7 @@ using TapDelegateJrpcRequestReadCB = std::function<void(ZM_TAP_CTX* tap, const c
 class ZmTapDelegateJRPC : public ZmTapDelegate
 {
 public:
-	ZmTapDelegateJRPC();
+	ZmTapDelegateJRPC(struct event_base* evbase);
 	virtual ~ZmTapDelegateJRPC();
 
 	/** @brief 设置 JRPC 请求到达时的外部回调
@@ -37,8 +37,7 @@ public:
 
 	/** @brief 请求端接受连接（JRPC 模式不接受直连，始终返回 false）
 	 *  @return false */
-	bool OnTapRequesterAccept(ZM_TAP_CTX* tap, evutil_socket_t fd,
-		struct sockaddr* address) override;
+	bool OnTapRequesterAccept(ZM_TAP_CTX* tap) override;
 
 	/** @brief delegate 内部事件回调（JRPC 模式下无内部事件，空实现） */
 	void OnTapDelegateEvent(short what) override;

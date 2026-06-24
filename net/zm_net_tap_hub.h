@@ -21,14 +21,14 @@ class ZmTapDelegateJRPC;
 class ZmTapHubBase : public ZmTapDelegate
 {
 public:
-	ZmTapHubBase();
+	ZmTapHubBase(struct event_base* evbase);
 	virtual ~ZmTapHubBase();
 
 	// --- ZmTapDelegate 默认实现（子类按需重写）---
 
 	/** @brief 接受新连接（默认接受）
 	 *  @return 始终返回 true */
-	bool OnTapRequesterAccept(ZM_TAP_CTX* tap, evutil_socket_t fd, struct sockaddr* address) override;
+	bool OnTapRequesterAccept(ZM_TAP_CTX* tap) override;
 
 	/** @brief 数据读取回调（Hub 模式下不直接读数据） */
 	void OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app_input, size_t datalen) override;
@@ -92,7 +92,7 @@ typedef enum {
 class ZmTapHubProxy : public ZmTapHubBase
 {
 public:
-	ZmTapHubProxy();
+	ZmTapHubProxy(struct event_base* evbase);
 	virtual ~ZmTapHubProxy();
 
 	// --- 生命周期 ---
@@ -101,8 +101,7 @@ public:
 	 *  @param context TAP 上下文池指针
 	 *  @param evbase  libevent 事件循环基
 	 *  @param mode    工作模式（默认 ZM_DELEGATE_MODE_PROXY_INTERNAL_HUB） */
-	void StartTapDelegate(ZmTapContext* context, struct event_base* evbase,
-	                      int mode = ZM_DELEGATE_MODE_PROXY_INTERNAL_HUB);
+	void StartTapDelegate(int mode = ZM_DELEGATE_MODE_PROXY_INTERNAL_HUB);
 
 	// --- 端口管理 ---
 
@@ -134,21 +133,13 @@ public:
 	 * 首包到达后自动识别协议类型并切换 delegate。
 	 *
 	 * @return 始终返回 true */
-	bool OnTapRequesterAccept(ZM_TAP_CTX* tap, evutil_socket_t fd, struct sockaddr* address) override;
+	bool OnTapRequesterAccept(ZM_TAP_CTX* tap) override;
 
 	/** @brief 数据读取回调（正常情况下 probe 已完成 delegate 切换，不应走到这里） */
 	void OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app_input, size_t datalen) override;
 
 	/** @brief delegate 内部事件回调（当前无操作） */
 	void OnTapDelegateEvent(short what) override;
-
-	/** @brief 标记为自行管理 bufferevent 回调，禁止上层覆盖
-	 *  @return 始终返回 true */
-	bool IsCallbackSelfManaged() override;
-
-	/** @brief 获取关联的 TAP 上下文池
-	 *  @return ZmTapContext 指针 */
-	ZmTapContext* TapContext() override;
 
 protected:
 	// --- 生命周期回调 ---
@@ -192,7 +183,6 @@ private:
 
 	ZmArrayList<ZM_HUB_LISTENER> m_proxy_listeners;  ///< 代理监听端口列表
 	ZmTapDelegateJRPC*           m_delegate_jrpc;      ///< JRPC 协议委托处理器
-	ZmTapContext*                m_context;            ///< 关联的 TAP 上下文池
 };
 
 #endif  // ZM_NET_TAP_HUB_H

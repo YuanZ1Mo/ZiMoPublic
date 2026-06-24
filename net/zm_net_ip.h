@@ -226,6 +226,15 @@ public:
     static char*    IPv4ToStr(uint32_t ipv4, char* str, bool bigendian = false);
 
     /**
+    * @brief 将 in4_addr 结构转换为 IPv4 可读字符串
+    * @param in4      IPv4 地址结构指针
+    * @param ipstr    输出缓冲区
+    * @param capacity 缓冲区大小
+    * @return 指向 ipstr 的指针，失败返回 NULL
+    */
+    static const char* IPv4ToStr(const struct in_addr* in4, char* ipstr, size_t capacity);
+
+    /**
      * @brief 将 in6_addr 结构转换为 IPv6 可读字符串
      * @param in6      IPv6 地址结构指针
      * @param ipstr    输出缓冲区

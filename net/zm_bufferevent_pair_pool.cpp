@@ -10,44 +10,16 @@
 // BuffereventPairHandle
 // ============================================================================
 
-void BuffereventPairHandle::ReleasePair0()
+void BuffereventPairHandle::Pair0EOF()
 {
-    pair0_done = true;
-    TryReturn();
-}
-
-void BuffereventPairHandle::ReleasePair1()
-{
-    pair1_done = true;
-    TryReturn();
-}
-
-void BuffereventPairHandle::Pair1EOF()
-{
-    // ★ 双回调防护：数据已写出时跳过 EOF——
-//    pair0 读到数据后自行回收，无第二事件从根源消除竞态。
-//    未写出（如错误提前释放）则仍需 EOF 唤醒 pair0。
-    if (!pair1_done && !pair0_done && bev0 && !data_written)
-    {
+    if (bev0)
         bufferevent_trigger_event(bev0, BEV_EVENT_EOF, BEV_OPT_DEFER_CALLBACKS);
-    }
-}
-
-void BuffereventPairHandle::MarkDataWritten()
-{
-    data_written = true;
-}
-
-void BuffereventPairHandle::Cancel()
-{
-    pair0_done = true;
-    pair1_done = true;
-    TryReturn();
 }
 
 void BuffereventPairHandle::TryReturn()
 {
-    if (pair0_done && pair1_done)
+    if (pair0_done.load(std::memory_order_acquire) &&
+        pair1_done.load(std::memory_order_acquire))
     {
         Reset();
         if (owner_)
@@ -75,9 +47,8 @@ void BuffereventPairHandle::Reset()
         if (output) evbuffer_drain(output, evbuffer_get_length(output));
         bufferevent_setcb(bev1, nullptr, nullptr, nullptr, nullptr);
     }
-    pair0_done   = false;
-    pair1_done   = false;
-    data_written = false;
+    pair0_done.store(false, std::memory_order_release);
+    pair1_done.store(false, std::memory_order_release);
 }
 
 // ============================================================================
@@ -118,6 +89,7 @@ void BuffereventPairPool::Init(struct event_base* evbase, int capacity)
 
 void BuffereventPairPool::Shutdown()
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     for (auto& h : m_slots)
     {
         if (h.bev0) { bufferevent_free(h.bev0); h.bev0 = nullptr; }
@@ -130,6 +102,8 @@ void BuffereventPairPool::Shutdown()
 
 BuffereventPairHandle* BuffereventPairPool::Acquire()
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
     if (m_free_stack.empty())
     {
         if (!Grow())
@@ -143,11 +117,13 @@ BuffereventPairHandle* BuffereventPairPool::Acquire()
 
 void BuffereventPairPool::Return(BuffereventPairHandle* h)
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_free_stack.push_back(h);
 }
 
 bool BuffereventPairPool::Grow()
 {
+    // 调用者已持有 m_mutex
     m_slots.emplace_back();
     auto& h = m_slots.back();
     h.owner_ = this;

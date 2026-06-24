@@ -13,7 +13,8 @@
 // ZmTapHubBase — 构造与析构
 // ============================================================================
 
-ZmTapHubBase::ZmTapHubBase()
+ZmTapHubBase::ZmTapHubBase(struct event_base* evbase)
+	: ZmTapDelegate(evbase)
 {
 }
 
@@ -25,11 +26,9 @@ ZmTapHubBase::~ZmTapHubBase()
 // ZmTapHubBase — ZmTapDelegate 默认实现
 // ============================================================================
 
-bool ZmTapHubBase::OnTapRequesterAccept(ZM_TAP_CTX* tap, evutil_socket_t fd, struct sockaddr* address)
+bool ZmTapHubBase::OnTapRequesterAccept(ZM_TAP_CTX* tap)
 {
 	ZM_UNUSED(tap);
-	ZM_UNUSED(fd);
-	ZM_UNUSED(address);
 	return true;
 }
 
@@ -226,10 +225,10 @@ bool ZmTapHubBase::Listen(ZM_HUB_LISTENER* listener, struct event_base* evbase, 
 // ZmTapHubProxy — 构造与析构
 // ============================================================================
 
-ZmTapHubProxy::ZmTapHubProxy()
-	: m_proxy_listeners(ZM_DEFAULT_PROXY_LISTENER_NUM)
+ZmTapHubProxy::ZmTapHubProxy(struct event_base* evbase)
+	: ZmTapHubBase(evbase)
+	, m_proxy_listeners(ZM_DEFAULT_PROXY_LISTENER_NUM)
 	, m_delegate_jrpc(nullptr)
-	, m_context(nullptr)
 {
 	TapDelegateName("ZmTapHubProxy");
 }
@@ -242,10 +241,9 @@ ZmTapHubProxy::~ZmTapHubProxy()
 // ZmTapHubProxy — 生命周期
 // ============================================================================
 
-void ZmTapHubProxy::StartTapDelegate(ZmTapContext* context, struct event_base* evbase, int mode)
+void ZmTapHubProxy::StartTapDelegate(int mode)
 {
-	m_context = context;
-	ZmTapDelegate::StartTapDelegate(evbase, mode);
+	ZmTapDelegate::StartTapDelegate(mode);
 }
 
 // ============================================================================
@@ -353,10 +351,8 @@ void ZmTapHubProxy::SetJrpcDelegate(ZmTapDelegateJRPC* DelegateJRPC)
 // ZmTapHubProxy — ZmTapDelegate 接口实现
 // ============================================================================
 
-bool ZmTapHubProxy::OnTapRequesterAccept(ZM_TAP_CTX* tap, evutil_socket_t fd, struct sockaddr* address)
+bool ZmTapHubProxy::OnTapRequesterAccept(ZM_TAP_CTX* tap)
 {
-	ZM_UNUSED(address);
-
 	//PUBLIC_LOG_INFO("HubProxy setting up probe callbacks for Tap: {}", (void*)tap);
 
 	/** 设置 4 字节读水位线，确保首包至少包含协议魔数 */
@@ -394,16 +390,6 @@ void ZmTapHubProxy::OnTapRequesterRead(ZM_TAP_CTX* tap, struct evbuffer* app_inp
 void ZmTapHubProxy::OnTapDelegateEvent(short what)
 {
 	ZM_UNUSED(what);
-}
-
-bool ZmTapHubProxy::IsCallbackSelfManaged()
-{
-	return true;
-}
-
-ZmTapContext* ZmTapHubProxy::TapContext()
-{
-	return m_context;
 }
 
 // ============================================================================
@@ -493,11 +479,7 @@ void ZmTapHubProxy::OnProtocolDetectEventCB(struct bufferevent* bev, short event
 	{
 		//PUBLIC_LOG_INFO("Probe connection closed/error, dropping Tap: {}", (void*)tap);
 		tap->delegate->OnTapRequesterEvent(tap, bev, events);
-
-		if (ZmTapContext::IsBackChainEmpty(tap))
-		{
-			tap->Drop("Probe connection closed");
-		}
+		tap->Drop("Probe connection closed");
 	}
 }
 

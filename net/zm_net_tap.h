@@ -15,6 +15,7 @@
 #include <atomic>
 #include <deque>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <vector>
 
@@ -70,7 +71,6 @@ typedef enum
     ZM_DELEGATE_MODE_NONE = 0,                 /** 未设置 */
     ZM_DELEGATE_MODE_PROXY_INTERNAL_HUB = 1,   /** 内部 Hub 代理 */
     ZM_DELEGATE_MODE_PROXY_INTERNAL_JRPC = 2,  /** 内部 JRPC 代理 */
-    ZM_DELEGATE_MODE_DNR_ASYNC = 3,            /** 异步域名解析器（已废弃） */
 } ZM_DELEGATE_MODE;
 
 /** @brief TAP 状态枚举 */
@@ -95,10 +95,9 @@ typedef struct ZM_TAP_CTX
 {
 private:
     ZmTapContext* tap_context;                ///< 所属的 TAP 池，未收回前有且只有一个唯一值
-    event_base*   ev_base;                    ///< libevent 事件循环基，暂定仅挂靠在创建时的 HUB 上且中途不可更改
-    evdns_base*   ev_dns_base;                ///< libevent DNS 解析基，暂定仅挂靠在创建时的 HUB 上且中途不可更改
 
 public:
+    ZmTapDelegate* delegate;                  ///< 当前关联的协议处理器
 
     event*        ev_timeout;                 ///< 超时定时器事件
     uint32_t      drop_timeout_error_code;    ///< 超时错误码
@@ -110,18 +109,16 @@ public:
     uint16_t      requester_port;             ///< 请求来源端口
     char          requester_ip[64];           ///< 请求来源 IP 地址字符串
 
-    uint8_t       state;                      ///< 当前状态，见 ZM_TAP_STATE
+    std::atomic<uint8_t> state;               ///< 当前状态，见 ZM_TAP_STATE
 
     evdns_getaddrinfo_request* dns_request;   ///< libevent DNS 解析请求句柄
-
-    /// 以下字段在释放 TAP 时不 free（由 delegate 持有或内联存储）
-    ZmTapDelegate* delegate;                  ///< 当前关联的协议处理器
-    ZM_HTTP_REQ    request;                   ///< HTTP 请求参数（内联存储，避免额外 malloc）
 
     /** @brief 回传代理链：响应数据按 LIFO 顺序经过链上各 delegate 处理 */
     ZmTapDelegate* onback_chains[ZM_TAP_DELEGATE_CHAIN_MAX];
     void*          onback_data;               ///< 回传数据缓冲区
     uint32_t       onback_dlen;               ///< 回传数据长度
+
+    ZM_HTTP_REQ    request;                   ///< HTTP 请求参数（内联存储，避免额外 malloc）
 
     char           seq_num[16];               ///< 消息序号（原子自增生成，唯一标识）
     ZM_TAP_SLOT*   _slot;                     ///< 回指 pool 中的槽位，扩容时被 ZmTapContext 同步更新
@@ -137,16 +134,6 @@ public:
     void Clear();
 
     void SetTapContext(ZmTapContext* pTapContext);
-
-    const ZmTapContext* TapContext();
-
-    void SetEventBase(event_base* evbase);
-
-    const event_base* EventBase();
-
-    void SetEvDnsBase(evdns_base* evdnsbase);
-
-    const evdns_base* EventDnsBase();
 
     void Drop(const char* reason = "");
 } ZM_TAP_CTX;
@@ -175,12 +162,11 @@ public:
                        std::function<bool(const ZM_TAP_CTX*)> fnmatches);
 
 public:
-    // --- 异步 TAP 操作方法（跨线程安全，内部通过 ScheduleInLoop 投递到事件循环线程）---
+    // --- 跨线程安全操作方法 ---
     /** @brief 异步写入 JSON 响应（跨线程安全） */
     static void Response(ZM_TAP_CTX* tap, const ZMJSON& jsResponse);
-    /** @brief 异步设置 TAP 超时定时器（跨线程安全） */
+    /** @brief 异步设置 TAP 超时定时器, 注意,如果设置了drop_timeout_error_code,请不要提前手动Drop这个tap（跨线程安全） */
     static void SetDropTimer(ZM_TAP_CTX* tap, int seconds = 0, int micros = 0, uint32_t drop_timeout_error_code = 0);
-
     // --- 静态工具方法 ---
     /** @brief 释放请求端 bufferevent */
     static void FreeRequesterEnd(ZM_TAP_CTX* tap);
@@ -196,8 +182,6 @@ public:
     static void EvDnsResolve(ZM_TAP_CTX* tap, const char* hostname, uint16_t port);
     /** @brief 取消正在进行的 DNS 解析 */
     static void CancelResolve(ZM_TAP_CTX* tap);
-    /** @brief 获取请求端 bufferevent 输入缓冲区中未读取数据长度 */
-    static size_t RequesterInputLen(ZM_TAP_CTX* tap);
     /** @brief 从回传链末尾弹出一个 delegate（LIFO）
      *  @param remove true 同时从链上移除 */
     static ZmTapDelegate* BackChainPop(ZM_TAP_CTX* tap, bool remove = true);
@@ -206,35 +190,11 @@ public:
     /** @brief 判断回传链是否为空 */
     static bool IsBackChainEmpty(ZM_TAP_CTX* tap);
 
-    /**
-     * @brief 在 TAP 所属的事件循环线程中调度执行任务（跨线程安全，可在任意线程调用）
-     * @param tap 目标 TAP 上下文（用于获取 event_base）
-     * @param fn  要在事件循环线程中执行的任务
-     * @return true 调度成功，false 参数为空或 event_base 不可用
-     */
-    static bool ScheduleInLoop(ZM_TAP_CTX* tap, std::function<void()> fn);
-
-    /**
-     * @brief 在指定事件循环线程中调度执行任务（跨线程安全）
-     * @param evbase libevent 事件循环基
-     * @param fn     要在事件循环线程中执行的任务
-     * @return true 调度成功，false 参数为空
-     */
-    static bool ScheduleInLoop(event_base* evbase, std::function<void()> fn);
-
 private:
     /** @brief 分配并初始化一个新的 ZM_TAP_CTX */
     ZM_TAP_CTX* CreateTap();
     /** @brief 释放 ZM_TAP_CTX 内存 */
     void        FreeTap(ZM_TAP_CTX* tap);
-
-    // --- 同步内部实现（仅在事件循环线程中调用）---
-    /** @brief 同步写响应实现 */
-    static void ResponseImpl(ZM_TAP_CTX* tap, const ZMJSON& jsResponse);
-    /** @brief 同步 Drop 清理实现（执行实际的资源释放和池回收，需持有 ZmTapContext 实例） */
-    void DropImpl(ZM_TAP_CTX* tap, const char* reason);
-    /** @brief 同步设置超时定时器实现 */
-    static void SetDropTimerImpl(ZM_TAP_CTX* tap, int seconds, int micros, uint32_t drop_timeout_error_code);
 
 private:
     enum { TAP_ITEM_SIZE = sizeof(ZM_TAP_SLOT) };
@@ -255,14 +215,14 @@ private:
 class ZmTapDelegate
 {
 public:
-    ZmTapDelegate();
+    ZmTapDelegate(struct event_base* evbase);
     virtual ~ZmTapDelegate() {}
 
     // --- 生命周期 ---
     /** @brief 启动 delegate（由外部在 event_base 就绪后调用）
      *  @param evbase libevent 事件循环基
      *  @param mode   工作模式 */
-    void StartTapDelegate(struct event_base* evbase, int mode = ZM_DELEGATE_MODE_NONE);
+    void StartTapDelegate(int mode = ZM_DELEGATE_MODE_NONE);
     /** @brief 停止 delegate，释放内部事件资源 */
     void StopTapDelegate();
     /** @brief 读取/设置 delegate 名称（调试用）
@@ -285,26 +245,19 @@ public:
     virtual void OnTapRequesterWrite(ZM_TAP_CTX* tap, struct bufferevent* requester_bev) {}
     /** @brief 新连接到达回调（纯虚，子类必须实现）
      *  @return true 接受连接，false 拒绝 */
-    virtual bool OnTapRequesterAccept(ZM_TAP_CTX* tap, evutil_socket_t fd, struct sockaddr* address) = 0;
+    virtual bool OnTapRequesterAccept(ZM_TAP_CTX* tap) = 0;
     /** @brief DNS 解析完成回调 */
     virtual void OnTapDnsResolved(ZM_TAP_CTX* tap, struct sockaddr_in6* sa6, socklen_t salen,
         const char* ipaddr, const char* hostname) {}
     /** @brief 错误处理回调
      *  @return true 已自行处理，false 交由 OnDropTimerCB 统一处理 */
-    virtual bool OnTapError(ZM_TAP_CTX* tap, uint32_t error) { return false; }
-    /** @brief TAP 即将被 Drop 时的通知 */
+    virtual bool OnTapTimeOut(ZM_TAP_CTX* tap, uint32_t error) { return false; }
+    /** @brief TAP 即将被 Drop 时的通知, 尽量不要做耗时操作,因为占用evbase的线程时间 */
     virtual void OnTapDrop(ZM_TAP_CTX* tap) {}
     /** @brief delegate 内部事件回调（纯虚） */
     virtual void OnTapDelegateEvent(short what) = 0;
     /** @brief 回传数据到达回调 */
     virtual void OnTapDelegateBackEvent(ZM_TAP_CTX* tap) {}
-    /** @brief 是否自行管理 bufferevent 回调
-     *  @return true  OnTapRequesterAccept 中已设置回调，上层不再覆盖
-     *          false 使用默认的 OnRequesterReadCB / OnRequesterEventCB */
-    virtual bool IsCallbackSelfManaged() { return false; }
-    /** @brief 获取关联的 TAP 上下文池
-     *  @return ZmTapContext 指针，默认返回 nullptr（非 Hub 模式） */
-    virtual ZmTapContext* TapContext() { return nullptr; }
 
 protected:
     /** @brief 触发 delegate 内部事件 */
@@ -327,34 +280,40 @@ protected:
  *
  * 所有方法均为 static，ctx 参数携带 ZM_TAP_CTX* 或 ZmTapDelegate*。
  */
+struct ContextEventHandlerParams
+{
+    ZmTapContext* ctx;
+    void* delegate;
+};
 class ZmTapContextEventHandler
 {
 public:
+    static void RegistryContextEventHandler(const char* name, ZmTapContext* ctx, void* delegate);
+    static void UnregistryContextEventHandler(const char* name);
+    static ContextEventHandlerParams* FindContextEventHandler(const char* name);
     static void OnTapDelegateEventCB(evutil_socket_t fd, short what, void* ctx);
     static void OnDnsResolvedCB(int errcode, struct evutil_addrinfo* addr, void* ctx);
     static void OnDropTimerCB(evutil_socket_t fd, short what, void* ctx);
     static void OnRequesterAcceptConnCB(struct evconnlistener* listener,
         evutil_socket_t fd, struct sockaddr* address, int socklen, void* ctx);
-    /** @brief 接受 socket pair 连接 — 与 OnRequesterAcceptConnCB 对应但用于进程内 pair 注入
-     *  @param ctx Hub 代理 delegate
-     *  @param fd pair 中交付给事件循环端的 socket 描述符（成功后由 bufferevent 接管）
-     *  @return true 成功创建 TAP 并触发协议探测，false 失败（fd 已关闭）
-     *  @note  必须在事件循环线程中调用
-     *  @note  一般由HUB回调,所以使用HUB的evtbase和context池 */
-    static bool OnPairAcceptConn(void* ctx, evutil_socket_t fd);
-
-    /** @brief 接受 bufferevent 注入 — OnPairAcceptConn 的变体，用于已创建的 bufferevent（如 bufferevent_pair）
+    /** @brief 接受 bufferevent 注入, 用于已创建的 bufferevent（如 bufferevent_pair）
      *  @param ctx  Hub 代理 delegate
      *  @param bev  已创建的 bufferevent（如 bufferevent_pair 的一端），成功后由 TAP 接管生命周期
      *  @param handle 可选，池句柄指针；非空时设置 TAP 的 pair_handle
      *  @return true 成功创建 TAP 并触发协议探测，false 失败（bev 已释放）
      *  @note  必须在事件循环线程中调用
      *  @note  用于进程内零拷贝通信，bev 无需关联 socket fd */
-    static bool OnPairAcceptBev(void* ctx, struct bufferevent* bev,
+    static bool OnPairAcceptBev(ContextEventHandlerParams* params, struct bufferevent* bev,
+                                struct sockaddr* address = nullptr,
+                                BuffereventPairHandle* handle = nullptr);
+    static bool OnPairAcceptBev(const char* name, struct bufferevent* bev,
+                                struct sockaddr* address = nullptr,
                                 BuffereventPairHandle* handle = nullptr);
     static void OnRequesterEventCB(struct bufferevent* requester_bev, short events, void* ctx);
     static void OnRequesterReadCB(struct bufferevent* requester_bev, void* ctx);
-    static void OnRequesterWriteCB(struct bufferevent* requester_bev, void* ctx);
+
+private:
+    static std::map<std::string, ContextEventHandlerParams> m_registry;
 };
 
 #endif /* ZM_NET_TAP_H */

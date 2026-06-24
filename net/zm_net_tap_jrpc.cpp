@@ -9,8 +9,8 @@
 // 构造与析构
 // ============================================================================
 
-ZmTapDelegateJRPC::ZmTapDelegateJRPC()
-	: ZmTapDelegate()
+ZmTapDelegateJRPC::ZmTapDelegateJRPC(struct event_base* evbase)
+	: ZmTapDelegate(evbase)
 	, m_threadPool(nullptr)
 {
 	TapDelegateName("ZmTapDelegateJRPC");
@@ -48,12 +48,9 @@ void ZmTapDelegateJRPC::SetJrpcRequestReadCB(TapDelegateJrpcRequestReadCB cb)
 // ZmTapDelegate 接口实现
 // ============================================================================
 
-bool ZmTapDelegateJRPC::OnTapRequesterAccept(ZM_TAP_CTX* tap, evutil_socket_t fd,
-	struct sockaddr* address)
+bool ZmTapDelegateJRPC::OnTapRequesterAccept(ZM_TAP_CTX* tap)
 {
 	ZM_UNUSED(tap);
-	ZM_UNUSED(fd);
-	ZM_UNUSED(address);
 	return false;
 }
 
@@ -205,11 +202,6 @@ void ZmTapDelegateJRPC::WriteResponse(ZM_TAP_CTX* tap, const char* json_str, siz
 	{
 		PUBLIC_LOG_ERROR("bufferevent_flush failed, TAP:{}, ret:{}", (void*)tap, ret);
 	}
-
-	// ★ 标记数据已写出：后续 tap->Drop() → ReleasePair1 看到此标记跳
-	//    过 EOF 触发，pair0 读到响应数据后自行回收，从根源消灭双回调。
-	if (tap->pair_handle)
-		tap->pair_handle->MarkDataWritten();
 
 	if (ZmTapContext::IsBackChainEmpty(tap))
 	{

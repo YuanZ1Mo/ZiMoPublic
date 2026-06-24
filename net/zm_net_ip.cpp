@@ -169,11 +169,19 @@ char* ZmNetIP::IPv4ToStr(uint32_t ipv4, char* str, bool bigendian)
 }
 
 /**
+ * @brief 将 in4_addr 结构转换为 IPv4 可读字符串
+ */
+const char* ZmNetIP::IPv4ToStr(const struct in_addr* in4, char* ipstr, size_t capacity)
+{
+    return evutil_inet_ntop(AF_INET, &in4, ipstr, capacity);
+}
+
+/**
  * @brief 将 in6_addr 结构转换为 IPv6 可读字符串
  */
 const char* ZmNetIP::IPv6ToStr(const struct in6_addr* in6, char* ipstr, size_t capacity)
 {
-    return evutil_inet_ntop(AF_INET6, (const void*)in6, ipstr, (socklen_t)capacity);
+    return evutil_inet_ntop(AF_INET6, &in6, ipstr, capacity);
 }
 
 /**
