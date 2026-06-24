@@ -212,7 +212,8 @@ void ZmEvBaseRunLoop::OnEventCtrlCB(evutil_socket_t fd, short what, void* arg)
 
 void ZmEvBaseRunLoop::OnTimerCB(evutil_socket_t fd, short what, void* arg)
 {
+    ZmEvBaseRunLoop* self = (ZmEvBaseRunLoop*)arg;
     char buf[32];
     ZmSystem::CurrentTimeStr(buf, sizeof(buf));
-    PUBLIC_LOG_INFO("ZmEvBaseRunLoop:{} HeartbeatTime:{}", arg, buf);
+    PUBLIC_LOG_INFO("{}:{} HeartbeatTime:{}", self->GetName(), arg, buf);
 }
