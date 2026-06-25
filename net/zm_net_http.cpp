@@ -439,7 +439,17 @@ const char* ZmHttpdTask::GetRequestHeader(const char* name, const char* defv)
 void ZmHttpdTask::PutReplyHeader(const char* name, const char* val)
 {
     // val 为 nullptr 时存储空字符串，防止后续构造 string 时崩溃
-    m_reply_headers[std::string(name)] = std::string(val ? val : "");
+    std::string key(name);
+    std::string value(val ? val : "");
+
+    // 去重：key 和 value 都相同则跳过
+    for (auto& [k, v] : m_reply_headers)
+    {
+        if (k == key && v == value)
+            return;
+    }
+
+    m_reply_headers.emplace_back(std::move(key), std::move(value));
 }
 
 void ZmHttpdTask::SetReply(int code, const char* reason)
@@ -1291,9 +1301,9 @@ void ZmJsonRpcServer::SetJsonRpcCBAsync(OnJsonRpcRequestCBAsync oncall_async)
 }
 
 int ZmJsonRpcServer::OnJsonRpcRequest(ZmHttpdTask* task, const char* method, const ZMJSON& params,
-    ZMJSON& result, ZMJSON& error)
+    ZMJSON& result, ZMJSON& error, ZMJSON& header)
 {
-    return m_on_jsonrpc_call ? m_on_jsonrpc_call(task, method, params, result, error) : -1;
+    return m_on_jsonrpc_call ? m_on_jsonrpc_call(task, method, params, result, error, header) : -1;
 }
 
 bool ZmJsonRpcServer::OnJsonRpcRequestAsync(ZmHttpdTask* task, std::string method, const ZMJSON& params,
@@ -1301,12 +1311,13 @@ bool ZmJsonRpcServer::OnJsonRpcRequestAsync(ZmHttpdTask* task, std::string metho
 {
     if (m_on_jsonrpc_call_async)
     {
-        // 异步回调：业务层在完成处理后调用 reply(result, error) 发送响应
-        // reply 按值捕获（拷贝 rsp_reply），确保 OnHttpdRequest 返回后字段不丢失
+        // 异步回调：reply 拷贝到堆上（shared_ptr），确保 OnHttpdRequest 返回后仍然存活
+        // reply 是 ZMJSON& 引用，按值捕获只拷贝引用本身，必须显式拷对象到堆
+        auto replyPtr = std::make_shared<ZMJSON>(reply);
         m_on_jsonrpc_call_async(task, method, params,
-            [this, task, reply](const ZMJSON& result, const ZMJSON& error) mutable
+            [this, task, replyPtr](const ZMJSON& result, const ZMJSON& error, const ZMJSON& header) mutable
             {
-                OnJsonRpcAsyncReply(this, task, reply, result, error);
+                OnJsonRpcAsyncReply(this, task, *replyPtr, result, error, header);
             });
 
         return true; // 异步处理中，响应稍后到达
@@ -1316,7 +1327,7 @@ bool ZmJsonRpcServer::OnJsonRpcRequestAsync(ZmHttpdTask* task, std::string metho
 }
 
 void ZmJsonRpcServer::OnJsonRpcAsyncReply(ZmJsonRpcServer* server, ZmHttpdTask* task, ZMJSON& reply,
-    const ZMJSON& result, const ZMJSON& error)
+    const ZMJSON& result, const ZMJSON& error, const ZMJSON& header)
 {
     // JSON-RPC 2.0 规范: 响应中 result 和 error 二选一
     if (!error.empty())
@@ -1336,12 +1347,12 @@ void ZmJsonRpcServer::OnJsonRpcAsyncReply(ZmJsonRpcServer* server, ZmHttpdTask* 
     }
 
     // 通过共用方法构造响应（自动处理 JSONP callback 和 Server 头）
-    server->BuildJsonRpcResponse(task, reply);
+    server->BuildJsonRpcResponse(task, reply, header);
     // 投递 REPLY 信号到 HTTP 服务器的 event loop → SendReply → evhttp_send_reply
     task->TriggerReply();
 }
 
-void ZmJsonRpcServer::BuildJsonRpcResponse(ZmHttpdTask* task, const ZMJSON& rsp_envelope)
+void ZmJsonRpcServer::BuildJsonRpcResponse(ZmHttpdTask* task, const ZMJSON& rsp_envelope, const ZMJSON& header)
 {
     // 从 task 中获取 callback 参数（JSONP 支持），无需外部捕获
     std::string callback = task->GetQueryValue("callback");
@@ -1364,6 +1375,35 @@ void ZmJsonRpcServer::BuildJsonRpcResponse(ZmHttpdTask* task, const ZMJSON& rsp_
 
     task->SetReply(200);
     task->PutReplyHeader("Content-type", content_type.c_str());
+
+    // 业务层传入的自定义响应头（如 Set-Cookie 等）
+    // 支持 string/number/bool 单值 和 array 多值（同名 header 发多次）
+    if (!header.is_null() && header.is_object())
+    {
+        // 先拷贝一份，避免迭代过程中引用失效
+        ZMJSON hdr = header;
+        auto putValue = [&](const char* key, const ZMJSON& v)
+        {
+            if (v.is_string())
+                task->PutReplyHeader(key, v.get_ref<const std::string&>().c_str());
+            else if (v.is_number() || v.is_boolean())
+                task->PutReplyHeader(key, v.dump().c_str());
+        };
+
+        for (auto& [key, val] : hdr.items())
+        {
+            if (val.is_array())
+            {
+                for (auto& item : val)
+                    putValue(key.c_str(), item);
+            }
+            else
+            {
+                putValue(key.c_str(), val);
+            }
+        }
+    }
+
     task->SetReplyData((const BYTE*)body.data(), body.size());
 }
 
@@ -1391,6 +1431,7 @@ int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
     ZMJSON       rsp_reply;
     ZMJSON       rsp_result;
     ZMJSON       rsp_error;
+    ZMJSON       rsp_header;
     ZmByteBuffer buf(dlen, data);
 
     // GET 请求通过 query string 的 jsonbody 参数传递 Base64 编码的 JSON 请求体
@@ -1446,7 +1487,7 @@ int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
                 {
                     return -1; // 异步处理中，响应稍后到达
                 }
-                else if (OnJsonRpcRequest(task, method.c_str(), params, rsp_result, rsp_error) < 0)
+                else if (OnJsonRpcRequest(task, method.c_str(), params, rsp_result, rsp_error, rsp_header) < 0)
                 {
                     // 回调返回 < 0 表示该 method 不存在
                     errcode = -32601;
@@ -1494,7 +1535,7 @@ int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
         rsp_reply["result"] = rsp_result;
     }
 
-    BuildJsonRpcResponse(task, rsp_reply);
+    BuildJsonRpcResponse(task, rsp_reply, rsp_header);
 
     // JSON-RPC 层面的错误通过响应体中的 error 字段传达，HTTP 层面始终返回 200
     return 200;
