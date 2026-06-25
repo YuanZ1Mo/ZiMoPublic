@@ -15,7 +15,9 @@
 #include <../libevent/include/event2/bufferevent.h>
 #include <../libevent/include/event2/buffer.h>
 
+#include <algorithm>
 #include <atomic>
+#include <vector>
 
 
 #define JRPC_VERSION "2.0"
@@ -330,13 +332,17 @@ static std::atomic<uint64_t> g_httpd_task_id{0};
 
 ZmHttpdTask::ZmHttpdTask(struct evhttp_request* request) : m_request(request), m_status_code(0), m_id(++g_httpd_task_id)
 {
-    const struct evhttp_uri* uri = evhttp_request_get_evhttp_uri(request);
-    if (uri)
+    // request 可能为 nullptr（对象池预创建场景），仅跳过 URI 解析，其余资源正常分配
+    if (request)
     {
-        // 解析 URI 的 query string 部分为键值对，存入 m_query
-        // 例如 "/api?foo=bar&name=test" 解析为 {foo=bar, name=test}
-        if (-1 == evhttp_parse_query_str(evhttp_uri_get_query(uri), &m_query))
+        const struct evhttp_uri* uri = evhttp_request_get_evhttp_uri(request);
+        if (uri)
         {
+            // 解析 URI 的 query string 部分为键值对，存入 m_query
+            // 例如 "/api?foo=bar&name=test" 解析为 {foo=bar, name=test}
+            if (-1 == evhttp_parse_query_str(evhttp_uri_get_query(uri), &m_query))
+            {
+            }
         }
     }
     // 创建用于存储响应体的 evbuffer，后续通过 SetReplyData 写入
@@ -523,43 +529,38 @@ void ZmHttpdTask::SetReplyCallback(std::function<void()> cb)
 // ============================ ZmHttpServer internals ============================
 
 /**
- * @brief HTTP 请求处理任务，由线程池调度执行（不再继承 ZmThread）
+ * @brief HTTP 请求处理任务，由线程池调度执行
  *
- * 生命周期:
- *   1. 事件循环线程创建 ZmHttpdDoer 并提交到线程池
- *   2. 线程池执行 Process() → Perform() → event_active(REPLY)
- *   3. 事件循环线程收到 REPLY 信号 → SendReply() → 启动 1 秒定时器
- *   4. 定时器触发 → SendReplyEnd() → delete this
- *   5. Perform() 异常时兜底设置 500 并触发 REPLY，确保 doer 不泄露
+ * 生命周期（对象池模式）:
+ *   1. 事件循环线程从对象池 Acquire 或 new 创建，提交到线程池
+ *   2. 线程池执行 Process() → Perform() → 若未 DeferReply 则自动 event_active(REPLY)
+ *   3. 事件循环线程收到 REPLY 信号 → SendReply() → 回收至对象池
+ *   4. 对象池满或 shutdown 时，多余的 doer 被 delete
+ *   5. Perform() 异常时兜底设置 500 并触发 REPLY
  *
  * @note 此类仅在 cpp 内部使用，不对外暴露
+ * @note event/m_reply_buf/m_on_deferred_reply 构造后不再释放，复用时通过 Reset() 清状态
  */
 class ZmHttpdDoer : public ZmHttpdTask
 {
 public:
-    /**
-     * @brief 构造请求处理任务（不再继承 ZmThread，由线程池调度）
-     * @param httpd    所属的 HTTP 服务器实例
-     * @param request  libevent HTTP 请求对象
-     */
     ZmHttpdDoer(ZmHttpServer* httpd, struct evhttp_request* request)
         : ZmHttpdTask(request), m_httpd(httpd)
     {
+        // request 为 nullptr 时仅分配持久资源（预创建场景），URI 解析在 Reset() 中补齐
         m_reply_event = event_new(m_httpd->EventBase(), -1, 0,
             ZmHttpServer::OnEventControl, this);
         event_add(m_reply_event, nullptr);
 
-        // 设置延迟回复回调：异步处理完成后由业务层调用 SendDeferredReply() 触发
+        // 延迟回复回调：this 不变，整个生命周期只设置一次
         SetReplyCallback([this] {
             event_active(m_reply_event, ZmHttpServer::ZM_HTTPD_CONTROL_REPLY, 0);
         });
     }
 
-    /**
-     * @brief 析构，释放回复事件和延迟释放事件
-     */
     ~ZmHttpdDoer()
     {
+        // ★ 仅在对象真正销毁时释放资源（不是回收时）
         if (m_reply_event)
         {
             event_free(m_reply_event);
@@ -567,35 +568,66 @@ public:
         }
     }
 
+    // ========================================================================
+    // 对象池复用接口
+    // ========================================================================
+
     /**
-     * @brief 在事件循环线程中发送 HTTP 响应，并启动延迟释放定时器
+     * @brief 重置内部状态以绑定新请求（从对象池取出时调用）
      *
-     * 执行流程:
-     *   1. 将 m_reply_headers 中的响应头写入 evhttp_request
-     *   2. 调用 evhttp_send_reply 发送响应
+     * 只清零瞬态字段；持久资源（event / evbuffer / callback）保持复用。
      *
+     * @param request  新的 libevent 请求对象
      */
-    void SendReply()
+    void Reset(struct evhttp_request* request)
     {
-        // 将收集到的响应头统一写入 evhttp_request 的输出头
-        // 此处必须在事件循环线程执行，因为 evhttp_add_header 操作 libevent 内部结构
-        for (auto it = m_reply_headers.begin(); it != m_reply_headers.end(); it++)
+        // ① 清空上一个请求的 query 参数
+        evhttp_clear_headers(&m_query);
+
+        // ② 绑定新请求并重新解析 URI query string
+        m_request = request;
+        const struct evhttp_uri* uri = evhttp_request_get_evhttp_uri(request);
+        if (uri)
         {
-            evhttp_add_header(evhttp_request_get_output_headers(m_request), it->first.c_str(), it->second.c_str());
+            evhttp_parse_query_str(evhttp_uri_get_query(uri), &m_query);
         }
-        evhttp_send_reply(m_request, m_status_code, m_reason.empty() ? nullptr : m_reason.c_str(), m_reply_buf);
 
-        // 打印响应返回日志，包含追踪 ID 便于关联请求和响应
-        //PUBLIC_LOG_INFO("[响应#{}] ← {} {}", m_id, m_status_code,
-        //    m_reason.empty() ? "(no reason)" : m_reason.c_str());
+        // ③ 清空响应状态（evbuffer 只 drain，不 free）
+        evbuffer_drain(m_reply_buf, evbuffer_get_length(m_reply_buf));
+        m_reply_headers.clear();
+        m_reason.clear();
+        m_status_code = 0;
+        m_input_buf = nullptr;
+        m_id = ++g_httpd_task_id;
 
-        delete this;
+        // ★ 以下成员保持不变（生命周期 = doer 对象生命周期）:
+        //   m_reply_event — 仍挂在 event_base 上，下次 event_active 即可触发
+        //   m_reply_buf   — evbuffer 仅 drain，结构体复用
+        //   m_on_reply    — lambda 捕获 this 不变，仍然正确
+        //   m_httpd       — 同一 server 实例
     }
 
-    /**
-     * @brief 由线程池调用的处理入口，执行请求处理并通知事件循环线程
-     */
-public:
+    // ========================================================================
+    // 响应发送
+    // ========================================================================
+
+    void SendReply()
+    {
+        for (auto it = m_reply_headers.begin(); it != m_reply_headers.end(); it++)
+        {
+            evhttp_add_header(evhttp_request_get_output_headers(m_request),
+                it->first.c_str(), it->second.c_str());
+        }
+        evhttp_send_reply(m_request, m_status_code,
+            m_reason.empty() ? nullptr : m_reason.c_str(), m_reply_buf);
+
+        // ★ 生命周期由调用方 OnEventControl 管理，此处不回收
+    }
+
+    // ========================================================================
+    // 请求处理入口（线程池调用）
+    // ========================================================================
+
     void Process()
     {
         try
@@ -616,12 +648,132 @@ public:
         }
     }
 
-private:
-    /** @brief 所属的 HTTP 服务器实例 */
-    ZmHttpServer* m_httpd;
+    ZmHttpServer* HttpServer() { return m_httpd; }
 
-    /** @brief 用于接收工作线程"回复就绪"信号的事件 */
-    struct event* m_reply_event;
+private:
+    ZmHttpServer* m_httpd;
+    struct event* m_reply_event;  ///< "响应就绪"信号事件（挂在 httpd 的 event_base 上）
+};
+
+// ============================================================================
+// ZmHttpdDoer 对象池（事件循环线程独享，无锁，自动扩容）
+// ============================================================================
+//
+// Acquire / Recycle 均在事件循环线程调用，不需要同步原语。
+// 无硬上限，池大小随峰值并发自然增长。
+//
+// 维护两份列表：
+//   m_allDoers  — 池创建过的所有 doer（全集，析构时统一释放）
+//   m_freelist  — 空闲待复用的 doer（m_allDoers 的子集）
+//
+// 在飞 doer（m_allDoers 中但不在 m_freelist 中）不在析构时强制释放，
+// 它们会在后续 REPLY 回调到达时通过 RecycleDoer(nullptr 兜底) 自删除。
+//
+class DoerPool
+{
+public:
+    explicit DoerPool(ZmHttpServer* server, size_t initCount = 0)
+        : m_server(server), m_peakSize(0)
+    {
+        if (initCount > 0)
+            PreAlloc(initCount);
+    }
+
+    ~DoerPool()
+    {
+        // ① 删除所有空闲 doer
+        for (ZmHttpdDoer* doer : m_freelist)
+            delete doer;
+
+        // ② 统计在飞 doer（m_allDoers 中有但 m_freelist 中已无）
+        //    这些 doer 的 event 尚未触发 REPLY，由 RecycleDoer nullptr 兜底自删除
+        size_t inflight = m_allDoers.size() - m_freelist.size();
+        if (inflight > 0)
+        {
+            PUBLIC_LOG_WARN("DoerPool 析构: {} 个 doer 仍在飞（等待异步响应），将由兜底逻辑自删除", inflight);
+        }
+
+        m_freelist.clear();
+        m_allDoers.clear();
+    }
+
+    /**
+     * @brief 从池中取出一个已重置的 doer，池空时新建（自动扩容）
+     */
+    /**
+     * @brief 预创建 count 个 doer 放入池中（初始化时调用，避免首批请求的分配延迟）
+     * @param count  预创建数量
+     */
+    void PreAlloc(size_t count)
+    {
+        m_freelist.reserve(m_freelist.size() + count);
+        m_allDoers.reserve(m_allDoers.size() + count);
+        for (size_t i = 0; i < count; ++i)
+        {
+            auto* doer = new ZmHttpdDoer(m_server, nullptr);
+            m_allDoers.push_back(doer);
+            m_freelist.push_back(doer);
+        }
+        RefreshPeak();
+    }
+
+    ZmHttpdDoer* Acquire(struct evhttp_request* request)
+    {
+        if (!m_freelist.empty())
+        {
+            ZmHttpdDoer* doer = m_freelist.back();
+            m_freelist.pop_back();
+            doer->Reset(request);
+            return doer;
+        }
+        // 池空 → 新建（自动扩容），记入全集
+        auto* doer = new ZmHttpdDoer(m_server, request);
+        m_allDoers.push_back(doer);
+        return doer;
+    }
+
+    /**
+     * @brief 回收 doer，放回空闲列表
+     */
+    void Recycle(ZmHttpdDoer* doer)
+    {
+        m_freelist.push_back(doer);
+        RefreshPeak();
+    }
+
+    /**
+     * @brief 收缩池容量，保留最近使用的 keep 个 doer，其余释放
+     * @param keep  保留数量，0 表示全部释放
+     */
+    void Shrink(size_t keep = 0)
+    {
+        while (m_freelist.size() > keep)
+        {
+            ZmHttpdDoer* doer = m_freelist.back();
+            m_freelist.pop_back();
+            // 从全集中移除
+            auto it = std::find(m_allDoers.begin(), m_allDoers.end(), doer);
+            if (it != m_allDoers.end())
+                m_allDoers.erase(it);
+            delete doer;
+        }
+    }
+
+    size_t Size()       const { return m_freelist.size(); }
+    size_t TotalSize()  const { return m_allDoers.size(); }  ///< 含在飞 doer
+    size_t PeakSize()   const { return m_peakSize; }
+
+private:
+    void RefreshPeak()
+    {
+        if (m_freelist.size() > m_peakSize)
+            m_peakSize = m_freelist.size();
+    }
+
+    ZmHttpServer* m_server;
+    std::vector<ZmHttpdDoer*> m_freelist;   ///< 空闲待复用
+    std::vector<ZmHttpdDoer*> m_allDoers;   ///< 全集（含在飞 doer）
+    size_t m_peakSize;                       ///< 空闲列表历史峰值
 };
 
 ZmHttpHead::ZmHttpHead() : _entries(16)
@@ -817,8 +969,8 @@ bool ZmHttpHead::IsEmpty()
 // ============================ ZmHttpServer ============================
 
 ZmHttpServer::ZmHttpServer(struct event_base* evbase, uint16_t local_port)
-    : m_evbase(evbase), m_evhttpd(nullptr), m_poolName(), m_pool(nullptr),
-      m_local_port(local_port), m_port_bind_failed(false)
+    : m_evbase(evbase), m_evhttpd(nullptr), m_threadPoolName(), m_threadPool(nullptr),
+      m_local_port(local_port), m_port_bind_failed(false), m_doerPool(nullptr)
 {}
 
 ZmHttpServer::~ZmHttpServer()
@@ -840,23 +992,34 @@ bool ZmHttpServer::Init()
 
     // 创建工作线程池（线程复用，替代 thread-per-request）
     {
-        std::string poolName = m_poolName.empty()
+        std::string poolName = m_threadPoolName.empty()
             ? "ZmHttpServer:" + std::to_string(m_local_port)
-            : m_poolName;
-        m_pool = new ZmThreadPool(
+            : m_threadPoolName;
+        m_threadPool = new ZmThreadPool(
             (uint16_t)std::thread::hardware_concurrency(), poolName);
     }
+
+    // 创建 doer 对象池（预创建 = CPU 核数，与线程池规模匹配，免去首批请求的分配延迟）
+    if (!m_doerPool)
+        m_doerPool = new DoerPool(this, std::thread::hardware_concurrency());
 
     return true;
 }
 
 void ZmHttpServer::Close()
 {
-    // ★ 先停线程池（join 所有 worker，确保不再有 REPLY 信号进入事件循环）
-    if (m_pool)
+    // ★ 先停线程池（join 所有 worker，确保不再有新 doer 进入处理流程）
+    if (m_threadPool)
     {
-        delete m_pool;
-        m_pool = nullptr;
+        delete m_threadPool;
+        m_threadPool = nullptr;
+    }
+
+    // ★ 销毁 doer 对象池（线程池已停，worker 不再引用 doer，安全释放）
+    if (m_doerPool)
+    {
+        delete m_doerPool;
+        m_doerPool = nullptr;
     }
 
     // 释放 evhttp（停止接受新连接）
@@ -876,9 +1039,9 @@ bool ZmHttpServer::IsOpen() const
 
 void ZmHttpServer::SetPoolName(const std::string& name)
 {
-    m_poolName = name;
-    if (m_pool)
-        m_pool->SetPoolName(name);
+    m_threadPoolName = name;
+    if (m_threadPool)
+        m_threadPool->SetPoolName(name);
 }
 
 uint16_t ZmHttpServer::LocalPort()
@@ -889,6 +1052,20 @@ uint16_t ZmHttpServer::LocalPort()
 struct event_base* ZmHttpServer::EventBase()
 {
     return m_evbase;
+}
+
+ZmHttpdDoer* ZmHttpServer::AcquireDoer(struct evhttp_request* request)
+{
+    return m_doerPool ? m_doerPool->Acquire(request)
+                      : new ZmHttpdDoer(this, request);
+}
+
+void ZmHttpServer::RecycleDoer(ZmHttpdDoer* doer)
+{
+    if (m_doerPool)
+        m_doerPool->Recycle(doer);
+    else
+        delete doer;  // pool 已销毁时兜底
 }
 
 void ZmHttpServer::SetRequestCallback(OnHttpdRequestCB onreq)
@@ -970,8 +1147,8 @@ void ZmHttpServer::OnHttpRequestCB(struct evhttp_request* request, void* arg)
     if (uri && arg)
     {
         ZmHttpServer* server = (ZmHttpServer*)arg;
-        ZmHttpdDoer* doer = new ZmHttpdDoer(server, request);
-        server->m_pool->Submit([doer]() { doer->Process(); }, "Doer");
+        ZmHttpdDoer* doer = server->AcquireDoer(request);
+        server->m_threadPool->Submit([doer]() { doer->Process(); }, "Doer");
     }
     else
     {
@@ -989,6 +1166,8 @@ void ZmHttpServer::OnEventControl(evutil_socket_t fd, short what, void* ctx)
             // 工作线程请求发送响应
             ZmHttpdDoer* doer = (ZmHttpdDoer*)ctx;
             doer->SendReply();
+            // ★ 回收至对象池（替代 delete this）
+            doer->HttpServer()->RecycleDoer(doer);
         }
     }
 }

@@ -27,6 +27,8 @@
 
 // 前向声明（头文件中仅通过指针使用）
 class ZmThreadPool;
+class ZmHttpdDoer;
+class DoerPool;
 struct evbuffer;
 
 
@@ -474,6 +476,22 @@ public:
     struct event_base* EventBase();
 
     /**
+     * @brief 从对象池获取或新建 ZmHttpdDoer（事件循环线程调用）
+     * @param request  libevent 请求对象
+     * @return         ZmHttpdDoer 实例指针
+     */
+    ZmHttpdDoer* AcquireDoer(struct evhttp_request* request);
+
+    /**
+     * @brief 回收 ZmHttpdDoer 到对象池（事件循环线程调用）
+     *
+     * 若对象池未初始化（shutdown 后兜底），直接 delete。
+     *
+     * @param doer  待回收的 ZmHttpdDoer 实例
+     */
+    void RecycleDoer(ZmHttpdDoer* doer);
+
+    /**
      * @brief 设置通用 HTTP 请求处理回调
      * @param onreq  回调函数，处理非 JSON-RPC 路径的 HTTP 请求
      */
@@ -537,10 +555,10 @@ private:
     struct evhttp*     m_evhttpd;
 
     /** @brief 期望的线程池名称（Init 前设置则用此名，否则默认 "Http-{port}"） */
-    std::string        m_poolName;
+    std::string        m_threadPoolName;
 
     /** @brief 工作线程池（复用线程处理请求，替代 thread-per-request） */
-    ZmThreadPool*      m_pool;
+    ZmThreadPool*      m_threadPool;
 
     /** @brief 监听端口号 */
     uint16_t           m_local_port;
@@ -550,6 +568,9 @@ private:
 
     /** @brief 通用 HTTP 请求处理回调 */
     OnHttpdRequestCB   m_on_request;
+
+    /** @brief ZmHttpdDoer 对象池（事件循环线程独享，无需锁） */
+    DoerPool*          m_doerPool;
 };
 
 
