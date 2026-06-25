@@ -282,16 +282,6 @@ public:
     void ClearReplyBody();
 
     /**
-     * @brief 延迟自动回复，用于异步处理场景
-     *
-     * 调用后 ZmHttpdDoer::Process 不会自动触发 REPLY 信号。
-     * 业务层在异步处理完成后调用 SendDeferredReply() 发送响应。
-     *
-     * @note 必须在 Perform() 返回之前调用（即 OnHttpdRequest 回调内）
-     */
-    void DeferReply();
-
-    /**
      * @brief 发送被延迟的 HTTP 响应
      *
      * 通过 event_active 将 REPLY 信号投递到 HTTP 服务器的 event loop 线程，
@@ -300,17 +290,16 @@ public:
      * @note 可在任意线程调用（event_active 线程安全）。
      *       调用前需确保已通过 SetReply / SetReplyData / PutReplyHeader 设置好响应内容。
      */
-    void SendDeferredReply();
+    void TriggerReply();
 
 protected:
     /** @brief 设置延迟回复回调（由 ZmHttpdDoer 在构造时调用） */
-    void SetDeferredReplyCallback(std::function<void()> cb);
+    void SetReplyCallback(std::function<void()> cb);
 
 protected:
     friend class ZmHttpdDoer;
 
-    bool                  m_deferred = false;        ///< 是否延迟自动回复
-    std::function<void()> m_on_deferred_reply;       ///< 延迟回复信号回调
+    std::function<void()> m_on_reply;                ///< 回复信号回调
     /** @brief 底层 libevent HTTP 请求对象 */
     struct evhttp_request*              m_request;
 
@@ -439,7 +428,6 @@ public:
     enum
     {
         ZM_HTTPD_CONTROL_REPLY     = 0x0200,   ///< 工作线程请求发送响应
-        ZM_HTTPD_CONTROL_REPLY_END = 0x0400    ///< 响应发送完成，延迟释放资源
     };
 
     /**
@@ -512,7 +500,7 @@ public:
      *
      * @note 创建 ZmHttpdDoer 并提交到线程池处理请求
      */
-    static void OnHttp_RequestCB(struct evhttp_request* request, void* arg);
+    static void OnHttpRequestCB(struct evhttp_request* request, void* arg);
 
     /**
      * @brief 事件循环内部控制事件回调，处理线程间通信信号
@@ -520,15 +508,7 @@ public:
      * @param what  触发的事件标志位，与 ZM_HTTPD_CONTROL_* 枚举按位与判断
      * @param ctx   事件关联的对象指针（ZmHttpdDoer 或 ZmHttpServer）
      */
-    static void OnEvent_Control(evutil_socket_t fd, short what, void* ctx);
-
-    /**
-     * @brief 延迟释放定时器回调，在响应发送 1 秒后触发以销毁 ZmHttpdDoer
-     * @param fd      未使用
-     * @param event   未使用
-     * @param arg     ZmHttpdDoer 实例指针
-     */
-    static void OnEvent_Timer(evutil_socket_t fd, short event, void* arg);
+    static void OnEventControl(evutil_socket_t fd, short what, void* ctx);
 
 protected:
     /**

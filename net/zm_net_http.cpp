@@ -509,20 +509,15 @@ void ZmHttpdTask::ClearReplyBody()
         evbuffer_drain(m_reply_buf, evbuffer_get_length(m_reply_buf));
 }
 
-void ZmHttpdTask::DeferReply()
+void ZmHttpdTask::TriggerReply()
 {
-    m_deferred = true;
+    if (m_on_reply)
+        m_on_reply();
 }
 
-void ZmHttpdTask::SendDeferredReply()
+void ZmHttpdTask::SetReplyCallback(std::function<void()> cb)
 {
-    if (m_on_deferred_reply)
-        m_on_deferred_reply();
-}
-
-void ZmHttpdTask::SetDeferredReplyCallback(std::function<void()> cb)
-{
-    m_on_deferred_reply = std::move(cb);
+    m_on_reply = std::move(cb);
 }
 
 // ============================ ZmHttpServer internals ============================
@@ -550,13 +545,12 @@ public:
     ZmHttpdDoer(ZmHttpServer* httpd, struct evhttp_request* request)
         : ZmHttpdTask(request), m_httpd(httpd)
     {
-        m_remove_event = nullptr;
-        m_reply_event = event_new(m_httpd->EventBase(), -1, EV_PERSIST | EV_READ,
-            ZmHttpServer::OnEvent_Control, this);
+        m_reply_event = event_new(m_httpd->EventBase(), -1, 0,
+            ZmHttpServer::OnEventControl, this);
         event_add(m_reply_event, nullptr);
 
         // 设置延迟回复回调：异步处理完成后由业务层调用 SendDeferredReply() 触发
-        SetDeferredReplyCallback([this] {
+        SetReplyCallback([this] {
             event_active(m_reply_event, ZmHttpServer::ZM_HTTPD_CONTROL_REPLY, 0);
         });
     }
@@ -571,31 +565,18 @@ public:
             event_free(m_reply_event);
             m_reply_event = nullptr;
         }
-        if (m_remove_event)
-        {
-            event_free(m_remove_event);
-            m_remove_event = nullptr;
-        }
     }
 
     /**
      * @brief 在事件循环线程中发送 HTTP 响应，并启动延迟释放定时器
      *
      * 执行流程:
-     *   1. 释放 m_reply_event（已不需要）
-     *   2. 将 m_reply_headers 中的响应头写入 evhttp_request
-     *   3. 调用 evhttp_send_reply 发送响应
-     *   4. 创建 1 秒定时器，到期后执行 SendReplyEnd 释放自身
+     *   1. 将 m_reply_headers 中的响应头写入 evhttp_request
+     *   2. 调用 evhttp_send_reply 发送响应
      *
-     * @note 延迟 1 秒释放是为了确保 libevent 已完成响应数据的网络发送
      */
     void SendReply()
     {
-        if (m_reply_event)
-        {
-            event_free(m_reply_event);
-            m_reply_event = nullptr;
-        }
         // 将收集到的响应头统一写入 evhttp_request 的输出头
         // 此处必须在事件循环线程执行，因为 evhttp_add_header 操作 libevent 内部结构
         for (auto it = m_reply_headers.begin(); it != m_reply_headers.end(); it++)
@@ -608,29 +589,6 @@ public:
         //PUBLIC_LOG_INFO("[响应#{}] ← {} {}", m_id, m_status_code,
         //    m_reason.empty() ? "(no reason)" : m_reason.c_str());
 
-        // 创建 1 秒一次性定时器，到期后由 OnEvent_Timer 回调触发 SendReplyEnd
-        struct timeval tv = { 1, 0 };
-        if (m_remove_event)
-        {
-            event_free(m_remove_event);
-            m_remove_event = nullptr;
-        }
-        m_remove_event = event_new(m_httpd->EventBase(), -1, EV_TIMEOUT, ZmHttpServer::OnEvent_Timer, this);
-        evtimer_add(m_remove_event, &tv);
-    }
-
-    /**
-     * @brief 释放定时器事件并销毁自身（delete this）
-     *
-     * @note 由 1 秒定时器触发，确保响应已发送完毕后才释放资源
-     */
-    void SendReplyEnd()
-    {
-        if (m_remove_event)
-        {
-            event_free(m_remove_event);
-            m_remove_event = nullptr;
-        }
         delete this;
     }
 
@@ -648,16 +606,14 @@ public:
         {
             PUBLIC_LOG_ERROR("[请求#{}] Perform 异常: {}", m_id, e.what());
             SetReply(500, "Internal Server Error");
+            TriggerReply();
         }
         catch (...)
         {
             PUBLIC_LOG_ERROR("[请求#{}] Perform 未知异常", m_id);
             SetReply(500, "Internal Server Error");
+            TriggerReply();
         }
-
-        // 若业务层调用了 DeferReply()，跳过自动回复，等待 SendDeferredReply() 异步触发
-        if (!m_deferred)
-            event_active(m_reply_event, ZmHttpServer::ZM_HTTPD_CONTROL_REPLY, 0);
     }
 
 private:
@@ -666,9 +622,6 @@ private:
 
     /** @brief 用于接收工作线程"回复就绪"信号的事件 */
     struct event* m_reply_event;
-
-    /** @brief 响应发送后的延迟释放定时器事件 */
-    struct event* m_remove_event;
 };
 
 ZmHttpHead::ZmHttpHead() : _entries(16)
@@ -979,11 +932,14 @@ void ZmHttpServer::Perform(ZmHttpdTask* task)
     task->PutReplyHeader("Access-Control-Allow-Origin", "*");
     task->PutReplyHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
     task->PutReplyHeader("Access-Control-Allow-Headers", "*");
+    // 在 Server 响应头中附带服务端版本号
+    task->PutReplyHeader("ZmHttpServer-Version", ZIMO_SERVER_VERSION);
 
     // 浏览器预检请求（OPTIONS）直接返回 200，无需进入业务逻辑
     if (EVHTTP_REQ_OPTIONS == task->Method())
     {
         task->SetReply(200);
+        task->TriggerReply();
         return;
     }
 
@@ -991,17 +947,24 @@ void ZmHttpServer::Perform(ZmHttpdTask* task)
     size_t           dlen = evbuffer_get_length(inbuf);
     task->SetInputBuffer(inbuf);
     int              code = OnHttpdRequest(task, evbuffer_pullup(inbuf, dlen), dlen);
+
     // OnHttpdRequest 返回 0 表示该路径未被任何回调处理，默认 404
-    if (code == 0)
+    if (code == -1)
     {
-        code = 404;
+        //-1表示异步回调,这边不做处理
     }
-    // 在 Server 响应头中附带服务端版本号
-    task->PutReplyHeader("ZmHttpServer-Version", ZIMO_SERVER_VERSION);
-    task->SetReply(code);
+    else if (code >= 0)
+    {
+        if (code == 0)
+        {
+            code = 404;
+        }
+        task->SetReply(code);
+        task->TriggerReply();
+    }
 }
 
-void ZmHttpServer::OnHttp_RequestCB(struct evhttp_request* request, void* arg)
+void ZmHttpServer::OnHttpRequestCB(struct evhttp_request* request, void* arg)
 {
     const char* uri = evhttp_request_get_uri(request);
     if (uri && arg)
@@ -1016,7 +979,7 @@ void ZmHttpServer::OnHttp_RequestCB(struct evhttp_request* request, void* arg)
     }
 }
 
-void ZmHttpServer::OnEvent_Control(evutil_socket_t fd, short what, void* ctx)
+void ZmHttpServer::OnEventControl(evutil_socket_t fd, short what, void* ctx)
 {
     if (ctx)
     {
@@ -1027,21 +990,6 @@ void ZmHttpServer::OnEvent_Control(evutil_socket_t fd, short what, void* ctx)
             ZmHttpdDoer* doer = (ZmHttpdDoer*)ctx;
             doer->SendReply();
         }
-        else if (ZmHttpServer::ZM_HTTPD_CONTROL_REPLY_END & what)
-        {
-            // 延迟释放工作线程资源
-            ZmHttpdDoer* doer = (ZmHttpdDoer*)ctx;
-            doer->SendReplyEnd();
-        }
-    }
-}
-
-void ZmHttpServer::OnEvent_Timer(evutil_socket_t fd, short event, void* arg)
-{
-    ZmHttpdDoer* doer = (ZmHttpdDoer*)arg;
-    if (doer)
-    {
-        doer->SendReplyEnd();
     }
 }
 
@@ -1076,7 +1024,7 @@ bool ZmHttpServer::BindEventBase(struct event_base* evbase)
                                          EVHTTP_REQ_MOVE);
 
     // 设置通用请求回调，所有进入的请求都走 OnHttp_RequestCB
-    evhttp_set_gencb(m_evhttpd, ZmHttpServer::OnHttp_RequestCB, this);
+    evhttp_set_gencb(m_evhttpd, ZmHttpServer::OnHttpRequestCB, this);
 
     // 不限制最大并发连接数（0 表示禁用限制），实际上限由线程池和系统资源决定
     evhttp_set_max_connections(m_evhttpd, 0);
@@ -1174,9 +1122,6 @@ bool ZmJsonRpcServer::OnJsonRpcRequestAsync(ZmHttpdTask* task, std::string metho
 {
     if (m_on_jsonrpc_call_async)
     {
-        // 阻止 Worker 线程自动触发 REPLY 信号，等待异步处理完成
-        task->DeferReply();
-
         // 异步回调：业务层在完成处理后调用 reply(result, error) 发送响应
         // reply 按值捕获（拷贝 rsp_reply），确保 OnHttpdRequest 返回后字段不丢失
         m_on_jsonrpc_call_async(task, method, params,
@@ -1214,7 +1159,7 @@ void ZmJsonRpcServer::OnJsonRpcAsyncReply(ZmJsonRpcServer* server, ZmHttpdTask* 
     // 通过共用方法构造响应（自动处理 JSONP callback 和 Server 头）
     server->BuildJsonRpcResponse(task, reply);
     // 投递 REPLY 信号到 HTTP 服务器的 event loop → SendReply → evhttp_send_reply
-    task->SendDeferredReply();
+    task->TriggerReply();
 }
 
 void ZmJsonRpcServer::BuildJsonRpcResponse(ZmHttpdTask* task, const ZMJSON& rsp_envelope)
@@ -1320,7 +1265,7 @@ int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
                 // 异步路径优先：设置了异步回调则忽略同步回调
                 else if(OnJsonRpcRequestAsync(task, method, params, rsp_reply))
                 {
-                    return 200; // 异步处理中，响应稍后到达
+                    return -1; // 异步处理中，响应稍后到达
                 }
                 else if (OnJsonRpcRequest(task, method.c_str(), params, rsp_result, rsp_error) < 0)
                 {
