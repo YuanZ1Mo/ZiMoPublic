@@ -4,9 +4,8 @@
 /** @brief bufferevent 创建选项：关闭时释放 fd、延迟回调、线程安全 */
 #define ZM_EVENT_BEV_OPTIONS BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_THREADSAFE
 
-#include "zm_bufferevent_pair_pool.h"
-
 #include "zm_net_http.h"
+#include "../util/zm_util_bufferevent_pair_pool.h"
 
 #include <../libevent/include/event2/bufferevent.h>
 #include <../libevent/include/event2/event.h>
@@ -124,7 +123,7 @@ public:
     ZM_TAP_SLOT*   _slot;                     ///< 回指 pool 中的槽位，扩容时被 ZmTapContext 同步更新
 
     /// bufferevent_pair 池化支持：当 requester_bev 来自池时非空，FreeRequesterEnd 通过它归还
-    BuffereventPairHandle* pair_handle;       ///< 池句柄，非空时由池管理生命周期
+    ZmBuffereventPairHandle* pair_handle;       ///< 池句柄，非空时由池管理生命周期
 
 public:
     /**
@@ -305,10 +304,10 @@ public:
      *  @note  用于进程内零拷贝通信，bev 无需关联 socket fd */
     static bool OnPairAcceptBev(ContextEventHandlerParams* params, struct bufferevent* bev,
                                 struct sockaddr* address = nullptr,
-                                BuffereventPairHandle* handle = nullptr);
+                                ZmBuffereventPairHandle* handle = nullptr);
     static bool OnPairAcceptBev(const char* name, struct bufferevent* bev,
                                 struct sockaddr* address = nullptr,
-                                BuffereventPairHandle* handle = nullptr);
+                                ZmBuffereventPairHandle* handle = nullptr);
     static void OnRequesterEventCB(struct bufferevent* requester_bev, short events, void* ctx);
     static void OnRequesterReadCB(struct bufferevent* requester_bev, void* ctx);
 

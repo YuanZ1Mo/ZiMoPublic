@@ -714,7 +714,7 @@ void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* li
  * @note 调用后 bev 由 TAP 接管生命周期（BEV_OPT_CLOSE_ON_FREE），调用者不应再操作 bev
  */
 bool ZmTapContextEventHandler::OnPairAcceptBev(ContextEventHandlerParams* params, struct bufferevent* bev,
-                                                struct sockaddr* address, BuffereventPairHandle* handle)
+                                                struct sockaddr* address, ZmBuffereventPairHandle* handle)
 {
     ZmTapDelegate* delegate = (ZmTapDelegate*)params->delegate;
     ZmTapContext* context = params->ctx;
@@ -766,7 +766,7 @@ bool ZmTapContextEventHandler::OnPairAcceptBev(ContextEventHandlerParams* params
 }
 
 bool ZmTapContextEventHandler::OnPairAcceptBev(const char* name, struct bufferevent* bev,
-                                                struct sockaddr* address, BuffereventPairHandle* handle)
+                                                struct sockaddr* address, ZmBuffereventPairHandle* handle)
 {
     auto it = m_registry.find(name);
     if (it != m_registry.end())

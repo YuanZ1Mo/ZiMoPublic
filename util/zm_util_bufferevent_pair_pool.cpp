@@ -1,22 +1,22 @@
-#include "zm_bufferevent_pair_pool.h"
+#include "zm_util_bufferevent_pair_pool.h"
 
 #include "../spdlog/zm_logger.h"
 
-#include <event2/event.h>
-#include <event2/bufferevent.h>
-#include <event2/buffer.h>
+#include <../libevent/include/event2/event.h>
+#include <../libevent/include/event2/bufferevent.h>
+#include <../libevent/include/event2/buffer.h>
 
 // ============================================================================
-// BuffereventPairHandle
+// ZmBuffereventPairHandle
 // ============================================================================
 
-void BuffereventPairHandle::Pair0EOF()
+void ZmBuffereventPairHandle::Pair0EOF()
 {
     if (bev0)
         bufferevent_trigger_event(bev0, BEV_EVENT_EOF, BEV_OPT_DEFER_CALLBACKS);
 }
 
-void BuffereventPairHandle::TryReturn()
+void ZmBuffereventPairHandle::TryReturn()
 {
     if (pair0_done.load(std::memory_order_acquire) &&
         pair1_done.load(std::memory_order_acquire))
@@ -27,7 +27,7 @@ void BuffereventPairHandle::TryReturn()
     }
 }
 
-void BuffereventPairHandle::Reset()
+void ZmBuffereventPairHandle::Reset()
 {
     if (bev0)
     {
@@ -52,20 +52,20 @@ void BuffereventPairHandle::Reset()
 }
 
 // ============================================================================
-// BuffereventPairPool
+// ZmBuffereventPairPool
 // ============================================================================
 
-BuffereventPairPool::BuffereventPairPool()
+ZmBuffereventPairPool::ZmBuffereventPairPool()
     : m_evbase(nullptr)
 {
 }
 
-BuffereventPairPool::~BuffereventPairPool()
+ZmBuffereventPairPool::~ZmBuffereventPairPool()
 {
     Shutdown();
 }
 
-void BuffereventPairPool::Init(struct event_base* evbase, int capacity)
+void ZmBuffereventPairPool::Init(struct event_base* evbase, int capacity)
 {
     m_evbase = evbase;
     for (int i = 0; i < capacity; i++)
@@ -83,11 +83,11 @@ void BuffereventPairPool::Init(struct event_base* evbase, int capacity)
             m_free_stack.push_back(&h);
         }
     }
-    PUBLIC_LOG_INFO("BuffereventPairPool initialized: capacity={}, created={}",
+    PUBLIC_LOG_INFO("ZmBuffereventPairPool initialized: capacity={}, created={}",
         capacity, (int)m_free_stack.size());
 }
 
-void BuffereventPairPool::Shutdown()
+void ZmBuffereventPairPool::Shutdown()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     for (auto& h : m_slots)
@@ -100,7 +100,7 @@ void BuffereventPairPool::Shutdown()
     m_evbase = nullptr;
 }
 
-BuffereventPairHandle* BuffereventPairPool::Acquire()
+ZmBuffereventPairHandle* ZmBuffereventPairPool::Acquire()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -115,13 +115,13 @@ BuffereventPairHandle* BuffereventPairPool::Acquire()
     return h;
 }
 
-void BuffereventPairPool::Return(BuffereventPairHandle* h)
+void ZmBuffereventPairPool::Return(ZmBuffereventPairHandle* h)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_free_stack.push_back(h);
 }
 
-bool BuffereventPairPool::Grow()
+bool ZmBuffereventPairPool::Grow()
 {
     // 调用者已持有 m_mutex
     m_slots.emplace_back();
@@ -139,6 +139,6 @@ bool BuffereventPairPool::Grow()
     h.bev1 = p[1];
     m_free_stack.push_back(&h);
 
-    PUBLIC_LOG_INFO("BuffereventPairPool grow: total slots={}", (int)m_slots.size());
+    PUBLIC_LOG_INFO("ZmBuffereventPairPool grow: total slots={}", (int)m_slots.size());
     return true;
 }

@@ -1,5 +1,5 @@
-#ifndef ZM_BUFFEREVENT_PAIR_POOL_H
-#define ZM_BUFFEREVENT_PAIR_POOL_H
+#ifndef ZM_UTIL_BUFFEREVENT_PAIR_POOL_H
+#define ZM_UTIL_BUFFEREVENT_PAIR_POOL_H
 
 #include <atomic>
 #include <deque>
@@ -22,15 +22,15 @@ struct event_base;
  * === 回收条件 ===
  * 请自己按需回收
  */
-struct BuffereventPairHandle
+struct ZmBuffereventPairHandle
 {
     struct bufferevent* bev0;  ///< 响应端（原 pair[0]）
     struct bufferevent* bev1;  ///< TAP 端（原 pair[1]）
 
-    BuffereventPairHandle() = default;
+    ZmBuffereventPairHandle() = default;
 
     // std::deque 需要 MoveInsertable（atomic 不可拷贝/移动，需手动实现）
-    BuffereventPairHandle(BuffereventPairHandle&& other) noexcept
+    ZmBuffereventPairHandle(ZmBuffereventPairHandle&& other) noexcept
         : bev0(other.bev0), bev1(other.bev1)
         , pair0_done(other.pair0_done.load(std::memory_order_relaxed))
         , pair1_done(other.pair1_done.load(std::memory_order_relaxed))
@@ -41,9 +41,9 @@ struct BuffereventPairHandle
         other.owner_ = nullptr;
     }
 
-    BuffereventPairHandle& operator=(BuffereventPairHandle&&) = delete;
-    BuffereventPairHandle(const BuffereventPairHandle&) = delete;
-    BuffereventPairHandle& operator=(const BuffereventPairHandle&) = delete;
+    ZmBuffereventPairHandle& operator=(ZmBuffereventPairHandle&&) = delete;
+    ZmBuffereventPairHandle(const ZmBuffereventPairHandle&) = delete;
+    ZmBuffereventPairHandle& operator=(const ZmBuffereventPairHandle&) = delete;
 
     // ========================================================================
     // pair1 终端操作（由 FreeRequesterEnd 调用）
@@ -93,11 +93,11 @@ struct BuffereventPairHandle
     }
 
 private:
-    friend class BuffereventPairPool;
+    friend class ZmBuffereventPairPool;
 
     std::atomic<bool>    pair0_done = false;  ///< 响应端已释放
     std::atomic<bool>    pair1_done = false;  ///< TAP 端已释放
-    BuffereventPairPool* owner_     = nullptr;
+    ZmBuffereventPairPool* owner_     = nullptr;
 
     /// 两端都完成后 Reset() → 归还池
     void TryReturn();
@@ -114,11 +114,11 @@ private:
  * 使用 std::deque 保证扩容时已外借的句柄指针不失效。
  * Acquire/Return 加锁保证跨线程原子操作。
  */
-class BuffereventPairPool
+class ZmBuffereventPairPool
 {
 public:
-    BuffereventPairPool();
-    ~BuffereventPairPool();
+    ZmBuffereventPairPool();
+    ~ZmBuffereventPairPool();
 
     /// 预创建池
     void Init(struct event_base* evbase, int capacity);
@@ -127,21 +127,21 @@ public:
     void Shutdown();
 
     /// 获取句柄（O(1)，池耗尽时自动扩容），仅 bufferevent_pair_new 失败时返回 nullptr
-    BuffereventPairHandle* Acquire();
+    ZmBuffereventPairHandle* Acquire();
 
 private:
-    friend struct BuffereventPairHandle;
+    friend struct ZmBuffereventPairHandle;
 
     /// 句柄两端都释放后由 TryReturn 调用
-    void Return(BuffereventPairHandle* h);
+    void Return(ZmBuffereventPairHandle* h);
 
     /// 池耗尽时创建新句柄
     bool Grow();
 
     struct event_base*                m_evbase;
     std::mutex                        m_mutex;         ///< 保护 m_free_stack 的跨线程访问
-    std::deque<BuffereventPairHandle> m_slots;         ///< 槽位队列（push_back 不失效已有指针）
-    std::vector<BuffereventPairHandle*> m_free_stack;  ///< 空闲栈
+    std::deque<ZmBuffereventPairHandle> m_slots;         ///< 槽位队列（push_back 不失效已有指针）
+    std::vector<ZmBuffereventPairHandle*> m_free_stack;  ///< 空闲栈
 };
 
-#endif // ZM_BUFFEREVENT_PAIR_POOL_H
+#endif // ZM_UTIL_BUFFEREVENT_PAIR_POOL_H
