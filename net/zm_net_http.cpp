@@ -697,17 +697,17 @@ private:
 // 在飞 doer（m_allDoers 中但不在 m_freelist 中）不在析构时强制释放，
 // 它们会在后续 REPLY 回调到达时通过 RecycleDoer(nullptr 兜底) 自删除。
 //
-class DoerPool
+class ZmHttpdDoerPool
 {
 public:
-    explicit DoerPool(ZmHttpServer* server, size_t initCount = 0)
+    explicit ZmHttpdDoerPool(ZmHttpServer* server, size_t initCount = 0)
         : m_server(server), m_peakSize(0)
     {
         if (initCount > 0)
             PreAlloc(initCount);
     }
 
-    ~DoerPool()
+    ~ZmHttpdDoerPool()
     {
         // ① 删除所有空闲 doer
         for (ZmHttpdDoer* doer : m_freelist)
@@ -998,7 +998,7 @@ bool ZmHttpHead::IsEmpty()
 
 ZmHttpServer::ZmHttpServer(struct event_base* evbase, uint16_t local_port)
     : m_evbase(evbase), m_evhttpd(nullptr), m_threadPoolName(), m_threadPool(nullptr),
-      m_local_port(local_port), m_port_bind_failed(false), m_doerPool(nullptr)
+      m_local_port(local_port), m_port_bind_failed(false), m_httpdDoerPool(nullptr)
 {}
 
 ZmHttpServer::~ZmHttpServer()
@@ -1028,8 +1028,8 @@ bool ZmHttpServer::Init()
     }
 
     // 创建 doer 对象池（预创建 = CPU 核数，与线程池规模匹配，免去首批请求的分配延迟）
-    if (!m_doerPool)
-        m_doerPool = new DoerPool(this, std::thread::hardware_concurrency());
+    if (!m_httpdDoerPool)
+        m_httpdDoerPool = new ZmHttpdDoerPool(this, std::thread::hardware_concurrency());
 
     return true;
 }
@@ -1044,10 +1044,10 @@ void ZmHttpServer::Close()
     }
 
     // ★ 销毁 doer 对象池（线程池已停，worker 不再引用 doer，安全释放）
-    if (m_doerPool)
+    if (m_httpdDoerPool)
     {
-        delete m_doerPool;
-        m_doerPool = nullptr;
+        delete m_httpdDoerPool;
+        m_httpdDoerPool = nullptr;
     }
 
     // 释放 evhttp（停止接受新连接）
@@ -1084,14 +1084,14 @@ struct event_base* ZmHttpServer::EventBase()
 
 ZmHttpdDoer* ZmHttpServer::AcquireDoer(struct evhttp_request* request)
 {
-    return m_doerPool ? m_doerPool->Acquire(request)
+    return m_httpdDoerPool ? m_httpdDoerPool->Acquire(request)
                       : new ZmHttpdDoer(this, request);
 }
 
 void ZmHttpServer::RecycleDoer(ZmHttpdDoer* doer)
 {
-    if (m_doerPool)
-        m_doerPool->Recycle(doer);
+    if (m_httpdDoerPool)
+        m_httpdDoerPool->Recycle(doer);
     else
         delete doer;  // pool 已销毁时兜底
 }

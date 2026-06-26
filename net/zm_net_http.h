@@ -59,7 +59,7 @@
 // 前向声明（头文件中仅通过指针使用）
 class ZmThreadPool;
 class ZmHttpdDoer;
-class DoerPool;
+class ZmHttpdDoerPool;
 struct evbuffer;
 
 
@@ -601,7 +601,7 @@ private:
     OnHttpdRequestCB   m_on_request;
 
     /** @brief ZmHttpdDoer 对象池（事件循环线程独享，无需锁） */
-    DoerPool*          m_doerPool;
+    ZmHttpdDoerPool*   m_httpdDoerPool;
 };
 
 
