@@ -185,19 +185,17 @@ void ZmTapDelegateJRPC::WriteResponse(ZM_TAP_CTX* tap, const char* json_str, siz
 
 	uint32_t rsp_len = htonl((uint32_t)data_len);
 
-	struct evbuffer_iovec iov[2];
-	iov[0].iov_base = &rsp_len;
-	iov[0].iov_len = 4;
-	iov[1].iov_base = (void*)json_str;
-	iov[1].iov_len = data_len;
-
-	int ret = (int)evbuffer_add_iovec(bufferevent_get_output(tap->requester_bev), iov, 2);
-	if (ret < 0)
+	struct evbuffer* output = bufferevent_get_output(tap->requester_bev);
+	if (evbuffer_add(output, &rsp_len, 4) < 0 ||
+		evbuffer_add(output, json_str, data_len) < 0)
 	{
-		PUBLIC_LOG_ERROR("evbuffer_add_iovec failed, TAP:{}, ret:{}", (void*)tap, ret);
+		PUBLIC_LOG_ERROR("evbuffer_add failed in WriteResponse, TAP:{}, data_len:{}",
+			(void*)tap, data_len);
+		tap->Drop();
+		return;
 	}
 
-	ret = bufferevent_flush(tap->requester_bev, EV_WRITE, BEV_FLUSH);
+	int ret = bufferevent_flush(tap->requester_bev, EV_WRITE, BEV_FLUSH);
 	if (ret < 0)
 	{
 		PUBLIC_LOG_ERROR("bufferevent_flush failed, TAP:{}, ret:{}", (void*)tap, ret);

@@ -19,9 +19,6 @@
 #include <atomic>
 #include <vector>
 
-
-#define JRPC_VERSION "2.0"
-
  // ============================================================================
  // ZmHttpUtil
 ZM_HTTP_REQ* ZmHttpUtil::CreateRequest()
@@ -424,7 +421,23 @@ void ZmHttpdTask::GetRequestHeaders(nlohmann::json::object_t& headersObj)
         // 遍历 libevent 内部的 tailq 链表（tqh_first / tqe_next）读取所有请求头
         for (struct evkeyval* h = headerKeyVals->tqh_first; h; h = h->next.tqe_next)
         {
-            headersObj[h->key] = h->value;
+            auto it = headersObj.find(h->key);
+            if (it == headersObj.end())
+            {
+                headersObj[h->key] = h->value;
+            }
+            else if (it->second.is_array())
+            {
+                it->second.push_back(h->value);
+            }
+            else
+            {
+                // 已有单值 → 转为数组
+                nlohmann::json arr = nlohmann::json::array();
+                arr.push_back(std::move(it->second));
+                arr.push_back(h->value);
+                it->second = std::move(arr);
+            }
         }
     }
 }
@@ -623,6 +636,11 @@ public:
 
     void SendReply()
     {
+        PutReplyHeader("Access-Control-Allow-Origin", "*");
+        PutReplyHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+        PutReplyHeader("Access-Control-Allow-Headers", "*");
+        PutReplyHeader("ZmHttpServer-Version", ZIMO_SERVER_VERSION);
+
         for (auto it = m_reply_headers.begin(); it != m_reply_headers.end(); it++)
         {
             evhttp_add_header(evhttp_request_get_output_headers(m_request),
@@ -647,13 +665,13 @@ public:
         catch (const std::exception& e)
         {
             PUBLIC_LOG_ERROR("[请求#{}] Perform 异常: {}", m_id, e.what());
-            SetReply(500, "Internal Server Error");
+            SetReply(ZM_HTTP_STATUS_CODE_INTERNAL_ERROR, "Internal Server Error");
             TriggerReply();
         }
         catch (...)
         {
             PUBLIC_LOG_ERROR("[请求#{}] Perform 未知异常", m_id);
-            SetReply(500, "Internal Server Error");
+            SetReply(ZM_HTTP_STATUS_CODE_INTERNAL_ERROR, "Internal Server Error");
             TriggerReply();
         }
     }
@@ -1115,17 +1133,10 @@ void ZmHttpServer::Perform(ZmHttpdTask* task)
     //        task->Uri() ? task->Uri() : "(null)", task->Ip() ? task->Ip() : "(null)");
     //}
 
-    // 自动添加 CORS 跨域响应头，允许所有来源访问
-    task->PutReplyHeader("Access-Control-Allow-Origin", "*");
-    task->PutReplyHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-    task->PutReplyHeader("Access-Control-Allow-Headers", "*");
-    // 在 Server 响应头中附带服务端版本号
-    task->PutReplyHeader("ZmHttpServer-Version", ZIMO_SERVER_VERSION);
-
     // 浏览器预检请求（OPTIONS）直接返回 200，无需进入业务逻辑
     if (EVHTTP_REQ_OPTIONS == task->Method())
     {
-        task->SetReply(200);
+        task->SetReply(ZM_HTTP_STATUS_CODE_OK);
         task->TriggerReply();
         return;
     }
@@ -1135,17 +1146,12 @@ void ZmHttpServer::Perform(ZmHttpdTask* task)
     task->SetInputBuffer(inbuf);
     int              code = OnHttpdRequest(task, evbuffer_pullup(inbuf, dlen), dlen);
 
-    // OnHttpdRequest 返回 0 表示该路径未被任何回调处理，默认 404
     if (code == -1)
     {
         //-1表示异步回调,这边不做处理
     }
-    else if (code >= 0)
+    else
     {
-        if (code == 0)
-        {
-            code = 404;
-        }
         task->SetReply(code);
         task->TriggerReply();
     }
@@ -1184,8 +1190,7 @@ void ZmHttpServer::OnEventControl(evutil_socket_t fd, short what, void* ctx)
 
 int ZmHttpServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t dlen)
 {
-    // 返回 0 表示此路径不支持，Perform 中会将 0 覆盖为 404
-    return m_on_request ? m_on_request(task, data, dlen) : 0;
+    return m_on_request ? m_on_request(task, data, dlen) : ZM_HTTP_STATUS_CODE_NOT_FOUND;
 }
 
 bool ZmHttpServer::BindEventBase(struct event_base* evbase)
@@ -1254,15 +1259,6 @@ bool ZmHttpServer::BindEventBase(struct event_base* evbase)
 }
 
 // ============================ ZmJsonRpcServer ============================
-/*
-* JSON-RPC 2.0 Error Codes:
-* -32700   Parse error         Invalid JSON was received by the server.
-* -32600   Invalid Request     The JSON sent is not a valid Request object.
-* -32601   Method not found    The method does not exist / is not available.
-* -32602   Invalid params      Invalid method parameter(s).
-* -32603   Internal error      Internal JSON-RPC error.
-* -32000 to -32099             Server error (Reserved for implementation-defined server-errors).
-*/
 
 ZmJsonRpcServer::ZmJsonRpcServer(struct event_base* evbase, const char* root_uri, uint16_t local_port)
     : ZmHttpServer(evbase, local_port)
@@ -1273,9 +1269,10 @@ ZmJsonRpcServer::ZmJsonRpcServer(struct event_base* evbase, const char* root_uri
     }
     else
     {
-        // root_uri 为 nullptr 时清零，后续 ZmString::IsEmpty 返回 true，
-        // 使 OnHttpdRequest 中所有请求都走 RPC 流程
+        // root_uri 为 nullptr 时清零，后续 ZmString::IsEmpty 返回 404，
+        // 使 OnHttpdRequest 中所有请求都走 JRPC 流程
         memset(m_root_uri, 0, sizeof(m_root_uri));
+        PUBLIC_LOG_INFO("You haven't set the root_uri for HTTP_SERVER, so all requests will return a 404 error");
     }
 
     std::string poolName = "ZmJsonRpcServer:" + std::to_string(local_port);
@@ -1300,24 +1297,22 @@ void ZmJsonRpcServer::SetJsonRpcCBAsync(OnJsonRpcRequestCBAsync oncall_async)
     m_on_jsonrpc_call_async = oncall_async;
 }
 
-int ZmJsonRpcServer::OnJsonRpcRequest(ZmHttpdTask* task, const char* method, const ZMJSON& params,
-    ZMJSON& result, ZMJSON& error, ZMJSON& header)
+int ZmJsonRpcServer::OnJsonRpcRequest(ZmHttpdTask* task, const ZMJSON& request, ZMJSON& response)
 {
-    return m_on_jsonrpc_call ? m_on_jsonrpc_call(task, method, params, result, error, header) : -1;
+    return m_on_jsonrpc_call ? m_on_jsonrpc_call(task, request, response) : -1;
 }
 
-bool ZmJsonRpcServer::OnJsonRpcRequestAsync(ZmHttpdTask* task, std::string method, const ZMJSON& params,
-    ZMJSON& reply)
+bool ZmJsonRpcServer::OnJsonRpcRequestAsync(ZmHttpdTask* task, const ZMJSON& request, ZMJSON& reply)
 {
     if (m_on_jsonrpc_call_async)
     {
         // 异步回调：reply 拷贝到堆上（shared_ptr），确保 OnHttpdRequest 返回后仍然存活
         // reply 是 ZMJSON& 引用，按值捕获只拷贝引用本身，必须显式拷对象到堆
         auto replyPtr = std::make_shared<ZMJSON>(reply);
-        m_on_jsonrpc_call_async(task, method, params,
-            [this, task, replyPtr](const ZMJSON& result, const ZMJSON& error, const ZMJSON& header) mutable
+        m_on_jsonrpc_call_async(task, request,
+            [this, task, replyPtr](const ZMJSON& response) mutable
             {
-                OnJsonRpcAsyncReply(this, task, *replyPtr, result, error, header);
+                OnJsonRpcAsyncReply(this, task, *replyPtr, response);
             });
 
         return true; // 异步处理中，响应稍后到达
@@ -1326,62 +1321,56 @@ bool ZmJsonRpcServer::OnJsonRpcRequestAsync(ZmHttpdTask* task, std::string metho
     return  false;
 }
 
-void ZmJsonRpcServer::OnJsonRpcAsyncReply(ZmJsonRpcServer* server, ZmHttpdTask* task, ZMJSON& reply,
-    const ZMJSON& result, const ZMJSON& error, const ZMJSON& header)
+void ZmJsonRpcServer::OnJsonRpcAsyncReply(ZmJsonRpcServer* server, ZmHttpdTask* task, ZMJSON& reply, const ZMJSON& response)
 {
+    // 通过共用方法构造响应（自动处理 JSONP callback 和 Server 头）
+    server->BuildJsonRpcResponse(task, reply, response);
+    // 投递 REPLY 信号到 HTTP 服务器的 event loop → SendReply → evhttp_send_reply
+    task->TriggerReply();
+}
+
+void ZmJsonRpcServer::BuildJsonRpcResponse(ZmHttpdTask* task, ZMJSON& reply, const ZMJSON& response)
+{
+    ZMJSON error   = response.value("error",   ZMJSON());
+    ZMJSON result  = response.value("result",  ZMJSON());
+    ZMJSON headers = response.value("headers", ZMJSON());
+
     // JSON-RPC 2.0 规范: 响应中 result 和 error 二选一
     if (!error.empty())
     {
         reply["error"] = error;
     }
-    else if(!result.empty())
+    else if (!result.empty())
     {
         reply["result"] = result;
     }
     else
     {
-        ZMJSON rsp_error;
-        rsp_error["code"] = -32603;
-        rsp_error["message"] = "Invalid Response, the response must contain either error or result";
-        reply["error"] = rsp_error;
+        reply["error"] = MakeError(ZM_JRPC_ERR_INTERNAL, "Invalid Response, the response must contain either error or result");
     }
 
-    // 通过共用方法构造响应（自动处理 JSONP callback 和 Server 头）
-    server->BuildJsonRpcResponse(task, reply, header);
-    // 投递 REPLY 信号到 HTTP 服务器的 event loop → SendReply → evhttp_send_reply
-    task->TriggerReply();
-}
-
-void ZmJsonRpcServer::BuildJsonRpcResponse(ZmHttpdTask* task, const ZMJSON& rsp_envelope, const ZMJSON& header)
-{
     // 从 task 中获取 callback 参数（JSONP 支持），无需外部捕获
     std::string callback = task->GetQueryValue("callback");
-
     std::string body;
     std::string content_type;
 
     if (callback.empty())
     {
         // 标准 JSON 响应
-        body = rsp_envelope.dump();
+        body = reply.dump();
         content_type = "application/json; charset=UTF-8";
     }
     else
     {
         // JSONP 响应格式: callback(jsonString)
-        body = callback + "(" + rsp_envelope.dump() + ")";
+        body = callback + "(" + reply.dump() + ")";
         content_type = "application/javascript";
     }
 
-    task->SetReply(200);
-    task->PutReplyHeader("Content-type", content_type.c_str());
-
     // 业务层传入的自定义响应头（如 Set-Cookie 等）
     // 支持 string/number/bool 单值 和 array 多值（同名 header 发多次）
-    if (!header.is_null() && header.is_object())
+    if (headers.is_object())
     {
-        // 先拷贝一份，避免迭代过程中引用失效
-        ZMJSON hdr = header;
         auto putValue = [&](const char* key, const ZMJSON& v)
         {
             if (v.is_string())
@@ -1390,7 +1379,7 @@ void ZmJsonRpcServer::BuildJsonRpcResponse(ZmHttpdTask* task, const ZMJSON& rsp_
                 task->PutReplyHeader(key, v.dump().c_str());
         };
 
-        for (auto& [key, val] : hdr.items())
+        for (auto& [key, val] : headers.items())
         {
             if (val.is_array())
             {
@@ -1404,34 +1393,24 @@ void ZmJsonRpcServer::BuildJsonRpcResponse(ZmHttpdTask* task, const ZMJSON& rsp_
         }
     }
 
+    task->PutReplyHeader("Content-type", content_type.c_str());
+    task->SetReply(ZM_HTTP_STATUS_CODE_OK);
     task->SetReplyData((const BYTE*)body.data(), body.size());
 }
 
-
-/*
-* -32700	Parse error	JSON 解析错误
-* -32600	Invalid Request	不是有效的 JSON-RPC 2.0 请求
-* -32601	Method not found	请求的方法不存在
-* -32602	Invalid params	参数无效或不正确
-* -32603	Internal error	服务器内部错误
-* -32000 to -32099	Server error	服务器定义的错误（保留范围）
-* -32000    Internal portal does not have JRPC processing channel set up 门户未设置jrpcReq回调函数
-*/
 int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t dlen)
 {
     // 暂定JRPC请求的rui一律使用完全匹配
     if (ZmString::IsEmpty(m_root_uri) || !ZmString::Equals(task->Uri(), m_root_uri))
     {
-        return ZmHttpServer::OnHttpdRequest(task, data, dlen);
+        return ZM_HTTP_STATUS_CODE_NOT_FOUND;
     }
 
     std::string  errmsg;
     int          errcode = 0;
 
-    ZMJSON       rsp_reply;
-    ZMJSON       rsp_result;
-    ZMJSON       rsp_error;
-    ZMJSON       rsp_header;
+    ZMJSON       reply;
+    ZMJSON       response;
     ZmByteBuffer buf(dlen, data);
 
     // GET 请求通过 query string 的 jsonbody 参数传递 Base64 编码的 JSON 请求体
@@ -1454,50 +1433,70 @@ int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
         //id 原样回传，便于客户端匹配响应
         if (!request["id"].is_null())
         {
-            rsp_reply["id"] = request["id"];
+            reply["id"] = request["id"];
         }
 
         // 校验 JSON-RPC 版本号，必须为 JRPC_VERSION
         std::string jsonrpc_ver = zm_json_get_str(request, "jsonrpc");
         if (jsonrpc_ver != JRPC_VERSION)
         {
-            errcode = -32600;
+            errcode = ZM_JRPC_ERR_INVALID_REQUEST;
             errmsg = "Invalid Request: jsonrpc must be " JRPC_VERSION;
         }
         else
         {
             // 构造 JSON-RPC 2.0 标准响应
-            rsp_reply["jsonrpc"] = jsonrpc_ver;
+            reply["jsonrpc"] = jsonrpc_ver;
 
             std::string method = zm_json_get_str(request, "method");
             if (!method.empty())
             {
                 // 将请求中的 method 原样回传，便于客户端匹配响应
-                rsp_reply["method"] = method;
+                reply["method"] = method;
 
                 ZMJSON params = request["params"];
                 if (!params.is_object())
                 {
                     // JSON-RPC 2.0: params 必须是对象
-                    errcode = -32602;
+                    errcode = ZM_JRPC_ERR_INVALID_PARAMS;
                     errmsg = "Invalid params";
                 }
-                // 异步路径优先：设置了异步回调则忽略同步回调
-                else if(OnJsonRpcRequestAsync(task, method, params, rsp_reply))
+                else
                 {
-                    return -1; // 异步处理中，响应稍后到达
-                }
-                else if (OnJsonRpcRequest(task, method.c_str(), params, rsp_result, rsp_error, rsp_header) < 0)
-                {
-                    // 回调返回 < 0 表示该 method 不存在
-                    errcode = -32601;
-                    errmsg = "Method not found";
+                    // 将 task 中存储的请求头添加到 request 中
+                    nlohmann::json::object_t headers;
+                    task->GetRequestHeaders(headers);
+
+                    request.clear();
+                    request["method"] = method;
+                    request["params"] = params;
+                    request["headers"] = headers;
+
+                    // 异步路径优先：设置了异步回调则忽略同步回调
+                    if (OnJsonRpcRequestAsync(task, request, reply))
+                    {
+                        return -1; // 异步处理中，响应稍后到达
+                    }
+                    // 回调返回 < 0 表示该 method 不存在, 等于0表示没设置同步回调, 所以业务层不要返回0
+                    else if (int ret = OnJsonRpcRequest(task, request, response))
+                    {
+                        if (ret < 0)
+                        {
+                            errcode = ZM_JRPC_ERR_METHOD_NOT_FOUND;
+                            errmsg = "Method not found";
+                        }
+                    }
+                    else
+                    {
+                        errcode = ZM_JRPC_ERR_PORTAL_NOJRPC;
+                        errmsg = "Internal portal does not have JRPC processing channel set up";
+                    }
                 }
             }
             else
             {
                 // 缺少 method 字段
-                errcode = -32600;
+                errcode = ZM_JRPC_ERR_INVALID_REQUEST;
                 errmsg = "Invalid Request, Method field is required";
             }
         }
@@ -1505,38 +1504,18 @@ int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
     else
     {
         // JSON 解析失败
-        errcode = -32700;
-        errmsg = "Parse error";
+        errcode = ZM_JRPC_ERR_PARSE;
+        errmsg = "Parse request json error";
     }
 
     if (errcode)
     {
-        rsp_error.clear();
-        rsp_error["code"] = errcode;
-        rsp_error["message"] = errmsg;
-    }
-    else
-    {
-        if (rsp_error.empty() && rsp_result.empty())
-        {
-            rsp_error.clear();
-            rsp_error["code"] = -32603;
-            rsp_error["message"] = "Invalid Response, the response must contain either error or result";
-        }
+        response.clear();
+        response["error"] = MakeError(errcode, errmsg.c_str());
     }
 
-    // JSON-RPC 2.0 规范: 响应中 result 和 error 二选一
-    if (!rsp_error.empty())
-    {
-        rsp_reply["error"] = rsp_error;
-    }
-    else
-    {
-        rsp_reply["result"] = rsp_result;
-    }
-
-    BuildJsonRpcResponse(task, rsp_reply, rsp_header);
+    BuildJsonRpcResponse(task, reply, response);
 
     // JSON-RPC 层面的错误通过响应体中的 error 字段传达，HTTP 层面始终返回 200
-    return 200;
+    return ZM_HTTP_STATUS_CODE_OK;
 }

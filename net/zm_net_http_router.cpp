@@ -267,7 +267,7 @@ int ZmHttpRouter::Serve(ZmHttpdTask* task, const BYTE* data, size_t dlen)
 {
     const char* uri = task->Uri();
     if (uri == nullptr)
-        return 404;
+        return ZM_HTTP_STATUS_CODE_NOT_FOUND;
 
     // 去掉 query string
     std::string path(uri);
@@ -279,7 +279,7 @@ int ZmHttpRouter::Serve(ZmHttpdTask* task, const BYTE* data, size_t dlen)
     t_params.clear();
     auto matched = MatchRoute(path, t_params);
     if (matched.handlers == nullptr)
-        return 404;
+        return ZM_HTTP_STATUS_CODE_NOT_FOUND;
 
     // 匹配 HTTP 方法
     const char* methodStr = "*";
@@ -304,7 +304,7 @@ int ZmHttpRouter::Serve(ZmHttpdTask* task, const BYTE* data, size_t dlen)
     }
 
     if (!handler)
-        return 404;
+        return ZM_HTTP_STATUS_CODE_NOT_FOUND;
 
     return ExecuteChain(task, data, dlen, matched.nodeMWs, handler);
 }
@@ -411,7 +411,7 @@ ZmHttpRouter::Middleware ZmHttpMiddlewareRecovery()
 				task->Id(), e.what(), task->Uri() ? task->Uri() : "(null)");
 			task->ClearReplyBody();
 			task->PutReplyHeader("Content-type", "application/json; charset=utf-8");
-			task->SetReply(500, "Internal Server Error");
+			task->SetReply(ZM_HTTP_STATUS_CODE_INTERNAL_ERROR, "Internal Server Error");
 			std::string body = "{\"error\":\"Internal Server Error\"}";
 			task->SetReplyData((const BYTE*)body.c_str(), body.size());
 		}
@@ -421,7 +421,7 @@ ZmHttpRouter::Middleware ZmHttpMiddlewareRecovery()
 				task->Uri() ? task->Uri() : "(null)");
 			task->ClearReplyBody();
 			task->PutReplyHeader("Content-type", "application/json; charset=utf-8");
-			task->SetReply(500, "Internal Server Error");
+			task->SetReply(ZM_HTTP_STATUS_CODE_INTERNAL_ERROR, "Internal Server Error");
 			std::string body = "{\"error\":\"Internal Server Error\"}";
 			task->SetReplyData((const BYTE*)body.c_str(), body.size());
 		}

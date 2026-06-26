@@ -24,6 +24,37 @@
 
 #include <stdint.h>
 
+#define JRPC_VERSION "2.0"
+
+// 2xx 成功
+#define ZM_HTTP_STATUS_CODE_OK                    200  // 请求成功
+#define ZM_HTTP_STATUS_CODE_CREATED               201  // 已创建（资源新建成功）
+#define ZM_HTTP_STATUS_CODE_ACCEPTED              202  // 已接受（异步处理中）
+#define ZM_HTTP_STATUS_CODE_NO_CONTENT            204  // 无内容（操作成功，无返回体）
+#define ZM_HTTP_STATUS_CODE_PARTIAL_CONTENT       206  // 部分内容（断点续传 / Range 响应）
+                                                   
+// 3xx 重定向                                      
+#define ZM_HTTP_STATUS_CODE_MOVED_PERMANENTLY     301  // 永久重定向
+#define ZM_HTTP_STATUS_CODE_FOUND                 302  // 临时重定向
+#define ZM_HTTP_STATUS_CODE_NOT_MODIFIED          304  // 未修改（缓存命中）
+#define ZM_HTTP_STATUS_CODE_TEMPORARY_REDIRECT    307  // 临时重定向（保持原方法）
+                                                   
+// 4xx 客户端错误                                  
+#define ZM_HTTP_STATUS_CODE_BAD_REQUEST           400  // 请求无效（参数格式/必填字段缺失）
+#define ZM_HTTP_STATUS_CODE_UNAUTHORIZED          401  // 未授权（需认证）
+#define ZM_HTTP_STATUS_CODE_FORBIDDEN             403  // 禁止访问（已认证但无权限）
+#define ZM_HTTP_STATUS_CODE_NOT_FOUND             404  // 资源不存在
+#define ZM_HTTP_STATUS_CODE_METHOD_NOT_ALLOWED    405  // 方法不允许（如 PUT 访问只读接口）
+#define ZM_HTTP_STATUS_CODE_REQUEST_TIMEOUT       408  // 请求超时
+#define ZM_HTTP_STATUS_CODE_RANGE_NOT_SATISFIABLE 416 // 请求范围无法满足（Range 头非法）
+#define ZM_HTTP_STATUS_CODE_TOO_MANY_REQUESTS     429  // 请求过于频繁（频率限制）
+                                                   
+// 5xx 服务端错误                                  
+#define ZM_HTTP_STATUS_CODE_INTERNAL_ERROR        500  // 服务器内部错误
+#define ZM_HTTP_STATUS_CODE_NOT_IMPLEMENTED       501  // 功能未实现
+#define ZM_HTTP_STATUS_CODE_BAD_GATEWAY           502  // 网关错误（上游返回无效响应）
+#define ZM_HTTP_STATUS_CODE_SERVICE_UNAVAILABLE   503  // 服务不可用（过载/维护中）
+#define ZM_HTTP_STATUS_CODE_GATEWAY_TIMEOUT       504  // 网关超时（上游响应超时）
 
 // 前向声明（头文件中仅通过指针使用）
 class ZmThreadPool;
@@ -574,6 +605,28 @@ private:
 };
 
 
+/*
+* JSON-RPC 2.0 标准错误码（https://www.jsonrpc.org/specification）
+* -32600	Invalid Request	不是有效的 JSON-RPC 2.0 请求
+* -32601	Method not found	请求的方法不存在
+* -32602	Invalid params	参数无效或不正确
+* -32603	Internal error	服务器内部错误
+* -32700	Parse error	JSON 解析错误
+* -32000 to -32099	Server error	服务器定义的错误（保留范围）
+*
+* -32000    Internal portal does not have JRPC processing channel set up 门户未设置jrpcReq回调函数
+*/
+#define ZM_JRPC_ERR_INVALID_REQUEST  -32600  // 无效请求（不是有效的 JSON-RPC 2.0 请求）
+#define ZM_JRPC_ERR_METHOD_NOT_FOUND -32601  // 方法不存在
+#define ZM_JRPC_ERR_INVALID_PARAMS   -32602  // 参数无效（params 格式/类型不符）
+#define ZM_JRPC_ERR_INTERNAL         -32603  // 内部错误（服务端处理异常）
+#define ZM_JRPC_ERR_PARSE            -32700  // 解析错误（JSON 格式非法）
+// 自定义错误码（-32000 ~ -32099 为 JSON-RPC 2.0 保留的服务端自定义范围）
+#define ZM_JRPC_ERR_PORTAL_NOJRPC    -32000  // 门户未设置 JRPC 回调
+#define ZM_JRPC_ERR_EMPTY_RSP        -32001  // 响应为空（上游回复空内容）
+#define ZM_JRPC_ERR_FORMAT           -32002  // 响应格式错误（上游 JSON 解析失败）
+#define ZM_JRPC_ERR_DROPPED          -32003  // 响应被丢弃（通道关闭/超时）
+
 /**
  * @brief JSON-RPC 2.0 协议服务器，在 ZmHttpServer 基础上增加 RPC 解析与分发
  *
@@ -608,10 +661,7 @@ public:
      * @header header  请求头设置
      * @return        >= 0 表示方法已处理，< 0 表示方法未找到
      */
-    typedef std::function<int(ZmHttpdTask* task, const std::string& method,
-        const ZMJSON& params,
-        ZMJSON& result, ZMJSON& error, ZMJSON& header)>
-        OnJsonRpcRequestCB;
+    typedef std::function<int(ZmHttpdTask* task, const ZMJSON& request, ZMJSON& response)> OnJsonRpcRequestCB;
 
     /**
      * @brief JSON-RPC 异步请求处理回调（优先级最高）
@@ -627,9 +677,8 @@ public:
      * @note 设置了异步回调后，同步回调被忽略。
      * @note reply 可在任意线程调用（内部通过 event_active 安全投递到 HTTP event loop）。
      */
-    typedef std::function<void(ZmHttpdTask* task, const std::string& method,
-        const ZMJSON& params,
-        std::function<void(const ZMJSON& result, const ZMJSON& error, const ZMJSON& header)> reply)>
+    typedef std::function<void(ZmHttpdTask* task, const ZMJSON& request,
+        std::function<void(const ZMJSON& response)> replyCB)>
         OnJsonRpcRequestCBAsync;
 
     /**
@@ -657,10 +706,11 @@ public:
     static ZMJSON MakeError(int code, const char* message);
 
     /**
-     * @brief 设置 JSON-RPC 请求回调（带 task 参数，优先级更高）
-     * @param oncall_ex  回调函数
+     * @brief 设置 JSON-RPC 同步请求回调
+     * @param oncall  回调函数
      *
-     * @note 同时设置了 CBEx 和 CB 时，优先使用 CBEx
+     * @note 回调函数在业务层不要返回0, 因为返回0表示没设置同步回调
+     *       回调函数返回 < 0 表示该 method 不被业务层接收
      */
     void SetJsonRpcCB(OnJsonRpcRequestCB oncall);
 
@@ -668,7 +718,7 @@ public:
      * @brief 设置 JSON-RPC 异步请求回调（优先级最高）
      * @param oncall_async  异步回调函数
      *
-     * @note 设置后同步回调（CBEx / CB）被忽略，所有匹配 root_uri 的请求走异步路径。
+     * @note 设置后同步回调被忽略，所有匹配 root_uri 的请求走异步路径。
      *       异步回调中业务层调用 reply(result, error) 发送响应，框架自动构造
      *       JSON-RPC 2.0 标准响应信封并通过 task->SendDeferredReply() 发送。
      */
@@ -686,8 +736,7 @@ protected:
      *
      * @note 分发优先级: CBEx > CB > 返回 -1
      */
-    virtual int OnJsonRpcRequest(ZmHttpdTask* task, const char* method, const ZMJSON& params,
-        ZMJSON& result, ZMJSON& error, ZMJSON& header);
+    virtual int OnJsonRpcRequest(ZmHttpdTask* task, const ZMJSON& request, ZMJSON& response);
 
     /**
     * @brief 分发 JSON-RPC 请求到注册的异步回调（虚函数，子类可重写）
@@ -699,8 +748,7 @@ protected:
     *
     * @note 分发优先级: CBEx > CB > 返回 -1
     */
-    virtual bool OnJsonRpcRequestAsync(ZmHttpdTask* task, std::string method, const ZMJSON& params,
-        ZMJSON& reply);
+    virtual bool OnJsonRpcRequestAsync(ZmHttpdTask* task, const ZMJSON& request, ZMJSON& reply);
 
     /**
      * @brief 处理 HTTP 请求，解析 JSON-RPC 协议并构造响应（重写父类虚函数）
@@ -733,7 +781,7 @@ protected:
      * @param task         请求上下文对象（从中读取 callback 参数）
      * @param rsp_envelope 已填充 jsonrpc/id/method/result/error 的响应 JSON 对象
      */
-    void BuildJsonRpcResponse(ZmHttpdTask* task, const ZMJSON& rsp_envelope, const ZMJSON& header);
+    void BuildJsonRpcResponse(ZmHttpdTask* task, ZMJSON& reply, const ZMJSON& response);
 
     /**
      * @brief 异步 JRPC 请求的回复回调（静态成员函数，供 OnJsonRpcRequestAsync 中 std::bind 使用）
@@ -743,11 +791,10 @@ protected:
      * @param result  业务层返回的结果对象（is_null() 表示无结果）
      * @param error   业务层返回的错误对象（is_null() 表示无错误）
      */
-    static void OnJsonRpcAsyncReply(ZmJsonRpcServer* server, ZmHttpdTask* task, ZMJSON& reply,
-        const ZMJSON& result, const ZMJSON& error, const ZMJSON& header);
+    static void OnJsonRpcAsyncReply(ZmJsonRpcServer* server, ZmHttpdTask* task, ZMJSON& reply, const ZMJSON& response);
 
 private:
-    /** @brief JSON-RPC 请求回调（带 task 参数，优先使用） */
+    /** @brief JSON-RPC 请求回调, 返回 < 0 表示该 method 不存在, 所以业务层不要返回0,因为返回0表示没设置同步回调 */
     OnJsonRpcRequestCB    m_on_jsonrpc_call;
 
     /** @brief JSON-RPC 异步请求回调（优先级最高，设置后忽略同步回调） */
