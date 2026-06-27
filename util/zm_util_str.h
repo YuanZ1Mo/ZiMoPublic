@@ -107,13 +107,16 @@ public:
      * @brief 判断两个 C 字符串是否相等（安全处理 NULL 指针）
      * @param s1 第一个字符串指针，可以为 NULL
      * @param s2 第二个字符串指针，可以为 NULL
+     * @param ignoreCase 是否忽略大小写，默认为 false（区分大小写）
      * @return true 表示两个字符串内容相同（包括都为 NULL 的情况），false 表示不同
      * @example
-     *   ZmString::Equals("abc", "abc");   // true
-     *   ZmString::Equals(NULL, NULL);     // true
-     *   ZmString::Equals("abc", NULL);    // false
+     *   ZmString::Equals("abc", "abc");           // true
+     *   ZmString::Equals("abc", "ABC");           // false
+     *   ZmString::Equals("abc", "ABC", true);     // true
+     *   ZmString::Equals(NULL, NULL);             // true
+     *   ZmString::Equals("abc", NULL);            // false
      */
-    static bool  Equals(const char* s1, const char* s2);
+    static bool  Equals(const char* s1, const char* s2, bool ignoreCase = false);
 
     /**
      * @brief 判断字符串是否全部由数字字符组成

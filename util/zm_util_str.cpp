@@ -79,9 +79,13 @@ bool ZmString::IsEmpty(const char* str)
     return (NULL == str || '\0' == str[0]);
 }
 
-bool ZmString::Equals(const char* s1, const char* s2)
+bool ZmString::Equals(const char* s1, const char* s2, bool ignoreCase)
 {
-    return (NULL == s1) ? (NULL == s2) : (NULL != s2 && 0 == strcmp(s1, s2));
+    if (NULL == s1)
+        return (NULL == s2);
+    if (NULL == s2)
+        return false;
+    return 0 == (ignoreCase ? _stricmp(s1, s2) : strcmp(s1, s2));
 }
 
 bool ZmString::IsNumeric(const char* str)

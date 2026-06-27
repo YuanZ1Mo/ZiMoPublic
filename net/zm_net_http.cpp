@@ -1401,7 +1401,7 @@ void ZmJsonRpcServer::BuildJsonRpcResponse(ZmHttpdTask* task, ZMJSON& reply, con
 int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t dlen)
 {
     // 暂定JRPC请求的rui一律使用完全匹配
-    if (ZmString::IsEmpty(m_root_uri) || !ZmString::Equals(task->Uri(), m_root_uri))
+    if (ZmString::IsEmpty(m_root_uri) || !ZmString::Equals(task->Uri(), m_root_uri, true))
     {
         return ZM_HTTP_STATUS_CODE_NOT_FOUND;
     }
