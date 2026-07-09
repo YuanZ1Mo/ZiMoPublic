@@ -16,6 +16,7 @@
 #define ZM_JSON_H
 
 #include <string>
+#include <string_view>
 #include <vector>
 #include <sstream>
 
@@ -40,7 +41,7 @@ using ZMJSON = nlohmann::ordered_json;
  * @param default_value 字段不存在或类型不匹配时的默认返回值
  * @return 解析后的 int 值，或 default_value
  */
-int zm_json_get_int(const ZMJSON& json, const char* kname, int default_value = 0);
+int zm_json_get_int(const ZMJSON& json, std::string_view kname, int default_value = 0);
 
 /**
  * @brief 从 JSON 对象中读取字符串值
@@ -56,7 +57,7 @@ int zm_json_get_int(const ZMJSON& json, const char* kname, int default_value = 0
  * @param default_value 字段不存在或类型不匹配时的默认返回值
  * @return 解析后的 string 值，或 default_value
  */
-std::string zm_json_get_str(const ZMJSON& json, const char* kname, std::string default_value = "");
+std::string zm_json_get_str(const ZMJSON& json, std::string_view kname, std::string default_value = "");
 
 /**
  * @brief 从 JSON 对象中读取浮点数值
@@ -71,7 +72,7 @@ std::string zm_json_get_str(const ZMJSON& json, const char* kname, std::string d
  * @param default_value 字段不存在或类型不匹配时的默认返回值
  * @return 解析后的 double 值，或 default_value
  */
-double zm_json_get_float(const ZMJSON& json, const char* kname, double default_value = 0.0);
+double zm_json_get_float(const ZMJSON& json, std::string_view kname, double default_value = 0.0);
 
 /**
  * @brief 从 JSON 对象中读取布尔值
@@ -86,7 +87,7 @@ double zm_json_get_float(const ZMJSON& json, const char* kname, double default_v
  * @param default_value 字段不存在或类型不匹配时的默认返回值
  * @return 解析后的 bool 值，或 default_value
  */
-bool zm_json_get_bool(const ZMJSON& json, const char* kname, bool default_value = false);
+bool zm_json_get_bool(const ZMJSON& json, std::string_view kname, bool default_value = false);
 
 /**
  * @brief 安全检查 JSON 对象中是否存在指定字段
@@ -97,7 +98,7 @@ bool zm_json_get_bool(const ZMJSON& json, const char* kname, bool default_value 
  * @param kname 字段名
  * @return 存在返回 true，不存在或 json 非 object 返回 false
  */
-bool zm_json_has(const ZMJSON& json, const char* kname);
+bool zm_json_has(const ZMJSON& json, std::string_view kname);
 
 /**
  * @brief 安全获取 JSON 数组或对象的元素个数
@@ -115,7 +116,7 @@ size_t zm_json_size(const ZMJSON& json);
  * @param obj   JSON 对象（必须为 object 类型）
  * @param name  要删除的字段名
  */
-void zm_json_erase(ZMJSON& obj, const char* name);
+void zm_json_erase(ZMJSON& obj, std::string_view name);
 
 /**
  * @brief 将 JSON 对象序列化为字符串
@@ -199,7 +200,7 @@ inline T zm_json_get_path(const ZMJSON& json, const std::string& path, T default
  * @return 包含数组元素的 std::vector<T>
  */
 template<typename T>
-inline std::vector<T> zm_json_get_array(const ZMJSON& json, const char* kname, std::vector<T> default_value = {})
+inline std::vector<T> zm_json_get_array(const ZMJSON& json, std::string_view kname, std::vector<T> default_value = {})
 {
     if (!json.is_object() || !json.contains(kname)) return default_value;
     const ZMJSON& node = json[kname];
@@ -222,7 +223,7 @@ inline std::vector<T> zm_json_get_array(const ZMJSON& json, const char* kname, s
  * @param value 要写入的值（支持 nlohmann::json 可接受的任意类型）
  */
 template<typename T>
-inline void zm_json_set(ZMJSON& obj, const char* kname, const T& value)
+inline void zm_json_set(ZMJSON& obj, std::string_view kname, const T& value)
 {
     if (obj.is_null()) obj = ZMJSON::object();
     obj[kname] = value;

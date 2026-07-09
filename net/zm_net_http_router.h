@@ -35,6 +35,7 @@
 
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <map>
 #include <memory>
@@ -80,15 +81,15 @@ public:
     // ---- 路由注册 ----
 
     /** @brief 注册 GET 路由 */
-    void Get(const char* pattern, Handler h);
+    void Get(std::string_view pattern, Handler h);
     /** @brief 注册 POST 路由 */
-    void Post(const char* pattern, Handler h);
+    void Post(std::string_view pattern, Handler h);
     /** @brief 注册 PUT 路由 */
-    void Put(const char* pattern, Handler h);
+    void Put(std::string_view pattern, Handler h);
     /** @brief 注册 DELETE 路由 */
-    void Delete(const char* pattern, Handler h);
+    void Delete(std::string_view pattern, Handler h);
     /** @brief 注册匹配任意 HTTP 方法的路由 */
-    void Any(const char* pattern, Handler h);
+    void Any(std::string_view pattern, Handler h);
 
     /**
      * @brief 创建路由分组（共享前缀）
@@ -102,7 +103,7 @@ public:
      *   admin.Get("/dashboard", dashboardHandler);
      * @endcode
      */
-    ZmHttpRouter& Group(const char* prefix);
+    ZmHttpRouter& Group(std::string_view prefix);
 
     // ---- 请求分发 ----
 
@@ -124,7 +125,7 @@ public:
      *
      * 仅在 Handler 中调用有效。底层用 thread_local 存储，线程安全。
      */
-    static std::string GetParam(const char* name);
+    static std::string GetParam(std::string_view name);
 
 private:
     // ---- 路由树节点 ----
@@ -149,7 +150,7 @@ private:
      *  @param pattern   路径模式（"/api/users/:id"）
      *  @param h         处理器
      *  @param groupMWs  分组中间件（来自 Group() 创建的子路由器） */
-    void AddRoute(const char* method, const char* pattern, Handler h,
+    void AddRoute(std::string_view method, std::string_view pattern, Handler h,
                   const std::vector<Middleware>& groupMWs = {});
 
     /**

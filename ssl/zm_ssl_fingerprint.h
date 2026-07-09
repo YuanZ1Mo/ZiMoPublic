@@ -5,6 +5,7 @@
 #include "../util/zm_util_container.h"
 
 #include <mutex>
+#include <string_view>
 
 // OpenSSL 结构体前向声明（头文件中仅通过指针使用）
 struct ssl_st;
@@ -116,7 +117,7 @@ public:
      * ZmSSLFingerprint::instance()->Put("", 0, "");
      * @endcode
      */
-    ZM_PEER_ADDR* Put(const char* host, uint16_t port, const char* fingerprint, const char* digest = "sha1");
+    ZM_PEER_ADDR* Put(std::string_view host, uint16_t port, std::string_view fingerprint, std::string_view digest = "sha1");
 
     /**
      * @brief 通过 socket fd 和 SSL 连接校验服务器证书指纹（白名单模式）
@@ -147,7 +148,7 @@ public:
      * bool ok = ZmSSLFingerprint::instance()->Validate(ssl, "A1:B2:C3:D4:...");
      * @endcode
      */
-    bool Validate(SSL* ssl, const char* fingerprint);
+    bool Validate(SSL* ssl, std::string_view fingerprint);
 
 private:
     // === Private ===
@@ -157,7 +158,7 @@ private:
      * @param pembuf PEM 编码的证书数据
      * @param pemlen PEM 数据长度
      */
-    void                DumpCertBuffer(const char* pembuf, size_t pemlen);
+    void                DumpCertBuffer(std::string_view pembuf, size_t pemlen);
 
     /**
      * @brief 打印 X509 证书的 SHA1 指纹到日志（调试用）
@@ -171,7 +172,7 @@ private:
      * @param port       端口号
      * @return 找到则返回记录指针；未找到返回 NULL
      */
-    ZM_SSL_FINGERPRINT*  QueryByHostame(const char* servername, uint16_t port);
+    ZM_SSL_FINGERPRINT*  QueryByHostame(std::string_view servername, uint16_t port);
 
     /**
      * @brief 按对端 IP 地址 + port 查找指纹记录

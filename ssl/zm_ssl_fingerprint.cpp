@@ -88,42 +88,41 @@ ZmSSLFingerprint::~ZmSSLFingerprint()
  * @param digest      摘要算法名称，目前仅支持 "sha1"（默认 "sha1"）
  * @return 非空指针 指向该记录的地址信息；NULL 参数无效、指纹长度不足、DNS 解析失败或指纹数已满
  */
-ZM_PEER_ADDR* ZmSSLFingerprint::Put(const char* host, uint16_t port, const char* fingerprint, const char* digest)
+ZM_PEER_ADDR* ZmSSLFingerprint::Put(std::string_view host, uint16_t port, std::string_view fingerprint, std::string_view digest)
 {
     PUBLIC_LOG_INFO("Put a remote server certificate fingerprint: addr={}:{}, fingerprint={}", host, port, fingerprint);
     std::unique_lock<std::mutex> lock(m_mutex);
-    if (!ZmString::IsEmpty(host))
+    if (!ZmString::IsEmpty(host.data()))
     {
-        if (ZmString::IsEmpty(digest) || 0 != strcmp(digest, "sha1"))
+        if (ZmString::IsEmpty(digest.data()) || digest != "sha1")
         {
-            PUBLIC_LOG_WARN("Put fingerprint: only sha1 digest is supported, ignored digest={}", digest ? digest : "(null)");
+            PUBLIC_LOG_WARN("Put fingerprint: only sha1 digest is supported, ignored digest={}", digest);
         }
 
         // 从 fingerprint 字符串中提取前 40 个十六进制字符（过滤冒号等非 HEX 字符）
         ZmByteBuffer str(64);
         size_t sha1len = SHA_DIGEST_LENGTH * 2;
         size_t i = 0;
-        char* ptr = const_cast<char*>(fingerprint);
-        while (i < sha1len && *ptr)
+        for (size_t pi = 0; i < sha1len && pi < fingerprint.size(); pi++)
         {
-            if (zm_is_hex_char(*ptr))
+            if (zm_is_hex_char(fingerprint[pi]))
             {
-                str[i++] = *ptr;
+                str[i++] = fingerprint[pi];
             }
-            ptr++;
         }
 
         if (strlen(str.Str()) >= sha1len)
         {
+            std::string hostStr(host);
             ZM_SSL_FINGERPRINT* fp = QueryByHostame(host, port);
             ZM_IP_ADDR          ip = { 0 };
             // 短路求值：若 hostname 已有记录则跳过 DNS 解析，否则尝试 DNS 解析获取 IP
-            if (fp || ZmNetDNS::GetHostIPByName(&ip, host, port))
+            if (fp || ZmNetDNS::GetHostIPByName(&ip, hostStr.c_str(), port))
             {
                 if (!fp)
                 {
                     fp = m_fingerprints.Add();
-                    snprintf(fp->hostname, sizeof(fp->hostname), "%s", host);
+                    snprintf(fp->hostname, sizeof(fp->hostname), "%s", hostStr.c_str());
                     memcpy(&fp->addr.ip, &ip, sizeof(ZM_IP_ADDR));
                     fp->addr.port = port;
                 }
@@ -238,22 +237,20 @@ bool ZmSSLFingerprint::Validate(evutil_socket_t fd, SSL* ssl, const char* host, 
  * @param fingerprint 待比对的指纹字符串，支持含冒号分隔的格式
  * @return true 指纹匹配；false ssl 为空、fingerprint 为空、指纹长度不足或不匹配
  */
-bool ZmSSLFingerprint::Validate(SSL* ssl, const char* fingerprint)
+bool ZmSSLFingerprint::Validate(SSL* ssl, std::string_view fingerprint)
 {
-    if (ssl && NULL != fingerprint)
+    if (ssl && !fingerprint.empty())
     {
         // 从 fingerprint 字符串中提取前 40 个十六进制字符（过滤冒号等非 HEX 字符）
         ZmByteBuffer hex(64);
         size_t sha1len = SHA_DIGEST_LENGTH * 2;
         size_t i = 0;
-        char* ptr = const_cast<char*>(fingerprint);
-        while (i < sha1len && *ptr)
+        for (size_t pi = 0; i < sha1len && pi < fingerprint.size(); pi++)
         {
-            if (zm_is_hex_char(*ptr))
+            if (zm_is_hex_char(fingerprint[pi]))
             {
-                hex[i++] = *ptr;
+                hex[i++] = fingerprint[pi];
             }
-            ptr++;
         }
         if (strlen(hex.Str()) >= sha1len)
         {
@@ -273,9 +270,9 @@ bool ZmSSLFingerprint::Validate(SSL* ssl, const char* fingerprint)
  * @param pembuf PEM 编码的证书数据
  * @param pemlen PEM 数据长度
  */
-void ZmSSLFingerprint::DumpCertBuffer(const char* pembuf, size_t pemlen)
+void ZmSSLFingerprint::DumpCertBuffer(std::string_view pembuf, size_t pemlen)
 {
-    BIO* bio = BIO_new_mem_buf((void*)pembuf, (int)pemlen);
+    BIO* bio = BIO_new_mem_buf((void*)pembuf.data(), (int)pemlen);
     X509* cert = PEM_read_bio_X509(bio, NULL, NULL, NULL);
     DumpCert(cert);
     if (cert)
@@ -318,12 +315,12 @@ void ZmSSLFingerprint::DumpCert(X509* cert)
  * @param port       端口号
  * @return 找到则返回记录指针；未找到返回 NULL
  */
-ZM_SSL_FINGERPRINT* ZmSSLFingerprint::QueryByHostame(const char* servername, uint16_t port)
+ZM_SSL_FINGERPRINT* ZmSSLFingerprint::QueryByHostame(std::string_view servername, uint16_t port)
 {
     for (size_t i = 0; i < m_fingerprints.Count(); i++)
     {
         ZM_SSL_FINGERPRINT* fp = m_fingerprints.At(i);
-        if (0 == strcmp(fp->hostname, servername) && fp->addr.port == port)
+        if (servername == fp->hostname && fp->addr.port == port)
         {
             return fp;
         }

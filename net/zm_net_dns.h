@@ -2,6 +2,7 @@
 #define ZM_NET_DNS_H
 
 #include "zm_net_ip.h"
+#include <string_view>
 
 #define ZM_DNS_TTL_MS    300000L     /** 300 秒内不做重复解析 */
 
@@ -260,7 +261,7 @@ public:
      * @param ttl      存活时间（毫秒）。传 0 表示永久有效（不过期），
      *                 默认使用 ZM_DNS_TTL_MS（300秒）
      */
-    static void        CacheUpdateTTL(const char* hostname, int64_t ttl = ZM_DNS_TTL_MS);
+    static void        CacheUpdateTTL(std::string_view hostname, int64_t ttl = ZM_DNS_TTL_MS);
 
     /**
      * @brief 将主机名和对应的地址存入 DNS 缓存
@@ -268,7 +269,7 @@ public:
      * @param hostname 主机名
      * @param sa       地址信息（支持 sockaddr_in 和 sockaddr_in6）
      */
-    static void        CachePut(const char* hostname, const struct sockaddr* sa);
+    static void        CachePut(std::string_view hostname, const struct sockaddr* sa);
 
     /**
      * @brief 从 DNS 缓存中查找主机名对应的地址
@@ -280,7 +281,7 @@ public:
      * @return 地址结构体长度（sizeof(sockaddr_in) 或 sizeof(sockaddr_in6)），
      *         返回 0 表示缓存未命中或已过期
      */
-    static socklen_t   CacheGet(const char* hostname, uint16_t port, struct sockaddr* sa, uint64_t now);
+    static socklen_t   CacheGet(std::string_view hostname, uint16_t port, struct sockaddr* sa, uint64_t now);
 
     /**
      * @brief 清空所有 DNS 缓存条目
@@ -292,14 +293,14 @@ public:
      *
      * @param hostname 知名主机名，如 "google.com"
      */
-    static void        AddWellKnownHost(const char* hostname);
+    static void        AddWellKnownHost(std::string_view hostname);
 
     /**
      * @brief 从知名主机列表中删除指定的主机名
      *
      * @param hostname 要删除的主机名
      */
-    static void        DelWellKnownHost(const char* hostname);
+    static void        DelWellKnownHost(std::string_view hostname);
 
     /**
      * @brief 清空所有知名主机名
@@ -314,7 +315,7 @@ public:
      * @param hostname 待判断的主机名
      * @return true 表示该主机名属于知名主机
      */
-    static bool        IsWellKnownHost(const char* hostname);
+    static bool        IsWellKnownHost(std::string_view hostname);
 
     /**
      * @brief 获取系统配置的 DNS 解析服务器地址（仅 IPv4）
@@ -441,7 +442,7 @@ public:
      *   sendto(sock, (char*)buf, len, 0, (sockaddr*)&dns_server, sizeof(dns_server));
      * @endcode
      */
-    static size_t BuildQuery(BYTE* udpdata, const char* hostname);
+    static size_t BuildQuery(BYTE* udpdata, std::string_view hostname);
 
     /**
      * @brief 构建 DNS 应答报文（Reply）
@@ -530,7 +531,7 @@ private:
      * @param hostanme 待编码的主机名
      * @return 写入的总字节数（含结尾的 '\0'）
      */
-    static size_t LabelPut(BYTE* dnsp, size_t offset, const char* hostanme);
+    static size_t LabelPut(BYTE* dnsp, size_t offset, std::string_view hostanme);
 
     /**
      * @brief 向 DNS 报文缓冲区写入一条资源记录（Resource Record）
@@ -544,7 +545,7 @@ private:
      * @param rdata  资源数据（如 IPv4 的 4 字节地址、IPv6 的 16 字节地址）
      * @return 写入的总字节数
      */
-    static size_t FieldRecordPut(BYTE* dnsp, size_t offset, const char* rname,
+    static size_t FieldRecordPut(BYTE* dnsp, size_t offset, std::string_view rname,
         uint16_t rtype, uint16_t rclass, uint16_t rdlen, const BYTE* rdata);
 
     /**
@@ -569,7 +570,7 @@ private:
      * @param addr     地址信息（通过 sa_family 判断 IPv4/IPv6）
      * @return 写入的总字节数
      */
-    static size_t FieldRecordPutARPA(BYTE* dnsp, size_t offset, const char* hostname, const struct sockaddr* addr);
+    static size_t FieldRecordPutARPA(BYTE* dnsp, size_t offset, std::string_view hostname, const struct sockaddr* addr);
 };
 
 #endif /* ZM_NET_DNS_H */

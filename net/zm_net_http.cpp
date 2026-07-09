@@ -46,45 +46,45 @@ void ZmHttpUtil::FreeRequest(ZM_HTTP_REQ* req)
     }
 }
 
-int ZmHttpUtil::ParseVerb(const char* method)
+int ZmHttpUtil::ParseVerb(std::string_view method)
 {
     // GET POST CONNECT PUT DELETE OPTIONS PATCH TRACE HEAD
-    if (strcmp(method, "GET") == 0) { return ZM_HTTP_VERB_GET; }
-    else if (strcmp(method, "POST") == 0) { return ZM_HTTP_VERB_POST; }
-    else if (strcmp(method, "CONNECT") == 0) { return ZM_HTTP_VERB_CONNECT; }
-    else if (strcmp(method, "PUT") == 0) { return ZM_HTTP_VERB_PUT; }
-    else if (strcmp(method, "DELETE") == 0) { return ZM_HTTP_VERB_DELETE; }
-    else if (strcmp(method, "OPTIONS") == 0) { return ZM_HTTP_VERB_OPTIONS; }
-    else if (strcmp(method, "PATCH") == 0) { return ZM_HTTP_VERB_PATCH; }
-    else if (strcmp(method, "TRACE") == 0) { return ZM_HTTP_VERB_TRACE; }
-    else if (strcmp(method, "HEAD") == 0) { return ZM_HTTP_VERB_HEAD; }
+    if (method == "GET") { return ZM_HTTP_VERB_GET; }
+    else if (method == "POST") { return ZM_HTTP_VERB_POST; }
+    else if (method == "CONNECT") { return ZM_HTTP_VERB_CONNECT; }
+    else if (method == "PUT") { return ZM_HTTP_VERB_PUT; }
+    else if (method == "DELETE") { return ZM_HTTP_VERB_DELETE; }
+    else if (method == "OPTIONS") { return ZM_HTTP_VERB_OPTIONS; }
+    else if (method == "PATCH") { return ZM_HTTP_VERB_PATCH; }
+    else if (method == "TRACE") { return ZM_HTTP_VERB_TRACE; }
+    else if (method == "HEAD") { return ZM_HTTP_VERB_HEAD; }
     return ZM_HTTP_VERB_NONE;
 }
 
-int ZmHttpUtil::StartWithVerbs(const char* buf)
+int ZmHttpUtil::StartWithVerbs(std::string_view buf)
 {
     // GET POST CONNECT PUT DELETE OPTIONS PATCH TRACE HEAD
-    if (strncmp(buf, "GET ", 4) == 0) { return ZM_HTTP_VERB_GET; }
-    else if (strncmp(buf, "POST ", 5) == 0) { return ZM_HTTP_VERB_POST; }
-    else if (strncmp(buf, "CONNECT ", 8) == 0) { return ZM_HTTP_VERB_CONNECT; }
-    else if (strncmp(buf, "PUT ", 4) == 0) { return ZM_HTTP_VERB_PUT; }
-    else if (strncmp(buf, "DELETE ", 7) == 0) { return ZM_HTTP_VERB_DELETE; }
-    else if (strncmp(buf, "OPTIONS ", 8) == 0) { return ZM_HTTP_VERB_OPTIONS; }
-    else if (strncmp(buf, "PATCH ", 6) == 0) { return ZM_HTTP_VERB_PATCH; }
-    else if (strncmp(buf, "TRACE ", 6) == 0) { return ZM_HTTP_VERB_TRACE; }
-    else if (strncmp(buf, "HEAD ", 5) == 0) { return ZM_HTTP_VERB_HEAD; }
+    if (buf.substr(0, 4) == "GET ") { return ZM_HTTP_VERB_GET; }
+    else if (buf.substr(0, 5) == "POST ") { return ZM_HTTP_VERB_POST; }
+    else if (buf.substr(0, 8) == "CONNECT ") { return ZM_HTTP_VERB_CONNECT; }
+    else if (buf.substr(0, 4) == "PUT ") { return ZM_HTTP_VERB_PUT; }
+    else if (buf.substr(0, 7) == "DELETE ") { return ZM_HTTP_VERB_DELETE; }
+    else if (buf.substr(0, 8) == "OPTIONS ") { return ZM_HTTP_VERB_OPTIONS; }
+    else if (buf.substr(0, 6) == "PATCH ") { return ZM_HTTP_VERB_PATCH; }
+    else if (buf.substr(0, 6) == "TRACE ") { return ZM_HTTP_VERB_TRACE; }
+    else if (buf.substr(0, 5) == "HEAD ") { return ZM_HTTP_VERB_HEAD; }
     return ZM_HTTP_VERB_NONE;
 }
 
 // code referers libevent source http.c evhttp_parse_request_line()
 // GET scheme:[//[user:password@]host[:port]][/]path[?query][#fragment] HTTP/1.1
-bool ZmHttpUtil::ParseRequest(ZM_HTTP_REQ* req, const char* line, int verb)
+bool ZmHttpUtil::ParseRequest(ZM_HTTP_REQ* req, std::string_view line, int verb)
 {
     char* method;
     char* uri;
     char* version;
 
-    ZmByteBuffer  heap(strlen(line), line);
+    ZmByteBuffer  heap(line.size(), line.data());
 
     char* reqline = heap.Str();
     /* Parse the request line */
@@ -136,9 +136,9 @@ bool ZmHttpUtil::ParseRequest(ZM_HTTP_REQ* req, const char* line, int verb)
  * http://[::FFFF:129.144.52.38]:80/index.html
  * http://[2010:836B:4179::836B:4179]
  */
-void ZmHttpUtil::ParseUri(ZM_HTTP_REQ* req, const char* uri_)
+void ZmHttpUtil::ParseUri(ZM_HTTP_REQ* req, std::string_view uri_)
 {
-    if (req == nullptr || uri_ == nullptr)
+    if (req == nullptr || uri_.empty())
     {
         return;
     }
@@ -152,7 +152,7 @@ void ZmHttpUtil::ParseUri(ZM_HTTP_REQ* req, const char* uri_)
     req->path = nullptr;
     req->useragent = nullptr;
 
-    ZmByteBuffer heap(strlen(uri_), uri_);
+    ZmByteBuffer heap(uri_.size(), uri_.data());
     char* uri = heap.Str();
 
     // scheme
@@ -280,11 +280,12 @@ void ZmHttpUtil::ParseUriPath(ZM_HTTP_URI* uri, char* path)
     }
 }
 
-const char* ZmHttpUtil::GetQuery(const ZM_HTTP_URI* uri, const char* name)
+const char* ZmHttpUtil::GetQuery(const ZM_HTTP_URI* uri, std::string_view name)
 {
     for (size_t i = 0; i < uri->qcnt; i++)
     {
-        if (strcmp(uri->query[i].name, name) == 0)
+        if (name.size() == strlen(uri->query[i].name) &&
+            strncmp(uri->query[i].name, name.data(), name.size()) == 0)
         {
             return uri->query[i].value ? uri->query[i].value : "";
         }
@@ -292,30 +293,30 @@ const char* ZmHttpUtil::GetQuery(const ZM_HTTP_URI* uri, const char* name)
     return "";
 }
 
-std::string ZmHttpUtil::HeaderGetValue(struct evkeyvalq* headers, const char* key, const char* defv)
+std::string ZmHttpUtil::HeaderGetValue(struct evkeyvalq* headers, std::string_view key, std::string_view defv)
 {
-    const char* val = evhttp_find_header(headers, key);
+    std::string keyStr(key);
+    const char* val = evhttp_find_header(headers, keyStr.c_str());
     return std::string(val ? val : defv);
 }
 
 /** 不破坏数据的情况下提取 Status-Code */
-int ZmHttpUtil::ParseStatusCode(const char* statusLine, const char* limit)
+int ZmHttpUtil::ParseStatusCode(std::string_view statusLine, std::string_view /*limit*/)
 {
     int statusCode = 0;
     // Status-Line = HTTP-Version SP Status-Code SP Reason-Phrase CRLF
-    const char* ptr = strchr(statusLine, ' ');
-    if (ptr && ptr < limit)
+    auto pos1 = statusLine.find(' ');
+    if (pos1 != std::string_view::npos)
     {
-        ptr++;
-        const char* endptr = strchr(ptr, ' ');
-        if (endptr && endptr < limit)
+        auto rest = statusLine.substr(pos1 + 1);
+        auto pos2 = rest.find(' ');
+        if (pos2 != std::string_view::npos)
         {
-            // The Status-Code element is a 3-digit integer result code
-            while (ptr < endptr)
+            auto codeStr = rest.substr(0, pos2);
+            for (char c : codeStr)
             {
-                if (*ptr < '0' || *ptr>'9' || statusCode > 1000) { return 0; }
-                statusCode = statusCode * 10 + (*ptr - '0');
-                ptr++;
+                if (c < '0' || c > '9' || statusCode > 1000) { return 0; }
+                statusCode = statusCode * 10 + (c - '0');
             }
         }
     }
@@ -407,10 +408,11 @@ uint64_t ZmHttpdTask::Id()
     return m_id;
 }
 
-const char* ZmHttpdTask::GetQueryValue(const char* name, const char* defv)
+const char* ZmHttpdTask::GetQueryValue(std::string_view name, std::string_view defv)
 {
-    const char* val = evhttp_find_header(&m_query, name);
-    return val ? val : defv;
+    std::string nameStr(name);
+    const char* val = evhttp_find_header(&m_query, nameStr.c_str());
+    return val ? val : defv.data();
 }
 
 void ZmHttpdTask::GetRequestHeaders(nlohmann::json::object_t& headersObj)
@@ -442,18 +444,19 @@ void ZmHttpdTask::GetRequestHeaders(nlohmann::json::object_t& headersObj)
     }
 }
 
-const char* ZmHttpdTask::GetRequestHeader(const char* name, const char* defv)
+const char* ZmHttpdTask::GetRequestHeader(std::string_view name, std::string_view defv)
 {
     const struct evkeyvalq* headers = evhttp_request_get_input_headers(m_request);
-    const char* val = evhttp_find_header(headers, name);
-    return val ? val : defv;
+    std::string nameStr(name);
+    const char* val = evhttp_find_header(headers, nameStr.c_str());
+    return val ? val : defv.data();
 }
 
-void ZmHttpdTask::PutReplyHeader(const char* name, const char* val)
+void ZmHttpdTask::PutReplyHeader(std::string_view name, std::string_view val)
 {
-    // val 为 nullptr 时存储空字符串，防止后续构造 string 时崩溃
+    // val 为空时存储空字符串，防止后续构造 string 时崩溃
     std::string key(name);
-    std::string value(val ? val : "");
+    std::string value(val);
 
     // 去重：key 和 value 都相同则跳过
     for (auto& [k, v] : m_reply_headers)
@@ -836,20 +839,20 @@ int ZmHttpHead::ContentLength()
     return value ? atoi(value) : 0;
 }
 
-void ZmHttpHead::Parse(const char* buf, size_t len, bool hasReqLine)
+void ZmHttpHead::Parse(std::string_view buf, size_t len, bool hasReqLine)
 {
     _entries.Clear();
     const char* hstr = nullptr;
     if (hasReqLine)
     {
-        hstr = strstr(buf, "\r\n");
+        hstr = strstr(buf.data(), "\r\n");
         _status_code = ZmHttpUtil::ParseStatusCode(buf, hstr);
-        len = len ? (len - (hstr - buf - 2)) : strlen(hstr);
+        len = len ? (len - (hstr - buf.data() - 2)) : strlen(hstr);
     }
     else
     {
-        hstr = buf;
-        len = len ? len : strlen(hstr);
+        hstr = buf.data();
+        len = len ? len : buf.size();
     }
     ZmByteBuffer str(len, hstr);
     char  delims[] = "\r\n";
@@ -917,11 +920,12 @@ void ZmHttpHead::PutAll(ZmHttpHead* other)
     }
 }
 
-ZmHttpHead::_ENTRY* ZmHttpHead::QueryEntry(const char* name)
+ZmHttpHead::_ENTRY* ZmHttpHead::QueryEntry(std::string_view name)
 {
+    std::string nameStr(name);
     for (size_t i = 0; i < _entries.Count(); i++)
     {
-        if (_stricmp(_entries.At(i)->name, name) == 0)
+        if (_stricmp(_entries.At(i)->name, nameStr.c_str()) == 0)
         {
             return _entries.At(i);
         }
@@ -958,11 +962,12 @@ const char* ZmHttpHead::Value(const char* name, const char* value)
     return entry ? entry->value : nullptr;
 }
 
-void ZmHttpHead::Remove(const char* name)
+void ZmHttpHead::Remove(std::string_view name)
 {
+    std::string nameStr(name);
     for (size_t i = 0; i < _entries.Count(); i++)
     {
-        if (_stricmp(_entries.At(i)->name, name) == 0)
+        if (_stricmp(_entries.At(i)->name, nameStr.c_str()) == 0)
         {
             _entries.Remove(i);
             return;
@@ -970,21 +975,22 @@ void ZmHttpHead::Remove(const char* name)
     }
 }
 
-void ZmHttpHead::SetHostField(const char* scheme, const char* host, uint16_t port)
+void ZmHttpHead::SetHostField(std::string_view scheme, std::string_view host, uint16_t port)
 {
     ZmByteBuffer temp(256);
-    bool isIPv6 = (AF_INET6 == ZmNetIP::Validate(host));
-    if ((strcmp(scheme, "http") == 0 && port != 80)
-        || (strcmp(scheme, "https") == 0 && port != 443)
-        || (strcmp(scheme, "ssl") == 0 && port != 443))
+    std::string hostStr(host);
+    bool isIPv6 = (AF_INET6 == ZmNetIP::Validate(hostStr.c_str()));
+    if ((scheme == "http" && port != 80)
+        || (scheme == "https" && port != 443)
+        || (scheme == "ssl" && port != 443))
     {
-        if (isIPv6) { temp.Sprintf("[%s]:%d", host, port); }
-        else { temp.Sprintf("%s:%d", host, port); }
+        if (isIPv6) { temp.Sprintf("[%s]:%d", hostStr.c_str(), port); }
+        else { temp.Sprintf("%s:%d", hostStr.c_str(), port); }
     }
     else
     {
-        if (isIPv6) { temp.Sprintf("[%s]", host); }
-        else { temp.Sprintf("%s", host); }
+        if (isIPv6) { temp.Sprintf("[%s]", hostStr.c_str()); }
+        else { temp.Sprintf("%s", hostStr.c_str()); }
     }
     Value("Host", temp.Str());
 }
@@ -1260,16 +1266,16 @@ bool ZmHttpServer::BindEventBase(struct event_base* evbase)
 
 // ============================ ZmJsonRpcServer ============================
 
-ZmJsonRpcServer::ZmJsonRpcServer(struct event_base* evbase, const char* root_uri, uint16_t local_port)
+ZmJsonRpcServer::ZmJsonRpcServer(struct event_base* evbase, std::string_view root_uri, uint16_t local_port)
     : ZmHttpServer(evbase, local_port)
 {
-    if (root_uri)
+    if (!root_uri.empty())
     {
-        snprintf(m_root_uri, sizeof(m_root_uri), "%s", root_uri);
+        snprintf(m_root_uri, sizeof(m_root_uri), "%.*s", (int)root_uri.size(), root_uri.data());
     }
     else
     {
-        // root_uri 为 nullptr 时清零，后续 ZmString::IsEmpty 返回 404，
+        // root_uri 为空时清零，后续 ZmString::IsEmpty 返回 404，
         // 使 OnHttpdRequest 中所有请求都走 JRPC 流程
         memset(m_root_uri, 0, sizeof(m_root_uri));
         PUBLIC_LOG_INFO("You haven't set the root_uri for HTTP_SERVER, so all requests will return a 404 error");
@@ -1282,7 +1288,7 @@ ZmJsonRpcServer::ZmJsonRpcServer(struct event_base* evbase, const char* root_uri
 ZmJsonRpcServer::~ZmJsonRpcServer()
 {}
 
-ZMJSON ZmJsonRpcServer::MakeError(int code, const char* message)
+ZMJSON ZmJsonRpcServer::MakeError(int code, std::string_view message)
 {
     return ZMJSON{ {"code", code}, {"message", message} };
 }

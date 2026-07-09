@@ -38,7 +38,7 @@ void ZM_TAP_CTX::SetTapContext(ZmTapContext* pTapContext)
     }
 }
 
-void ZM_TAP_CTX::Drop(const char* reason)
+void ZM_TAP_CTX::Drop(std::string_view reason)
 {
     if (tap_context)
     {
@@ -100,7 +100,7 @@ void ZmTapContext::Clear()
     m_free_stack.clear();
 }
 
-void ZmTapContext::Drop(ZM_TAP_CTX* tap, const char* reason)
+void ZmTapContext::Drop(ZM_TAP_CTX* tap, std::string_view reason)
 {
     if (!tap) return;
 
@@ -575,23 +575,23 @@ std::map < std::string, ContextEventHandlerParams>
 ZmTapContextEventHandler::m_registry;
 
 void ZmTapContextEventHandler::RegistryContextEventHandler(
-    const char* name, ZmTapContext* ctx, void* delegate)
+    std::string_view name, ZmTapContext* ctx, void* delegate)
 {
-    if (name && ctx)
-        m_registry[name] = { ctx, delegate };
+    if (!name.empty() && ctx)
+        m_registry[std::string(name)] = { ctx, delegate };
 }
 
-void ZmTapContextEventHandler::UnregistryContextEventHandler(const char* name)
+void ZmTapContextEventHandler::UnregistryContextEventHandler(std::string_view name)
 {
-    if (name)
-        m_registry.erase(name);
+    if (!name.empty())
+        m_registry.erase(std::string(name));
 }
 
-ContextEventHandlerParams* ZmTapContextEventHandler::FindContextEventHandler(const char* name)
+ContextEventHandlerParams* ZmTapContextEventHandler::FindContextEventHandler(std::string_view name)
 {
-    if (!name)
+    if (name.empty())
         return nullptr;
-    auto it = m_registry.find(name);
+    auto it = m_registry.find(std::string(name));
     return (it != m_registry.end()) ? &it->second : nullptr;
 }
 
@@ -765,10 +765,10 @@ bool ZmTapContextEventHandler::OnPairAcceptBev(ContextEventHandlerParams* params
     return true;
 }
 
-bool ZmTapContextEventHandler::OnPairAcceptBev(const char* name, struct bufferevent* bev,
+bool ZmTapContextEventHandler::OnPairAcceptBev(std::string_view name, struct bufferevent* bev,
                                                 struct sockaddr* address, ZmBuffereventPairHandle* handle)
 {
-    auto it = m_registry.find(name);
+    auto it = m_registry.find(std::string(name));
     if (it != m_registry.end())
         return OnPairAcceptBev(&it->second, bev, address, handle);
 

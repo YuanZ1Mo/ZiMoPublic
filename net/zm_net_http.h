@@ -23,6 +23,7 @@
 #include <../libevent/include/event2/event.h>
 
 #include <stdint.h>
+#include <string_view>
 
 #define JRPC_VERSION "2.0"
 
@@ -159,25 +160,25 @@ public:
     ~ZmHttpUtil() {}
 
     /** Parse the HTTP verbs by the method name, like as 'GET'->ZM_HTTP_VERB_GET */
-    static int          ParseVerb(const char* method);
+    static int          ParseVerb(std::string_view method);
     /** Parse the HTTP request first line and return the verbs type */
-    static int          StartWithVerbs(const char* buf);
+    static int          StartWithVerbs(std::string_view buf);
     /** Parse the HTTP request first line */
-    static bool         ParseRequest(ZM_HTTP_REQ* req, const char* line, int verb = 0);
+    static bool         ParseRequest(ZM_HTTP_REQ* req, std::string_view line, int verb = 0);
     /** Parse a HTTP request url */
-    static void         ParseUri(ZM_HTTP_REQ* req, const char* uri);
+    static void         ParseUri(ZM_HTTP_REQ* req, std::string_view uri);
     /** Parse Path part of HTTP request url */
     static void         ParseUriPath(ZM_HTTP_URI* uri, char* path);
     /** Get query value by name from Query part of URL */
-    static const char* GetQuery(const ZM_HTTP_URI* uri, const char* name);
+    static const char* GetQuery(const ZM_HTTP_URI* uri, std::string_view name);
 
     static ZM_HTTP_REQ* CreateRequest();
     static void         FreeRequest(ZM_HTTP_REQ* req);
 
-    static std::string  HeaderGetValue(struct evkeyvalq* headers, const char* key, const char* defv = "");
+    static std::string  HeaderGetValue(struct evkeyvalq* headers, std::string_view key, std::string_view defv = "");
 
     /** Parse Status-Code from Status-Line */
-    static int          ParseStatusCode(const char* statusLine, const char* limit);
+    static int          ParseStatusCode(std::string_view statusLine, std::string_view limit);
 };
 
 
@@ -238,7 +239,7 @@ public:
      *   const char* page  = task->GetQueryValue("page", "1");   // "1"（未传时使用默认值）
      * @endcode
      */
-    const char* GetQueryValue(const char* name, const char* defv = "");
+    const char* GetQueryValue(std::string_view name, std::string_view defv = "");
 
     /**
      * @brief 将所有请求头导出为 JSON 对象
@@ -259,7 +260,7 @@ public:
      * @param defv   请求头不存在时的默认返回值
      * @return       请求头值字符串指针，内部缓冲区
      */
-    const char* GetRequestHeader(const char* name, const char* defv = "");
+    const char* GetRequestHeader(std::string_view name, std::string_view defv = "");
 
     /**
      * @brief 设置响应头（延迟到发送响应时写入）
@@ -268,7 +269,7 @@ public:
      *
      * @note 可在 SendReply 之前多次调用，同名字段会被覆盖
      */
-    void PutReplyHeader(const char* name, const char* val);
+    void PutReplyHeader(std::string_view name, std::string_view val);
 
     /**
      * @brief 设置响应状态码和原因短语
@@ -398,15 +399,15 @@ public:
     int         StatusCode();
     int         ContentLength();
 
-    void        Parse(const char* buf, size_t len, bool hasReqLine = false);
+    void        Parse(std::string_view buf, size_t len, bool hasReqLine = false);
     void        Build(ZmByteBuffer& output);
     void        BuildToBuffer(struct evbuffer* buf);
     void        PutAll(ZmHttpHead* other);
 
     const char* PutValue(const char* name, const char* fmt, ...);
     const char* Value(const char* name, const char* value = nullptr);
-    void        Remove(const char* name);
-    void        SetHostField(const char* scheme, const char* host, uint16_t port);
+    void        Remove(std::string_view name);
+    void        SetHostField(std::string_view scheme, std::string_view host, uint16_t port);
 
     bool        IsEmpty();
 
@@ -416,7 +417,7 @@ private:
         char* name;
         char* value;
     }_ENTRY;
-    ZmHttpHead::_ENTRY* QueryEntry(const char* name);
+    ZmHttpHead::_ENTRY* QueryEntry(std::string_view name);
 
 private:
     int                 _status_code;
@@ -687,7 +688,7 @@ public:
      * @param root_uri    RPC 请求的 URI 前缀，仅匹配此前缀的请求走 RPC 流程，为空或 nullptr 时所有请求走 RPC
      * @param local_port  监听端口号
      */
-    ZmJsonRpcServer(struct event_base* evbase, const char* root_uri, uint16_t local_port);
+    ZmJsonRpcServer(struct event_base* evbase, std::string_view root_uri, uint16_t local_port);
 
     /** @brief 析构 */
     virtual ~ZmJsonRpcServer();
@@ -703,7 +704,7 @@ public:
      *   error = ZmJsonRpcServer::MakeError(-32601, "Method not found");
      * @endcode
      */
-    static ZMJSON MakeError(int code, const char* message);
+    static ZMJSON MakeError(int code, std::string_view message);
 
     /**
      * @brief 设置 JSON-RPC 同步请求回调

@@ -28,16 +28,20 @@ ZmHttpRouter::~ZmHttpRouter() = default;
 // ============================================================================
 
 /** @brief 将 "/api/users/:id" 拆分为 ["api", "users", ":id"] */
-static std::vector<std::string> SplitPath(const char* pattern)
+static std::vector<std::string> SplitPath(std::string_view pattern)
 {
     std::vector<std::string> segs;
-    if (pattern == nullptr || pattern[0] == '\0')
+    if (pattern.empty())
+        return segs;
+
+    // 去掉开头 /
+    if (pattern[0] == '/')
+        pattern = pattern.substr(1);
+
+    if (pattern.empty())
         return segs;
 
     std::string p(pattern);
-    // 去掉开头 /
-    if (!p.empty() && p[0] == '/')
-        p = p.substr(1);
 
     if (p.empty())
         return segs;
@@ -56,7 +60,7 @@ static std::vector<std::string> SplitPath(const char* pattern)
 // 路由注册
 // ============================================================================
 
-void ZmHttpRouter::AddRoute(const char* method, const char* pattern, Handler h,
+void ZmHttpRouter::AddRoute(std::string_view method, std::string_view pattern, Handler h,
                              const std::vector<Middleware>& groupMWs)
 {
     auto segs = SplitPath(pattern);
@@ -85,7 +89,7 @@ void ZmHttpRouter::AddRoute(const char* method, const char* pattern, Handler h,
     }
 
     // 在叶子节点存储处理器
-    node->handlers[method] = h;
+    node->handlers[std::string(method)] = h;
 
     // 合并分组中间件到此节点
     if (!groupMWs.empty())
@@ -95,12 +99,12 @@ void ZmHttpRouter::AddRoute(const char* method, const char* pattern, Handler h,
     }
 }
 
-void ZmHttpRouter::Get(const char* pattern, Handler h)
+void ZmHttpRouter::Get(std::string_view pattern, Handler h)
 {
     if (m_parent)
     {
-        std::string fullPath = m_groupPrefix + pattern;
-        m_parent->AddRoute("GET", fullPath.c_str(), h, m_globalMiddlewares);
+        std::string fullPath = m_groupPrefix + std::string(pattern);
+        m_parent->AddRoute("GET", fullPath, h, m_globalMiddlewares);
     }
     else
     {
@@ -108,12 +112,12 @@ void ZmHttpRouter::Get(const char* pattern, Handler h)
     }
 }
 
-void ZmHttpRouter::Post(const char* pattern, Handler h)
+void ZmHttpRouter::Post(std::string_view pattern, Handler h)
 {
     if (m_parent)
     {
-        std::string fullPath = m_groupPrefix + pattern;
-        m_parent->AddRoute("POST", fullPath.c_str(), h, m_globalMiddlewares);
+        std::string fullPath = m_groupPrefix + std::string(pattern);
+        m_parent->AddRoute("POST", fullPath, h, m_globalMiddlewares);
     }
     else
     {
@@ -121,12 +125,12 @@ void ZmHttpRouter::Post(const char* pattern, Handler h)
     }
 }
 
-void ZmHttpRouter::Put(const char* pattern, Handler h)
+void ZmHttpRouter::Put(std::string_view pattern, Handler h)
 {
     if (m_parent)
     {
-        std::string fullPath = m_groupPrefix + pattern;
-        m_parent->AddRoute("PUT", fullPath.c_str(), h, m_globalMiddlewares);
+        std::string fullPath = m_groupPrefix + std::string(pattern);
+        m_parent->AddRoute("PUT", fullPath, h, m_globalMiddlewares);
     }
     else
     {
@@ -134,12 +138,12 @@ void ZmHttpRouter::Put(const char* pattern, Handler h)
     }
 }
 
-void ZmHttpRouter::Delete(const char* pattern, Handler h)
+void ZmHttpRouter::Delete(std::string_view pattern, Handler h)
 {
     if (m_parent)
     {
-        std::string fullPath = m_groupPrefix + pattern;
-        m_parent->AddRoute("DELETE", fullPath.c_str(), h, m_globalMiddlewares);
+        std::string fullPath = m_groupPrefix + std::string(pattern);
+        m_parent->AddRoute("DELETE", fullPath, h, m_globalMiddlewares);
     }
     else
     {
@@ -147,12 +151,12 @@ void ZmHttpRouter::Delete(const char* pattern, Handler h)
     }
 }
 
-void ZmHttpRouter::Any(const char* pattern, Handler h)
+void ZmHttpRouter::Any(std::string_view pattern, Handler h)
 {
     if (m_parent)
     {
-        std::string fullPath = m_groupPrefix + pattern;
-        m_parent->AddRoute("*", fullPath.c_str(), h, m_globalMiddlewares);
+        std::string fullPath = m_groupPrefix + std::string(pattern);
+        m_parent->AddRoute("*", fullPath, h, m_globalMiddlewares);
     }
     else
     {
@@ -165,7 +169,7 @@ void ZmHttpRouter::Use(Middleware mw)
     m_globalMiddlewares.push_back(std::move(mw));
 }
 
-ZmHttpRouter& ZmHttpRouter::Group(const char* prefix)
+ZmHttpRouter& ZmHttpRouter::Group(std::string_view prefix)
 {
     auto child = std::make_unique<ZmHttpRouter>();
     child->m_parent = this;
@@ -365,9 +369,9 @@ int ZmHttpRouter::ExecuteChain(ZmHttpdTask* task, const BYTE* data, size_t dlen,
 // 路径参数
 // ============================================================================
 
-std::string ZmHttpRouter::GetParam(const char* name)
+std::string ZmHttpRouter::GetParam(std::string_view name)
 {
-    auto it = t_params.find(name);
+    auto it = t_params.find(std::string(name));
     return (it != t_params.end()) ? it->second : std::string();
 }
 

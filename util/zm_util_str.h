@@ -4,6 +4,7 @@
 #include "zm_util_container.h"
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 typedef unsigned char BYTE;
@@ -126,14 +127,14 @@ public:
      *   ZmString::IsNumeric("12345");   // true
      *   ZmString::IsNumeric("12a45");   // false
      */
-    static bool  IsNumeric(const char* str);
+    static bool  IsNumeric(std::string_view str);
 
     /**
      * @brief 判断字符串中是否包含扩展 ASCII 字符（值大于 127）
      * @param str 待检测的 C 字符串
      * @return true 表示包含扩展 ASCII 字符，false 表示不包含
      */
-    static bool  HasExtendedAscii(const char* str);
+    static bool  HasExtendedAscii(std::string_view str);
 
     /**
      * @brief 判断字节流是否为合法的 UTF-8 编码
@@ -149,7 +150,7 @@ public:
      * @param len 长度阈值
      * @return true 表示字符串长度大于 len，false 表示不大于
      */
-    static bool  LongerThan(const char* str, size_t len);
+    static bool  LongerThan(std::string_view str, size_t len);
 
     // ========================================================================
     // 大小写转换
@@ -171,7 +172,7 @@ public:
      * @example
      *   std::string s = ZmString::LowerEx("Hello World"); // s == "hello world"
      */
-    static std::string LowerEx(const char* str);
+    static std::string LowerEx(std::string_view str);
 
     /**
      * @brief 将 std::string 中的所有字符原地转换为大写
@@ -189,7 +190,7 @@ public:
      * @example
      *   std::string s = ZmString::UpperEx("Hello World"); // s == "HELLO WORLD"
      */
-    static std::string UpperEx(const char* str);
+    static std::string UpperEx(std::string_view str);
 
     // ========================================================================
     // 格式化与转换
@@ -230,7 +231,7 @@ public:
      *   ZmString::Find("hello world", "world");       // 6
      *   ZmString::Find("hello world", "world", 7);    // -1
      */
-    static int   Find(const char* haystack, const char* needle, size_t offset = 0);
+    static int   Find(std::string_view haystack, std::string_view needle, size_t offset = 0);
 
     /**
      * @brief 从右向左在 haystack 中查找单个字符 needle 最后一次出现的位置
@@ -240,7 +241,7 @@ public:
      * @example
      *   ZmString::RFind("a/b/c/d", '/');  // 5
      */
-    static int   RFind(const char* haystack, const char needle);
+    static int   RFind(std::string_view haystack, const char needle);
 
     /**
      * @brief 在 haystack 中查找 needle 首次出现的位置（等同于从偏移 0 开始的 Find）
@@ -248,7 +249,7 @@ public:
      * @param needle   要查找的子串
      * @return 子串首次出现的起始索引；未找到时返回 -1
      */
-    static int   Pos(const char* haystack, const char* needle);
+    static int   Pos(std::string_view haystack, std::string_view needle);
 
     /**
      * @brief 判断 base 字符串是否以 head 字符串开头
@@ -259,7 +260,7 @@ public:
      *   ZmString::StartsWith("hello world", "hello");  // true
      *   ZmString::StartsWith("hello world", "world");  // false
      */
-    static bool  StartsWith(const char* base, const char* head);
+    static bool  StartsWith(std::string_view base, std::string_view head);
 
     /**
      * @brief 判断 base 字符串是否以 tail 字符串结尾
@@ -270,7 +271,7 @@ public:
      *   ZmString::EndsWith("hello world", "world");  // true
      *   ZmString::EndsWith("hello world", "hello");  // false
      */
-    static bool  EndsWith(const char* base, const char* tail);
+    static bool  EndsWith(std::string_view base, std::string_view tail);
 
     /**
      * @brief 通配符匹配，支持 '*'（匹配任意序列）和 '?'（匹配单个字符）
@@ -282,7 +283,7 @@ public:
      *   ZmString::WildcardMatch("test.txt", "*.txt");         // true
      *   ZmString::WildcardMatch("abc", "a?c");                // true
      */
-    static bool  WildcardMatch(const char* subject, const char* pattern);
+    static bool  WildcardMatch(std::string_view subject, std::string_view pattern);
 
     // ========================================================================
     // 裁剪与替换
@@ -327,7 +328,7 @@ public:
      *   // deep=true:  "ok"->"k" 时 "123oookkk"->"123kkk"（替换产生的 "ok" 会被再次替换）
      *   // deep=false: "ok"->"k" 时 "123oookkk"->"123ookkk"（跳过已替换部分，不二次匹配）
      */
-    static void Replace(const char* search, const char* replace, std::string& subject, bool deep = false);
+    static void Replace(std::string_view search, std::string_view replace, std::string& subject, bool deep = false);
 
     // ========================================================================
     // 编码转换
@@ -338,7 +339,7 @@ public:
      * @param output 转换结果输出缓冲区
      * @param astr   输入的 ASCII 字符串
      */
-    static void   Ascii_To_UTF8(ZmByteBuffer& output, const char* astr);
+    static void   Ascii_To_UTF8(ZmByteBuffer& output, std::string_view astr);
 
     /**
     * @brief 将 ASCII 字符串转换为 Unicode 宽字符串
@@ -347,7 +348,7 @@ public:
     * @param len    输入字符串长度，为 0 时自动计算
     * @return 转换后的宽字符数量
     */
-    static size_t Ascii_To_Unicode(ZmByteBuffer& output, const char* astr, size_t len = 0);
+    static size_t Ascii_To_Unicode(ZmByteBuffer& output, std::string_view astr, size_t len = 0);
 
     /**
      * @brief 将 Unicode 宽字符串转换为 ASCII 编码
@@ -378,7 +379,7 @@ public:
      * @param utf8   输入的 UTF-8 字符串
      * @param len    输入字符串长度，为 0 时自动计算
      */
-    static void   UTF8_To_Ascii(ZmByteBuffer& output, const char* utf8, size_t len = 0);
+    static void   UTF8_To_Ascii(ZmByteBuffer& output, std::string_view utf8, size_t len = 0);
 
     /**
      * @brief 将 UTF-8 编码字符串转换为 Unicode 宽字符串
@@ -386,7 +387,7 @@ public:
      * @param utf8   输入的 UTF-8 字符串
      * @param len    输入字符串长度，为 0 时自动计算
      */
-    static void   UTF8_To_Unicode(ZmByteBuffer& output, const char* utf8, size_t len = 0);
+    static void   UTF8_To_Unicode(ZmByteBuffer& output, std::string_view utf8, size_t len = 0);
 
     /**
      * @brief UTF-8 字符串转宽字符串
@@ -401,7 +402,7 @@ public:
      * @param utf8   输入的 UTF-8 字符串
      * @param len    输入字符串长度，为 0 时自动计算
      */
-    static void   UTF8_To_Ansi(ZmByteBuffer& output, const char* utf8, size_t len = 0);
+    static void   UTF8_To_Ansi(ZmByteBuffer& output, std::string_view utf8, size_t len = 0);
 
     /**
      * @brief 将字符串中的十六进制转义序列（\xNN）还原为对应字符
@@ -412,7 +413,7 @@ public:
      *   // 还原为 "三未3308000000\1\2\3000"
      *   ZmString::OptimizeHexMixed("\\xE4\\xB8\\x89\\xE6\\x9C\\xAA3308...", buf);
      */
-    static void   OptimizeHexMixed(const char* hexmixed, char* output = NULL);
+    static void   OptimizeHexMixed(std::string_view hexmixed, char* output = NULL);
 
     // ========================================================================
     // 编解码（Hex / URL / Base64 / Base32）
@@ -440,7 +441,7 @@ public:
      * @param inlen  输入字符串长度，为 0 时自动计算
      * @return 转换后的二进制数据字节数
      */
-    static size_t FromHex(const char* input, BYTE* output, size_t inlen = 0);
+    static size_t FromHex(std::string_view input, BYTE* output, size_t inlen = 0);
 
     /**
      * @brief URL 编码，将特殊字符转换为 %XX 形式
@@ -448,7 +449,7 @@ public:
      * @param input  待编码的 URL 字符串
      * @return 编码后的字符串指针
      */
-    static char* URLEncode(ZmByteBuffer& output, const char* input);
+    static char* URLEncode(ZmByteBuffer& output, std::string_view input);
 
     /**
      * @brief URL 解码，将 %XX 形式还原为原始字符
@@ -456,7 +457,7 @@ public:
      * @param input  待解码的 URL 编码字符串
      * @return 解码后的字符串指针
      */
-    static char* URLDecode(ZmByteBuffer& output, const char* input);
+    static char* URLDecode(ZmByteBuffer& output, std::string_view input);
 
     /**
      * @brief URL 百分号解码（%XX → 原始字节，+ → 空格）
@@ -470,7 +471,7 @@ public:
      * @param str 待检查的字符串
      * @return true 表示合法，false 表示非法
      */
-    static bool  Base64Check(const char* str);
+    static bool  Base64Check(std::string_view str);
 
     /**
      * @brief Base64 编码，将二进制数据编码为 Base64 字符串
@@ -486,7 +487,7 @@ public:
      * @param str    Base64 编码的字符串
      * @param inLen  输入字符串长度，为 0 时自动计算
      */
-    static void  Base64Decode(ZmByteBuffer& output, const char* str, size_t inLen = 0);
+    static void  Base64Decode(ZmByteBuffer& output, std::string_view str, size_t inLen = 0);
 
     /**
      * @brief URL 安全的 Base64 编码（不使用 '+' 和 '/'，使用 '-' 和 '_'）
@@ -502,7 +503,7 @@ public:
      * @param str    Base64URL 编码的字符串
      * @param inLen  输入字符串长度，为 0 时自动计算
      */
-    static void        Base64URLDecode(ZmByteBuffer& output, const char* str, size_t inLen = 0);
+    static void        Base64URLDecode(ZmByteBuffer& output, std::string_view str, size_t inLen = 0);
 
     /**
      * @brief Base32 编码（字母表 ABCDEFGHIJKLMNOPQRSTUVWXYZ234567），空间膨胀比 8/5
@@ -520,7 +521,7 @@ public:
      * @param len     输入字符串长度，为 0 时自动计算
      * @return 解码后的数据长度，失败返回负值
      */
-    static int    Base32Decode(ZmByteBuffer& output, const char* encoded, size_t len = 0);
+    static int    Base32Decode(ZmByteBuffer& output, std::string_view encoded, size_t len = 0);
 
     // ========================================================================
     // 哈希与工具
@@ -531,7 +532,7 @@ public:
      * @param str 输入的 C 字符串
      * @return 32 位哈希值
      */
-    static uint32_t Hash(const char* str);
+    static uint32_t Hash(std::string_view str);
 
     /**
      * @brief 验证 Ticket 是否合法（64 位十六进制字符串），可同时去除空白并拷贝到输出缓冲区
@@ -543,7 +544,7 @@ public:
      *   ZmString::ValidateTicket("  0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789ABCDEF01  ", buf);
      *   // true, buf 中存放去空白后的 64 字符
      */
-    static bool  ValidateTicket(const char* ticket, char* output = NULL);
+    static bool  ValidateTicket(std::string_view ticket, char* output = NULL);
 
     /**
      * @brief PKCS5 填充，在数据末尾追加填充字节使其长度对齐到 block_size 的整数倍
@@ -592,7 +593,7 @@ private:
      * @param data         待编码的二进制数据
      * @param inLen        数据长度
      */
-    static void  base64EncodeImpl(const char* b64chars, size_t b64charsSize, ZmByteBuffer& output, const BYTE* data, size_t inLen);
+    static void  base64EncodeImpl(std::string_view b64chars, size_t b64charsSize, ZmByteBuffer& output, const BYTE* data, size_t inLen);
 
     /**
      * @brief Base64 解码的内部实现，使用自定义解码表
@@ -601,7 +602,7 @@ private:
      * @param str      Base64 编码字符串
      * @param inLen    输入字符串长度，为 0 时自动计算
      */
-    static void  base64DecodeImpl(const BYTE* b64table, ZmByteBuffer& output, const char* str, size_t inLen = 0);
+    static void  base64DecodeImpl(const BYTE* b64table, ZmByteBuffer& output, std::string_view str, size_t inLen = 0);
 };
 
 /** 用一个长 buffer 存放多个短字符串 */
@@ -653,21 +654,21 @@ public:
      * @param str    待拆分的字符串
      * @param delims 分隔符集合，默认为 NULL
      */
-    void   AddEntries(const char* str, const char* delims = NULL);
+    void   AddEntries(std::string_view str, const char* delims = NULL);
 
     /**
      * @brief 向列表中添加一个条目
      * @param str 字符串指针
      * @param len 字符串长度，为 0 时自动计算
      */
-    void   AddEntry(const char* str, size_t len = 0);
+    void   AddEntry(std::string_view str, size_t len = 0);
 
     /**
      * @brief 从列表中移除与指定字符串匹配的条目
      * @param str 要移除的字符串
      * @param len 字符串长度，为 0 时自动计算
      */
-    void   RemoveEntry(const char* str, size_t len = 0);
+    void   RemoveEntry(std::string_view str, size_t len = 0);
 
     /**
      * @brief 非重复添加条目，若已存在则不重复添加
@@ -675,14 +676,14 @@ public:
      * @param len 字符串长度，为 0 时自动计算
      * @return 新增加成功返回条目索引，已存在返回已有索引；str 为 NULL 时返回 NPOS
      */
-    size_t PutEntry(const char* str, size_t len = 0);
+    size_t PutEntry(std::string_view str, size_t len = 0);
 
     /**
      * @brief 查询指定字符串在列表中的索引
      * @param str 要查询的字符串
      * @return 条目索引；未找到时返回 NPOS
      */
-    size_t QueryEntry(const char* str);
+    size_t QueryEntry(std::string_view str);
 
     /**
      * @brief 移除列表中的所有条目
@@ -718,7 +719,7 @@ public:
      * @param options 命令行参数字符串，例如 "-f file.txt --name \"hello world\""
      * @note 内部使用 Windows CommandLineToArgvW 进行解析，回退到空格分隔
      */
-    void   ParseOptions(const char* options);
+    void   ParseOptions(std::string_view options);
 
 private:
     typedef struct

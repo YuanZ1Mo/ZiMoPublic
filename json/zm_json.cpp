@@ -11,7 +11,7 @@
 // zm_json_get_int
 // ============================================================================
 
-int zm_json_get_int(const ZMJSON& json, const char* kname, int default_value)
+int zm_json_get_int(const ZMJSON& json, std::string_view kname, int default_value)
 {
     if (!json.is_object() || !json.contains(kname)) return default_value;
     const ZMJSON& node = json[kname];
@@ -42,7 +42,7 @@ int zm_json_get_int(const ZMJSON& json, const char* kname, int default_value)
 // zm_json_get_str
 // ============================================================================
 
-std::string zm_json_get_str(const ZMJSON& json, const char* kname, std::string default_value)
+std::string zm_json_get_str(const ZMJSON& json, std::string_view kname, std::string default_value)
 {
     if (!json.is_object() || !json.contains(kname)) return default_value;
     const ZMJSON& node = json[kname];
@@ -66,7 +66,7 @@ std::string zm_json_get_str(const ZMJSON& json, const char* kname, std::string d
 // zm_json_get_float
 // ============================================================================
 
-double zm_json_get_float(const ZMJSON& json, const char* kname, double default_value)
+double zm_json_get_float(const ZMJSON& json, std::string_view kname, double default_value)
 {
     if (!json.is_object() || !json.contains(kname)) return default_value;
     const ZMJSON& node = json[kname];
@@ -87,7 +87,7 @@ double zm_json_get_float(const ZMJSON& json, const char* kname, double default_v
 // zm_json_get_bool
 // ============================================================================
 
-bool zm_json_get_bool(const ZMJSON& json, const char* kname, bool default_value)
+bool zm_json_get_bool(const ZMJSON& json, std::string_view kname, bool default_value)
 {
     if (!json.is_object() || !json.contains(kname)) return default_value;
     const ZMJSON& node = json[kname];
@@ -118,7 +118,7 @@ bool zm_json_get_bool(const ZMJSON& json, const char* kname, bool default_value)
 // zm_json_has
 // ============================================================================
 
-bool zm_json_has(const ZMJSON& json, const char* kname)
+bool zm_json_has(const ZMJSON& json, std::string_view kname)
 {
     return json.is_object() && json.contains(kname);
 }
@@ -139,7 +139,7 @@ size_t zm_json_size(const ZMJSON& json)
 // zm_json_erase
 // ============================================================================
 
-void zm_json_erase(ZMJSON& obj, const char* name)
+void zm_json_erase(ZMJSON& obj, std::string_view name)
 {
     ZMJSON::iterator pos = obj.find(name);
     if (pos != obj.end())

@@ -8,6 +8,7 @@
 #include "../util/zm_util_bufferevent_pair_pool.h"
 
 #include <../libevent/include/event2/bufferevent.h>
+#include <string_view>
 #include <../libevent/include/event2/event.h>
 #include <../libevent/include/event2/listener.h>
 
@@ -134,7 +135,7 @@ public:
 
     void SetTapContext(ZmTapContext* pTapContext);
 
-    void Drop(const char* reason = "");
+    void Drop(std::string_view reason = "");
 } ZM_TAP_CTX;
 
 /**
@@ -153,7 +154,7 @@ public:
     void        Clear();
     /** @brief 异步回收 TAP（跨线程安全，立即标记 DROPPING 状态，清理动作延后到事件循环线程）
      *  @note 调用后 TAP 状态立即变为 DROPPING 阻止复用，实际释放和回收在事件循环线程中完成 */
-    void        Drop(ZM_TAP_CTX* tap, const char* reason = "");
+    void        Drop(ZM_TAP_CTX* tap, std::string_view reason = "");
     /** @brief 从池中获取一个可用 TAP（优先从空闲栈 O(1) 获取） */
     ZM_TAP_CTX* Get();
     /** @brief 遍历所有 TAP，对匹配项执行回调 */
@@ -287,9 +288,9 @@ struct ContextEventHandlerParams
 class ZmTapContextEventHandler
 {
 public:
-    static void RegistryContextEventHandler(const char* name, ZmTapContext* ctx, void* delegate);
-    static void UnregistryContextEventHandler(const char* name);
-    static ContextEventHandlerParams* FindContextEventHandler(const char* name);
+    static void RegistryContextEventHandler(std::string_view name, ZmTapContext* ctx, void* delegate);
+    static void UnregistryContextEventHandler(std::string_view name);
+    static ContextEventHandlerParams* FindContextEventHandler(std::string_view name);
     static void OnTapDelegateEventCB(evutil_socket_t fd, short what, void* ctx);
     static void OnDnsResolvedCB(int errcode, struct evutil_addrinfo* addr, void* ctx);
     static void OnDropTimerCB(evutil_socket_t fd, short what, void* ctx);
@@ -305,7 +306,7 @@ public:
     static bool OnPairAcceptBev(ContextEventHandlerParams* params, struct bufferevent* bev,
                                 struct sockaddr* address = nullptr,
                                 ZmBuffereventPairHandle* handle = nullptr);
-    static bool OnPairAcceptBev(const char* name, struct bufferevent* bev,
+    static bool OnPairAcceptBev(std::string_view name, struct bufferevent* bev,
                                 struct sockaddr* address = nullptr,
                                 ZmBuffereventPairHandle* handle = nullptr);
     static void OnRequesterEventCB(struct bufferevent* requester_bev, short events, void* ctx);

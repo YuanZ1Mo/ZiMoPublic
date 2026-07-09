@@ -88,14 +88,13 @@ bool ZmString::Equals(const char* s1, const char* s2, bool ignoreCase)
     return 0 == (ignoreCase ? _stricmp(s1, s2) : strcmp(s1, s2));
 }
 
-bool ZmString::IsNumeric(const char* str)
+bool ZmString::IsNumeric(std::string_view str)
 {
-    if (!IsEmpty(str))
+    if (!str.empty())
     {
-        size_t len = strlen(str);
-        for (size_t i = 0; i < len; i++)
+        for (size_t i = 0; i < str.size(); i++)
         {
-            if (str[i] < '0' || str[i]>'9')
+            if (str[i] < '0' || str[i] > '9')
             {
                 return false;
             }
@@ -105,12 +104,11 @@ bool ZmString::IsNumeric(const char* str)
     return false;
 }
 
-bool ZmString::HasExtendedAscii(const char* str)
+bool ZmString::HasExtendedAscii(std::string_view str)
 {
-    if (!IsEmpty(str))
+    if (!str.empty())
     {
-        size_t len = strlen(str);
-        for (size_t i = 0; i < len; i++)
+        for (size_t i = 0; i < str.size(); i++)
         {
             if (str[i] & 0x80)
             {
@@ -149,16 +147,9 @@ bool ZmString::IsUTF8(const BYTE* str, size_t len)
     return true;
 }
 
-bool ZmString::LongerThan(const char* str, size_t len)
+bool ZmString::LongerThan(std::string_view str, size_t len)
 {
-    for (size_t i = 0; i <= len; i++)
-    {
-        if (str[i] == 0)
-        {
-            return false;
-        }
-    }
-    return true;
+    return str.size() > len;
 }
 
 
@@ -170,9 +161,9 @@ void ZmString::Lower(std::string& str)
     std::transform(str.begin(), str.end(), str.begin(), ZmString::easyToLower);
 }
 
-std::string ZmString::LowerEx(const char* str)
+std::string ZmString::LowerEx(std::string_view str)
 {
-    std::string lowers(str ? str : "");
+    std::string lowers(str);
     Lower(lowers);
     return lowers;
 }
@@ -182,9 +173,9 @@ void ZmString::Upper(std::string& str)
     std::transform(str.begin(), str.end(), str.begin(), ZmString::easyToUpper);
 }
 
-std::string ZmString::UpperEx(const char* str)
+std::string ZmString::UpperEx(std::string_view str)
 {
-    std::string upers(str ? str : "");
+    std::string upers(str);
     Upper(upers);
     return upers;
 }
@@ -266,18 +257,18 @@ char* ZmString::L_To_A(long num, char* str, int radix)
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
 // ZmString - 查找与匹配
 
-int ZmString::Find(const char* haystack, const char* needle, size_t offset)
+int ZmString::Find(std::string_view haystack, std::string_view needle, size_t offset)
 {
-    if (NULL == haystack || NULL == needle) { return -1; }
-    char* ptr = const_cast<char*>(haystack) + offset;
-    char* str = strstr(ptr, needle);
-    return str ? (int)(str - haystack) : -1;
+    if (haystack.empty() || needle.empty()) { return -1; }
+    if (offset >= haystack.size()) { return -1; }
+    auto pos = haystack.substr(offset).find(needle);
+    return pos != std::string_view::npos ? (int)(pos + offset) : -1;
 }
 
-int ZmString::RFind(const char* haystack, const char needle)
+int ZmString::RFind(std::string_view haystack, const char needle)
 {
-    if (NULL == haystack) { return -1; }
-    for (int i = (int)(strlen(haystack) - 1); i >= 0; i--)
+    if (haystack.empty()) { return -1; }
+    for (int i = (int)(haystack.size() - 1); i >= 0; i--)
     {
         if (haystack[i] == needle)
         {
@@ -287,72 +278,49 @@ int ZmString::RFind(const char* haystack, const char needle)
     return -1;
 }
 
-int ZmString::Pos(const char* haystack, const char* needle)
+int ZmString::Pos(std::string_view haystack, std::string_view needle)
 {
-    if (NULL != haystack && NULL != needle)
+    if (!haystack.empty() && !needle.empty())
     {
-        const char* str = strstr(haystack, needle);
-        if (str)
+        auto pos = haystack.find(needle);
+        if (pos != std::string_view::npos)
         {
-            return (int)(str - haystack);
+            return (int)pos;
         }
     }
     return -1;
 }
 
-bool ZmString::StartsWith(const char* base, const char* head)
+bool ZmString::StartsWith(std::string_view base, std::string_view head)
 {
-    if (NULL != base && NULL != head)
-    {
-        size_t total = strlen(base);
-        size_t needle = strlen(head);
-
-        if (needle <= total)
-        {
-            for (size_t i = 0; i < needle; i++)
-            {
-                if (base[i] != head[i])
-                {
-                    return false;
-                }
-            }
-            return true;
-        }
-    }
-    return false;
+    return base.size() >= head.size() && base.substr(0, head.size()) == head;
 }
 
-bool ZmString::EndsWith(const char* base, const char* tail)
+bool ZmString::EndsWith(std::string_view base, std::string_view tail)
 {
-    if (NULL != base && NULL != tail)
-    {
-        size_t blen = strlen(base);
-        size_t slen = strlen(tail);
-        return (blen >= slen) && (0 == strcmp(base + blen - slen, tail));
-    }
-    return false;
+    return base.size() >= tail.size() && base.substr(base.size() - tail.size()) == tail;
 }
 
-bool ZmString::WildcardMatch(const char* subject, const char* pattern)
+bool ZmString::WildcardMatch(std::string_view subject, std::string_view pattern)
 {
-    if (*pattern == '\0' && *subject == '\0')
+    if (pattern.empty() && subject.empty())
     {
         return true;
     }
 
-    if (*pattern == '*' && *(pattern + 1) != '\0' && *subject == '\0')
+    if (pattern[0] == '*' && pattern.size() > 1 && subject.empty())
     {
         return false;
     }
 
-    if (*pattern == '?' || *pattern == *subject)
+    if (pattern[0] == '?' || (!pattern.empty() && !subject.empty() && pattern[0] == subject[0]))
     {
-        return WildcardMatch(subject + 1, pattern + 1);
+        return WildcardMatch(subject.substr(1), pattern.substr(1));
     }
 
-    if (*pattern == '*')
+    if (pattern[0] == '*')
     {
-        return WildcardMatch(subject, pattern + 1) || WildcardMatch(subject + 1, pattern);
+        return WildcardMatch(subject, pattern.substr(1)) || (!subject.empty() && WildcardMatch(subject.substr(1), pattern));
     }
     return false;
 }
@@ -406,15 +374,15 @@ std::string ZmString::spp(std::string str, std::string src, std::string dst)
     return str;
 }
 
-void ZmString::Replace(const char* search, const char* replace, std::string& subject, bool deep)
+void ZmString::Replace(std::string_view search, std::string_view replace, std::string& subject, bool deep)
 {
     std::string::size_type offset = 0;
     std::string::size_type pos = std::string::npos;
-    size_t                 slen = strlen(search);
-    size_t                 rlen = strlen(replace);
-    while (std::string::npos != (pos = subject.find(search, offset)))
+    size_t                 slen = search.size();
+    size_t                 rlen = replace.size();
+    while (std::string::npos != (pos = subject.find(search.data(), offset, slen)))
     {
-        subject.replace(pos, slen, replace);
+        subject.replace(pos, slen, replace.data(), rlen);
         if (!deep)
         {
             offset = pos + rlen;
@@ -426,26 +394,30 @@ void ZmString::Replace(const char* search, const char* replace, std::string& sub
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
 // ZmString - 编码转换
 
-void ZmString::Ascii_To_UTF8(ZmByteBuffer& output, const char* astr)
+void ZmString::Ascii_To_UTF8(ZmByteBuffer& output, std::string_view astr)
 {
-    int wlen = MultiByteToWideChar(CP_ACP, 0, astr, -1, 0, 0);
-    ZmByteBuffer wtemp(wlen * sizeof(wchar_t));
+    if (astr.empty()) { output.Reset(0); return; }
+    int wlen = MultiByteToWideChar(CP_ACP, 0, astr.data(), (int)astr.size(), 0, 0);
+    ZmByteBuffer wtemp((wlen + 1) * sizeof(wchar_t));
     wchar_t* wstr = (wchar_t*)wtemp.Head();
-    MultiByteToWideChar(CP_ACP, 0, astr, -1, wstr, wlen);
+    MultiByteToWideChar(CP_ACP, 0, astr.data(), (int)astr.size(), wstr, wlen);
+    wstr[wlen] = L'\0';
 
     int u8len = WideCharToMultiByte(CP_UTF8, 0, wstr, wlen, 0, 0, 0, 0);
-    output.Reset(u8len);
+    output.Reset(u8len + 1);
     WideCharToMultiByte(CP_UTF8, 0, wstr, wlen, output.Str(), u8len, 0, 0);
+    output.Str()[u8len] = '\0';
 }
 
-size_t ZmString::Ascii_To_Unicode(ZmByteBuffer& output, const char* astr, size_t len)
+size_t ZmString::Ascii_To_Unicode(ZmByteBuffer& output, std::string_view astr, size_t len)
 {
     size_t wlen = 0;
 
-    int alen = (int)(len ? len : -1);
-    wlen = MultiByteToWideChar(CP_ACP, 0, astr, alen, 0, 0);
-    output.Reset(sizeof(wchar_t) * wlen);
-    MultiByteToWideChar(CP_ACP, 0, astr, alen, (wchar_t*)output.Head(), (int)wlen);
+    int alen = (int)(len ? len : astr.size());
+    wlen = MultiByteToWideChar(CP_ACP, 0, astr.data(), alen, 0, 0);
+    output.Reset(sizeof(wchar_t) * (wlen + 1));
+    MultiByteToWideChar(CP_ACP, 0, astr.data(), alen, (wchar_t*)output.Head(), (int)wlen);
+    ((wchar_t*)output.Head())[wlen] = L'\0';
 
     return wlen;
 }
@@ -476,41 +448,49 @@ std::string ZmString::Unicode_To_UTF8(const std::wstring& wstr)
     return result;
 }
 
-void ZmString::UTF8_To_Ascii(ZmByteBuffer& output, const char* utf8, size_t len)
+void ZmString::UTF8_To_Ascii(ZmByteBuffer& output, std::string_view utf8, size_t len)
 {
-    int u8len = len ? (int)len : -1;
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, u8len, 0, 0);
-    ZmByteBuffer wtemp(wlen * sizeof(wchar_t));
-    MultiByteToWideChar(CP_UTF8, 0, utf8, u8len, (wchar_t*)wtemp.Head(), wlen);
+    if (utf8.empty()) { output.Reset(0); return; }
+    int u8len = len ? (int)len : (int)utf8.size();
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), u8len, 0, 0);
+    ZmByteBuffer wtemp((wlen + 1) * sizeof(wchar_t));
+    MultiByteToWideChar(CP_UTF8, 0, utf8.data(), u8len, (wchar_t*)wtemp.Head(), wlen);
+    ((wchar_t*)wtemp.Head())[wlen] = L'\0';
 
     int alen = WideCharToMultiByte(CP_ACP, 0, (wchar_t*)wtemp.Head(), wlen, 0, 0, 0, 0);
-    output.Reset(alen);
+    output.Reset(alen + 1);
     output.Zero();
     WideCharToMultiByte(CP_ACP, 0, (wchar_t*)wtemp.Head(), wlen, output.Str(), alen, 0, 0);
+    output.Str()[alen] = '\0';
 }
 
-void ZmString::UTF8_To_Unicode(ZmByteBuffer& output, const char* utf8, size_t len)
+void ZmString::UTF8_To_Unicode(ZmByteBuffer& output, std::string_view utf8, size_t len)
 {
-    int u8len = len ? (int)len : -1;
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, u8len, 0, 0);
-    output.Reset(sizeof(wchar_t) * wlen);
-    MultiByteToWideChar(CP_UTF8, 0, utf8, u8len, (wchar_t*)output.Head(), wlen);
+    if (utf8.empty()) { output.Reset(0); return; }
+    int u8len = len ? (int)len : (int)utf8.size();
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), u8len, 0, 0);
+    output.Reset(sizeof(wchar_t) * (wlen + 1));
+    MultiByteToWideChar(CP_UTF8, 0, utf8.data(), u8len, (wchar_t*)output.Head(), wlen);
+    ((wchar_t*)output.Head())[wlen] = L'\0';
 }
 
-void ZmString::UTF8_To_Ansi(ZmByteBuffer& output, const char* utf8, size_t len)
+void ZmString::UTF8_To_Ansi(ZmByteBuffer& output, std::string_view utf8, size_t len)
 {
-    int u8len = len ? (int)len : -1;
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, u8len, NULL, 0);
+    if (utf8.empty()) { output.Reset(0); return; }
+    int u8len = len ? (int)len : (int)utf8.size();
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), u8len, NULL, 0);
     if (wlen > 0)
     {
-        std::unique_ptr<wchar_t[]> buffer(new wchar_t[wlen]);
-        MultiByteToWideChar(CP_UTF8, 0, utf8, u8len, buffer.get(), wlen);
+        std::unique_ptr<wchar_t[]> wbuffer(new wchar_t[wlen + 1]);
+        MultiByteToWideChar(CP_UTF8, 0, utf8.data(), u8len, wbuffer.get(), wlen);
+        wbuffer[wlen] = L'\0';
 
-        int alen = WideCharToMultiByte(CP_ACP, 0, buffer.get(), wlen, NULL, 0, NULL, NULL);
+        int alen = WideCharToMultiByte(CP_ACP, 0, wbuffer.get(), wlen, NULL, 0, NULL, NULL);
         if (alen > 0)
         {
-            output.Reset(alen);
-            WideCharToMultiByte(CP_ACP, 0, buffer.get(), wlen, output.Str(), alen, NULL, NULL);
+            output.Reset(alen + 1);
+            WideCharToMultiByte(CP_ACP, 0, wbuffer.get(), wlen, output.Str(), alen, NULL, NULL);
+            output.Str()[alen] = '\0';
         }
     }
 }
@@ -525,15 +505,16 @@ std::wstring ZmString::UTF8_To_Unicode(const std::string& utf8)
     return result;
 }
 
-void ZmString::OptimizeHexMixed(const char* hexmixed, char* output)
+void ZmString::OptimizeHexMixed(std::string_view hexmixed, char* output)
 {
-    if (NULL == hexmixed) { return; }
-    if (strstr(hexmixed, "\\x") || strstr(hexmixed, "\\X"))
+    if (hexmixed.empty()) { return; }
+    std::string hm(hexmixed);
+    if (strstr(hm.c_str(), "\\x") || strstr(hm.c_str(), "\\X"))
     {
-        ZmStringList pieces(hexmixed, "\\");
-        ZmByteBuffer localBuf(strlen(hexmixed) + 1);
+        ZmStringList pieces(hm.c_str(), "\\");
+        ZmByteBuffer localBuf(hexmixed.size() + 1);
         char* writePtr = (output != NULL) ? output : localBuf.Str();
-        memset(writePtr, 0, (output != NULL) ? strlen(hexmixed) + 1 : localBuf.Size());
+        memset(writePtr, 0, (output != NULL) ? hexmixed.size() + 1 : localBuf.Size());
         for (size_t i = 0; i < pieces.Count(); i++)
         {
             const char* piece = pieces.At(i);
@@ -571,10 +552,10 @@ char* ZmString::Hex(const BYTE* input, char* output, size_t inlen, bool lower)
     return output;
 }
 
-size_t ZmString::FromHex(const char* input, BYTE* output, size_t inlen)
+size_t ZmString::FromHex(std::string_view input, BYTE* output, size_t inlen)
 {
     BYTE* out = output;
-    inlen = (0 == inlen) ? strlen(input) : inlen;
+    inlen = (0 == inlen) ? input.size() : inlen;
     if (inlen > 0)
     {
         size_t from = 0;
@@ -592,58 +573,55 @@ size_t ZmString::FromHex(const char* input, BYTE* output, size_t inlen)
     return ((inlen % 2) == 1) ? (outlen + 1) : outlen;
 }
 
-char* ZmString::URLEncode(ZmByteBuffer& output, const char* input)
+char* ZmString::URLEncode(ZmByteBuffer& output, std::string_view input)
 {
-    char* pin = const_cast<char*>(input);
-    output.Reset(strlen(input) * 3 + 1);
+    output.Reset(input.size() * 3 + 1);
     char* pout = output.Str();
 
-    while (*pin)
+    for (size_t i = 0; i < input.size(); i++)
     {
-        if (isalnum(*pin) || *pin == '-' || *pin == '_' || *pin == '.' || *pin == '~')
+        char c = input[i];
+        if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~')
         {
-            *pout++ = *pin;
+            *pout++ = c;
         }
-        else if (*pin == ' ')
+        else if (c == ' ')
         {
             *pout++ = '+';
         }
         else
         {
             *pout++ = '%';
-            *pout++ = zm_char_to_hex(*pin >> 4);
-            *pout++ = zm_char_to_hex(*pin & 15);
+            *pout++ = zm_char_to_hex((unsigned char)c >> 4);
+            *pout++ = zm_char_to_hex(c & 15);
         }
-        pin++;
     }
     *pout = '\0';
     return output.Str();
 }
 
-char* ZmString::URLDecode(ZmByteBuffer& output, const char* input)
+char* ZmString::URLDecode(ZmByteBuffer& output, std::string_view input)
 {
-    char* pin = const_cast<char*>(input);
-    output.Reset(strlen(input) + 1);
+    output.Reset(input.size() + 1);
     char* pout = output.Str();
-    while (*pin)
+    for (size_t i = 0; i < input.size(); i++)
     {
-        if (*pin == '%')
+        if (input[i] == '%')
         {
-            if (pin[1] && pin[2])
+            if (i + 2 < input.size())
             {
-                *pout++ = (zm_hex_to_char(pin[1]) << 4) | zm_hex_to_char(pin[2]);
-                pin += 2;
+                *pout++ = (zm_hex_to_char(input[i + 1]) << 4) | zm_hex_to_char(input[i + 2]);
+                i += 2;
             }
         }
-        else if (*pin == '+')
+        else if (input[i] == '+')
         {
             *pout++ = ' ';
         }
         else
         {
-            *pout++ = *pin;
+            *pout++ = input[i];
         }
-        pin++;
     }
     *pout = '\0';
     return output.Str();
@@ -700,10 +678,9 @@ static const BYTE g_base64UrlTable[] = { xx, xx, xx, xx, xx, xx, xx, xx, xx, xx,
                                           41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, xx, xx, xx, xx, xx };
 #undef xx
 
-bool ZmString::Base64Check(const char* str)
+bool ZmString::Base64Check(std::string_view str)
 {
-    size_t len = strlen(str);
-    for (size_t i = 0; i < len; i++)
+    for (size_t i = 0; i < str.size(); i++)
     {
         char c = str[i];
         if (ZM_BETWEEN(c, '0', '9') || ZM_BETWEEN(c, 'A', 'Z') || ZM_BETWEEN(c, 'a', 'z')
@@ -723,7 +700,7 @@ void ZmString::Base64Encode(ZmByteBuffer& output, const BYTE* data, size_t inLen
     base64EncodeImpl(g_base64Chars, sizeof(g_base64Chars), output, data, inLen);
 }
 
-void ZmString::Base64Decode(ZmByteBuffer& output, const char* str, size_t inLen)
+void ZmString::Base64Decode(ZmByteBuffer& output, std::string_view str, size_t inLen)
 {
     base64DecodeImpl(g_base64Table, output, str, inLen);
 }
@@ -744,7 +721,7 @@ std::string ZmString::Base64URLEncode(const BYTE* data, size_t inLen)
     return std::string(b64.Str());
 }
 
-void ZmString::Base64URLDecode(ZmByteBuffer& output, const char* str, size_t inLen)
+void ZmString::Base64URLDecode(ZmByteBuffer& output, std::string_view str, size_t inLen)
 {
     base64DecodeImpl(g_base64UrlTable, output, str, inLen);
 }
@@ -794,19 +771,19 @@ int ZmString::Base32Encode(ZmByteBuffer& output, const BYTE* inBytes, size_t inL
     return count;
 }
 
-int ZmString::Base32Decode(ZmByteBuffer& output, const char* inStr, size_t inLen)
+int ZmString::Base32Decode(ZmByteBuffer& output, std::string_view inStr, size_t inLen)
 {
     int buffer = 0;
     int bitsLeft = 0;
     int count = 0;
-    inLen = (inLen < 1) ? strlen(inStr) : inLen;
+    inLen = (inLen < 1) ? inStr.size() : inLen;
     int bufSize = ((int)inLen + 7) / 8 * 5 + 1;
     output.Reset(bufSize);
     uint8_t* result = output.Head();
 
-    for (const uint8_t* ptr = (const uint8_t*)inStr; count < bufSize && *ptr; ++ptr)
+    for (size_t idx = 0; idx < inLen && count < bufSize; ++idx)
     {
-        uint8_t ch = *ptr;
+        uint8_t ch = (uint8_t)inStr[idx];
         if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '-')
         {
             continue;
@@ -858,14 +835,13 @@ int ZmString::Base32Decode(ZmByteBuffer& output, const char* inStr, size_t inLen
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
 // ZmString - 哈希与工具
 
-uint32_t ZmString::Hash(const char* str)
+uint32_t ZmString::Hash(std::string_view str)
 {
-    const uint8_t* name = (const uint8_t*)str;
     uint32_t       h = 0;
     uint32_t       g;
-    while (*name)
+    for (size_t i = 0; i < str.size(); i++)
     {
-        h = (h << 4) + *name++;
+        h = (h << 4) + (uint8_t)str[i];
         g = h & 0xf0000000;
         if (g)
         {
@@ -876,10 +852,10 @@ uint32_t ZmString::Hash(const char* str)
     return h;
 }
 
-bool ZmString::ValidateTicket(const char* ticket, char* output)
+bool ZmString::ValidateTicket(std::string_view ticket, char* output)
 {
-    if (NULL == ticket) { return false; }
-    ZmByteBuffer buf(strlen(ticket), ticket);
+    if (ticket.empty()) { return false; }
+    ZmByteBuffer buf(ticket.size(), ticket.data());
     char* str = Trim(buf.Str());
     if (64 == strlen(str))
     {
@@ -959,7 +935,7 @@ char ZmString::easyToUpper(char c)
     return ZM_BETWEEN(c, 'a', 'z') ? (c - 'a' + 'A') : c;
 }
 
-void ZmString::base64EncodeImpl(const char* b64chars, size_t b64charsSize, ZmByteBuffer& output, const BYTE* inBytes, size_t inLen)
+void ZmString::base64EncodeImpl(std::string_view b64chars, size_t b64charsSize, ZmByteBuffer& output, const BYTE* inBytes, size_t inLen)
 {
     if (NULL == inBytes || inLen < 1)
     {
@@ -1020,10 +996,10 @@ void ZmString::base64EncodeImpl(const char* b64chars, size_t b64charsSize, ZmByt
     }
 }
 
-void ZmString::base64DecodeImpl(const BYTE* b64table, ZmByteBuffer& output, const char* inStr, size_t inLen)
+void ZmString::base64DecodeImpl(const BYTE* b64table, ZmByteBuffer& output, std::string_view inStr, size_t inLen)
 {
-    inLen = (inLen < 1) ? strlen(inStr) : inLen;
-    if (NULL == inStr || inLen < 1)
+    inLen = (inLen < 1) ? inStr.size() : inLen;
+    if (inStr.empty() || inLen < 1)
     {
         output.Reset(0);
         return;
@@ -1032,7 +1008,7 @@ void ZmString::base64DecodeImpl(const BYTE* b64table, ZmByteBuffer& output, cons
     size_t b64Len = ((inLen % 4) == 0) ? inLen : (inLen + 4 - (inLen % 4));
     ZmByteBuffer temp(b64Len);
     BYTE* input = temp.Head();
-    memcpy(input, inStr, inLen);
+    memcpy(input, inStr.data(), inLen);
     for (size_t i = inLen; i < b64Len; i++)
     {
         input[i] = '=';
@@ -1101,9 +1077,9 @@ void ZmStringList::Lower()
     }
 }
 
-void ZmStringList::AddEntries(const char* str, const char* delims)
+void ZmStringList::AddEntries(std::string_view str, const char* delims)
 {
-    if (NULL == str)
+    if (str.empty())
     {
         return;
     }
@@ -1113,9 +1089,9 @@ void ZmStringList::AddEntries(const char* str, const char* delims)
     }
     else
     {
-        size_t len = strlen(str);
+        size_t len = str.size();
         CheckSpace(len + 1);
-        strncpy_s(m_heap.Str() + m_tail, len + 1, str, len);
+        strncpy_s(m_heap.Str() + m_tail, len + 1, str.data(), len);
 
         char* from = m_heap.Str() + m_tail;
         char* to = m_heap.Str() + m_tail + len;
@@ -1137,28 +1113,28 @@ void ZmStringList::AddEntries(const char* str, const char* delims)
     }
 }
 
-void ZmStringList::AddEntry(const char* str, size_t len)
+void ZmStringList::AddEntry(std::string_view str, size_t len)
 {
     if (len < 1)
     {
-        len = strlen(str);
+        len = str.size();
     }
     CheckSpace(len + 1);
     m_items.Add()->pos = m_tail;
-    strncpy_s(m_heap.Str() + m_tail, len + 1, str, len);
+    strncpy_s(m_heap.Str() + m_tail, len + 1, str.data(), len);
     m_tail += len + 1;
 }
 
-void ZmStringList::RemoveEntry(const char* str, size_t len)
+void ZmStringList::RemoveEntry(std::string_view str, size_t len)
 {
-    if (ZmString::IsEmpty(str)) { return; }
-    if (len < 1) { len = strlen(str); }
+    if (str.empty()) { return; }
+    if (len < 1) { len = str.size(); }
 
     ZmStringList fresh;
     for (size_t i = 0; i < m_items.Count(); i++)
     {
         const char* xstr = m_heap.Str() + m_items.At(i)->pos;
-        if (0 != strcmp(xstr, str))
+        if (0 != strncmp(xstr, str.data(), len) || strlen(xstr) != len)
         {
             fresh.PutEntry(xstr);
         }
@@ -1173,9 +1149,9 @@ void ZmStringList::RemoveEntry(const char* str, size_t len)
     }
 }
 
-size_t ZmStringList::PutEntry(const char* str, size_t len)
+size_t ZmStringList::PutEntry(std::string_view str, size_t len)
 {
-    if (str)
+    if (!str.empty() || str.data() != nullptr)
     {
         size_t pos = QueryEntry(str);
         if (NPOS == pos)
@@ -1188,11 +1164,12 @@ size_t ZmStringList::PutEntry(const char* str, size_t len)
     return NPOS;
 }
 
-size_t ZmStringList::QueryEntry(const char* str)
+size_t ZmStringList::QueryEntry(std::string_view str)
 {
     for (size_t i = 0; i < m_items.Count(); i++)
     {
-        if (0 == strcmp(m_heap.Str() + m_items.At(i)->pos, str))
+        const char* xstr = m_heap.Str() + m_items.At(i)->pos;
+        if (str.size() == strlen(xstr) && 0 == strncmp(xstr, str.data(), str.size()))
         {
             return i;
         }
@@ -1269,11 +1246,11 @@ void ZmStringList::Export(std::vector<std::string>& outputs)
     }
 }
 
-void ZmStringList::ParseOptions(const char* options)
+void ZmStringList::ParseOptions(std::string_view options)
 {
     RemoveAll();
 
-    if (NULL == options || '\0' == options[0]) { return; }
+    if (options.empty()) { return; }
 
     ZmByteBuffer wbuf;
     ZmString::Ascii_To_Unicode(wbuf, options);

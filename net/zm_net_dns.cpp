@@ -180,11 +180,12 @@ ZmDNSCache  g_zm_dns_cache;
  * @param ttl      存活偏移时间（毫秒）。传 0 表示设置为永久有效（不过期），
  *                 默认使用 ZM_DNS_TTL_MS（300秒）
  */
-void ZmNetDNS::CacheUpdateTTL(const char* hostname, int64_t ttl)
+void ZmNetDNS::CacheUpdateTTL(std::string_view hostname, int64_t ttl)
 {
-    if (!ZmNetIP::Validate(hostname))
+    std::string hostStr(hostname);
+    if (!ZmNetIP::Validate(hostStr.c_str()))
     {
-        bool contains = g_zm_dns_cache.ResetExpireMS(hostname, (0L != ttl) ? (ZmSystem::CurrentTimeMills() + ttl) : 0L);
+        bool contains = g_zm_dns_cache.ResetExpireMS(hostStr.c_str(), (0L != ttl) ? (ZmSystem::CurrentTimeMills() + ttl) : 0L);
         //Y_LOGI("[net][dns] Updated cache item: hostname='%s', ttl=%" PRId64 ", result=%sFUND", hostname, ttl, contains ? "" : "NOT ");
     }
 }
@@ -195,9 +196,9 @@ void ZmNetDNS::CacheUpdateTTL(const char* hostname, int64_t ttl)
  * @param hostname 主机名
  * @param sa       地址信息（支持 sockaddr_in 和 sockaddr_in6）
  */
-void ZmNetDNS::CachePut(const char* hostname, const struct sockaddr* sa)
+void ZmNetDNS::CachePut(std::string_view hostname, const struct sockaddr* sa)
 {
-    g_zm_dns_cache.Put(hostname, sa, ZmSystem::CurrentTimeMills());
+    g_zm_dns_cache.Put(std::string(hostname).c_str(), sa, ZmSystem::CurrentTimeMills());
 }
 
 /**
@@ -210,9 +211,10 @@ void ZmNetDNS::CachePut(const char* hostname, const struct sockaddr* sa)
  * @return 地址结构体长度（sizeof(sockaddr_in) 或 sizeof(sockaddr_in6)），
  *         返回 0 表示缓存未命中或已过期
  */
-socklen_t ZmNetDNS::CacheGet(const char* hostname, uint16_t port, struct sockaddr* sa, uint64_t now)
+socklen_t ZmNetDNS::CacheGet(std::string_view hostname, uint16_t port, struct sockaddr* sa, uint64_t now)
 {
-    if (!ZmNetIP::Validate(hostname) && g_zm_dns_cache.Lookup(sa, hostname, now))
+    std::string hostStr(hostname);
+    if (!ZmNetIP::Validate(hostStr.c_str()) && g_zm_dns_cache.Lookup(sa, hostStr.c_str(), now))
     {
         if (sa->sa_family == AF_INET6)
         {
@@ -244,7 +246,7 @@ void ZmNetDNS::ClearCache()
  *
  * @param hostname 知名主机名
  */
-void ZmNetDNS::AddWellKnownHost(const char* hostname)
+void ZmNetDNS::AddWellKnownHost(std::string_view hostname)
 {
     std::lock_guard<std::mutex> lock(s_well_known_mutex);
     s_well_known_hosts.emplace_back(hostname);
@@ -255,7 +257,7 @@ void ZmNetDNS::AddWellKnownHost(const char* hostname)
  *
  * @param hostname 要删除的主机名
  */
-void ZmNetDNS::DelWellKnownHost(const char* hostname)
+void ZmNetDNS::DelWellKnownHost(std::string_view hostname)
 {
     std::lock_guard<std::mutex> lock(s_well_known_mutex);
     for (auto itor = s_well_known_hosts.begin(); itor != s_well_known_hosts.end(); itor++)
@@ -283,12 +285,12 @@ void ZmNetDNS::DelWellKnownHost()
  * @param hostname 待判断的主机名
  * @return true 表示该主机名属于知名主机
  */
-bool ZmNetDNS::IsWellKnownHost(const char* hostname)
+bool ZmNetDNS::IsWellKnownHost(std::string_view hostname)
 {
     std::lock_guard<std::mutex> lock(s_well_known_mutex);
     for (const auto& host : s_well_known_hosts)
     {
-        if (ZmString::EndsWith(hostname, host.c_str()))
+        if (ZmString::EndsWith(hostname, host))
         {
             return true;
         }
@@ -821,13 +823,13 @@ size_t ZmNetDNS::ParseLabel(char* label, size_t space, const BYTE* dnsp, size_t 
  *   // len == 17
  * @endcode
  */
-size_t ZmNetDNS::LabelPut(BYTE* dnsp, size_t offset, const char* hostanme)
+size_t ZmNetDNS::LabelPut(BYTE* dnsp, size_t offset, std::string_view hostanme)
 {
     BYTE* label = dnsp + offset;
     size_t cpos = 0;
-    size_t nlen = strlen(hostanme);
+    size_t nlen = hostanme.size();
     // 先将主机名拷贝到 label+1 的位置（跳过第一个字节，留给第一个标签的长度）
-    memcpy(label + 1, hostanme, nlen);
+    memcpy(label + 1, hostanme.data(), nlen);
     nlen++;                /** 因为跳过了第一个字符，因此长度增加 1 */
     label[0] = '.';    /** 设置第一个为 '.' 作为长度计数器的占位 */
 
@@ -866,7 +868,7 @@ size_t ZmNetDNS::LabelPut(BYTE* dnsp, size_t offset, const char* hostanme)
  * @param rdata  资源数据指针（可为 NULL）
  * @return 写入的总字节数
  */
-size_t ZmNetDNS::FieldRecordPut(BYTE* dnsp, size_t offset, const char* rname,
+size_t ZmNetDNS::FieldRecordPut(BYTE* dnsp, size_t offset, std::string_view rname,
     uint16_t rtype, uint16_t rclass, uint16_t rdlen, const BYTE* rdata)
 {
     /** TODO: 支持报文压缩 */
@@ -929,7 +931,7 @@ size_t ZmNetDNS::FieldQuestPut(BYTE* dnsp, size_t offset, const ZM_NET_DNS_QUEST
  *   // 写入 A 记录：mydevice.local -> 192.168.1.1, rdlen=4
  * @endcode
  */
-size_t ZmNetDNS::FieldRecordPutARPA(BYTE* dnsp, size_t offset, const char* hostname, const struct sockaddr* addr)
+size_t ZmNetDNS::FieldRecordPutARPA(BYTE* dnsp, size_t offset, std::string_view hostname, const struct sockaddr* addr)
 {
     uint16_t rtype = 0;
     uint16_t rclass = 0x01;  // IN (Internet)
@@ -1143,7 +1145,7 @@ void ZmNetDNS::ParseReplyUDP(ZM_NET_DNS_QUESTION* quest, const BYTE* dnsdata, si
  *   sendto(sock, (char*)buf, len, 0, (sockaddr*)&dns_addr, sizeof(dns_addr));
  * @endcode
  */
-size_t ZmNetDNS::BuildQuery(BYTE* udpdata, const char* hostname)
+size_t ZmNetDNS::BuildQuery(BYTE* udpdata, std::string_view hostname)
 {
     ZM_NET_DNS_HEAD* dnsh = (ZM_NET_DNS_HEAD*)udpdata;
     memset(dnsh, 0, sizeof(ZM_NET_DNS_HEAD));
@@ -1153,7 +1155,8 @@ size_t ZmNetDNS::BuildQuery(BYTE* udpdata, const char* hostname)
     dnsh->qdcount = htons(1);  // 1 个查询问题
 
     ZM_NET_DNS_QUESTION quest;
-    QuestInit(&quest, hostname);
+    std::string hostStr(hostname);
+    QuestInit(&quest, hostStr.c_str());
 
     // DNS Header 固定 12 字节，Question 区域从偏移 12 开始
     return 12 + FieldQuestPut(udpdata, 12, &quest);
