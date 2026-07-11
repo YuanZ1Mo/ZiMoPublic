@@ -1,6 +1,7 @@
 #include "zm_net_tap_hub.h"
 
 #include "zm_net_tap_jrpc.h"
+#include "zm_net_tap_rest.h"
 #include "zm_net_ip.h"
 #include "../util/zm_util_libevent.h"
 #include "../spdlog/zm_logger.h"
@@ -229,6 +230,7 @@ ZmTapHubProxy::ZmTapHubProxy(struct event_base* evbase)
 	: ZmTapHubBase(evbase)
 	, m_proxy_listeners(ZM_DEFAULT_PROXY_LISTENER_NUM)
 	, m_delegate_jrpc(nullptr)
+	, m_delegate_restful(nullptr)
 {
 	TapDelegateName("ZmTapHubProxy");
 }
@@ -347,6 +349,11 @@ void ZmTapHubProxy::SetJrpcDelegate(ZmTapDelegateJRPC* DelegateJRPC)
 	m_delegate_jrpc = DelegateJRPC;
 }
 
+void ZmTapHubProxy::SetRESTfulDelegate(ZmTapDelegateRESTful* DelegateRESTful)
+{
+	m_delegate_restful = DelegateRESTful;
+}
+
 // ============================================================================
 // ZmTapHubProxy — ZmTapDelegate 接口实现
 // ============================================================================
@@ -457,6 +464,18 @@ void ZmTapHubProxy::OnProtocolDetectReadCB(struct bufferevent* bev, void* ctx)
 		//PUBLIC_LOG_INFO("HubProxy probe detected JRPC protocol, switching delegate for Tap: {}", (void*)tap);
 		evbuffer_drain(input, 4);
 		self->SwitchDelegate(tap, self->m_delegate_jrpc);
+	}
+	else if (head[0] == 'R' && head[1] == 'E' && head[2] == 'S' && head[3] == 'T')
+	{
+		if (self->m_delegate_restful == nullptr)
+		{
+			PUBLIC_LOG_ERROR("RESTful protocol detected but delegate not set, dropping Tap: {}", (void*)tap);
+			tap->Drop("RESTful delegation not set");
+			return;
+		}
+
+		evbuffer_drain(input, 4);
+		self->SwitchDelegate(tap, self->m_delegate_restful);
 	}
 	else
 	{

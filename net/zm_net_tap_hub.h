@@ -7,6 +7,7 @@
 
 // 前向声明（头文件中仅通过指针使用）
 class ZmTapDelegateJRPC;
+class ZmTapDelegateRESTful;
 
 // ============================================================================
 // ZmTapHubBase — 监听基础设施
@@ -124,6 +125,10 @@ public:
 	 *  @param DelegateJRPC JRPC delegate 指针 */
 	void SetJrpcDelegate(ZmTapDelegateJRPC* DelegateJRPC);
 
+	/** @brief 设置 RESTful 协议委托处理器
+	 *  @param DelegateRESTful RESTful delegate 指针 */
+	void SetRESTfulDelegate(ZmTapDelegateRESTful* DelegateRESTful);
+
 public:
 	// --- ZmTapDelegate 接口实现 ---
 
@@ -183,6 +188,7 @@ private:
 
 	ZmArrayList<ZM_HUB_LISTENER> m_proxy_listeners;  ///< 代理监听端口列表
 	ZmTapDelegateJRPC*           m_delegate_jrpc;      ///< JRPC 协议委托处理器
+	ZmTapDelegateRESTful*        m_delegate_restful;   ///< RESTful 协议委托处理器
 };
 
 #endif  // ZM_NET_TAP_HUB_H

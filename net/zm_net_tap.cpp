@@ -22,6 +22,7 @@ void ZM_TAP_CTX::Clear()
     state = ZM_TAP_STATE_NONE;
     _slot = nullptr;
     pair_handle = nullptr;
+    httpd_task = nullptr;
     drop_timeout_error_code = 0;
     requester_data_len = 0;
     requester_received_len = 0;
@@ -73,7 +74,7 @@ void ZmTapContext::Clear()
             tap->delegate->OnTapDrop(tap);
 
         CancelResolve(tap);
-        FreeRequesterEnd(tap);
+        FreeRequesterBev(tap);
 
         if (tap->ev_timeout)
         {
@@ -113,7 +114,7 @@ void ZmTapContext::Drop(ZM_TAP_CTX* tap, std::string_view reason)
         tap->delegate->OnTapDrop(tap);
 
     CancelResolve(tap);
-    FreeRequesterEnd(tap);
+    FreeRequesterBev(tap);
 
     if (tap->ev_timeout)
     {
@@ -139,7 +140,7 @@ void ZmTapContext::Drop(ZM_TAP_CTX* tap, std::string_view reason)
     }
 }
 
-void ZmTapContext::FreeRequesterEnd(ZM_TAP_CTX* tap)
+void ZmTapContext::FreeRequesterBev(ZM_TAP_CTX* tap)
 {
     // 若来自 bufferevent_pair 池，触发 EOF 到 pair0
     // 双事件互斥不靠 CAS，靠事件循环线程上 OnResponseRead/OnResponseEvent 的
@@ -714,7 +715,8 @@ void ZmTapContextEventHandler::OnRequesterAcceptConnCB(struct evconnlistener* li
  * @note 调用后 bev 由 TAP 接管生命周期（BEV_OPT_CLOSE_ON_FREE），调用者不应再操作 bev
  */
 bool ZmTapContextEventHandler::OnPairAcceptBev(ContextEventHandlerParams* params, struct bufferevent* bev,
-                                                struct sockaddr* address, ZmBuffereventPairHandle* handle)
+                                                struct sockaddr* address, ZmBuffereventPairHandle* handle,
+                                                ZmHttpdTask* task)
 {
     ZmTapDelegate* delegate = (ZmTapDelegate*)params->delegate;
     ZmTapContext* context = params->ctx;
@@ -737,6 +739,7 @@ bool ZmTapContextEventHandler::OnPairAcceptBev(ContextEventHandlerParams* params
     tap->delegate = delegate;
     tap->requester_bev = bev;
     tap->pair_handle = handle;
+    tap->httpd_task = task;
 
     if (address)
     {
@@ -766,11 +769,12 @@ bool ZmTapContextEventHandler::OnPairAcceptBev(ContextEventHandlerParams* params
 }
 
 bool ZmTapContextEventHandler::OnPairAcceptBev(std::string_view name, struct bufferevent* bev,
-                                                struct sockaddr* address, ZmBuffereventPairHandle* handle)
+                                                struct sockaddr* address, ZmBuffereventPairHandle* handle,
+                                                ZmHttpdTask* task)
 {
     auto it = m_registry.find(std::string(name));
     if (it != m_registry.end())
-        return OnPairAcceptBev(&it->second, bev, address, handle);
+        return OnPairAcceptBev(&it->second, bev, address, handle, task);
 
     return false;
 }

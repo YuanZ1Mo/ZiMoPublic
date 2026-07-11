@@ -68,9 +68,10 @@ class ZmTapContext;
 /** @brief delegate 工作模式枚举 */
 typedef enum
 {
-    ZM_DELEGATE_MODE_NONE = 0,                 /** 未设置 */
-    ZM_DELEGATE_MODE_PROXY_INTERNAL_HUB = 1,   /** 内部 Hub 代理 */
-    ZM_DELEGATE_MODE_PROXY_INTERNAL_JRPC = 2,  /** 内部 JRPC 代理 */
+    ZM_DELEGATE_MODE_NONE = 0,                   /** 未设置 */
+    ZM_DELEGATE_MODE_PROXY_INTERNAL_HUB = 1,     /** 内部 Hub 代理 */
+    ZM_DELEGATE_MODE_PROXY_INTERNAL_JRPC = 2,    /** 内部 JRPC 代理 */
+    ZM_DELEGATE_MODE_PROXY_INTERNAL_RESTFUL = 3, /** 内部 RESTful 代理 */
 } ZM_DELEGATE_MODE;
 
 /** @brief TAP 状态枚举 */
@@ -102,6 +103,7 @@ public:
     event*        ev_timeout;                 ///< 超时定时器事件
     uint32_t      drop_timeout_error_code;    ///< 超时错误码
 
+    ZmHttpdTask*    httpd_task;                 ///< HTTP 请求上下文指针（RESTful 模式用），业务层通过它直接回写响应
     bufferevent*  requester_bev;              ///< 请求端 bufferevent
     BYTE*         requester_data;             ///< 请求数据接收缓冲区（变长，堆分配）
     uint32_t      requester_data_len;         ///< 期望接收的请求数据总长度
@@ -169,7 +171,7 @@ public:
     static void SetDropTimer(ZM_TAP_CTX* tap, int seconds = 0, int micros = 0, uint32_t drop_timeout_error_code = 0);
     // --- 静态工具方法 ---
     /** @brief 释放请求端 bufferevent */
-    static void FreeRequesterEnd(ZM_TAP_CTX* tap);
+    static void FreeRequesterBev(ZM_TAP_CTX* tap);
     /** @brief 设置请求可选数据（会释放旧数据） */
     static void SetOptData(ZM_TAP_CTX* tap, size_t optlen = 0, const BYTE* optdata = nullptr);
     /** @brief 设置回传数据（会释放旧数据） */
@@ -305,10 +307,12 @@ public:
      *  @note  用于进程内零拷贝通信，bev 无需关联 socket fd */
     static bool OnPairAcceptBev(ContextEventHandlerParams* params, struct bufferevent* bev,
                                 struct sockaddr* address = nullptr,
-                                ZmBuffereventPairHandle* handle = nullptr);
+                                ZmBuffereventPairHandle* handle = nullptr,
+                                ZmHttpdTask* task = nullptr);
     static bool OnPairAcceptBev(std::string_view name, struct bufferevent* bev,
                                 struct sockaddr* address = nullptr,
-                                ZmBuffereventPairHandle* handle = nullptr);
+                                ZmBuffereventPairHandle* handle = nullptr,
+                                ZmHttpdTask* task = nullptr);
     static void OnRequesterEventCB(struct bufferevent* requester_bev, short events, void* ctx);
     static void OnRequesterReadCB(struct bufferevent* requester_bev, void* ctx);
 

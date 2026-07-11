@@ -61,6 +61,58 @@ int ZmHttpUtil::ParseVerb(std::string_view method)
     return ZM_HTTP_VERB_NONE;
 }
 
+const char* ZmHttpUtil::VerbToString(evhttp_cmd_type verb)
+{
+    switch (verb)
+    {
+    case EVHTTP_REQ_GET:     return "GET";
+    case EVHTTP_REQ_POST:    return "POST";
+    case EVHTTP_REQ_CONNECT: return "CONNECT";
+    case EVHTTP_REQ_PUT:     return "PUT";
+    case EVHTTP_REQ_DELETE:  return "DELETE";
+    case EVHTTP_REQ_OPTIONS: return "OPTIONS";
+    case EVHTTP_REQ_PATCH:    return "PATCH";
+    case EVHTTP_REQ_TRACE:    return "TRACE";
+    case EVHTTP_REQ_HEAD:     return "HEAD";
+    case EVHTTP_REQ_PROPFIND: return "PROPFIND";
+    case EVHTTP_REQ_PROPPATCH:return "PROPPATCH";
+    case EVHTTP_REQ_MKCOL:    return "MKCOL";
+    case EVHTTP_REQ_LOCK:     return "LOCK";
+    case EVHTTP_REQ_UNLOCK:   return "UNLOCK";
+    case EVHTTP_REQ_COPY:     return "COPY";
+    case EVHTTP_REQ_MOVE:     return "MOVE";
+    default:                  return "UNKNOWN";
+    }
+}
+
+const char* ZmHttpUtil::GetMimeType(const std::string& path)
+{
+    size_t dot = path.find_last_of('.');
+    if (dot == std::string::npos) return "application/octet-stream";
+
+    std::string ext = path.substr(dot);
+    for (auto& c : ext) c = (char)tolower((unsigned char)c);
+
+    if (ext == ".html" || ext == ".htm") return "text/html; charset=utf-8";
+    if (ext == ".css")                    return "text/css; charset=utf-8";
+    if (ext == ".js")                     return "application/javascript; charset=utf-8";
+    if (ext == ".json")                   return "application/json; charset=utf-8";
+    if (ext == ".png")                    return "image/png";
+    if (ext == ".jpg" || ext == ".jpeg")  return "image/jpeg";
+    if (ext == ".gif")                    return "image/gif";
+    if (ext == ".svg")                    return "image/svg+xml";
+    if (ext == ".ico")                    return "image/x-icon";
+    if (ext == ".woff")                   return "font/woff";
+    if (ext == ".woff2")                  return "font/woff2";
+    if (ext == ".ttf")                    return "font/ttf";
+    if (ext == ".txt")                    return "text/plain; charset=utf-8";
+    if (ext == ".xml")                    return "application/xml; charset=utf-8";
+    if (ext == ".pdf")                    return "application/pdf";
+    if (ext == ".zip")                    return "application/zip";
+
+    return "application/octet-stream";
+}
+
 int ZmHttpUtil::StartWithVerbs(std::string_view buf)
 {
     // GET POST CONNECT PUT DELETE OPTIONS PATCH TRACE HEAD
@@ -382,6 +434,18 @@ evhttp_cmd_type ZmHttpdTask::Method()
 const char* ZmHttpdTask::Uri()
 {
     return evhttp_request_get_uri(m_request);
+}
+
+const char* ZmHttpdTask::Path()
+{
+    const struct evhttp_uri* uri = evhttp_request_get_evhttp_uri(m_request);
+    return uri ? evhttp_uri_get_path(uri) : "/";
+}
+
+const char* ZmHttpdTask::QueryStr()
+{
+    const struct evhttp_uri* uri = evhttp_request_get_evhttp_uri(m_request);
+    return uri ? evhttp_uri_get_query(uri) : "";
 }
 
 const char* ZmHttpdTask::Ip()
@@ -1670,4 +1734,98 @@ int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
 
     // JSON-RPC 层面的错误通过响应体中的 error 字段传达，HTTP 层面始终返回 200
     return ZM_HTTP_STATUS_CODE_OK;
+}
+
+// ============================================================================
+// ZmRESTfulServer — RESTful HTTP 服务器实现
+// ============================================================================
+
+ZmRESTfulServer::ZmRESTfulServer(struct event_base* evbase, std::string_view root_uri, uint16_t local_port)
+    : ZmHttpServer(evbase, local_port)
+{
+    if (!root_uri.empty())
+    {
+        size_t len = root_uri.size() < sizeof(m_root_uri) - 1 ? root_uri.size() : sizeof(m_root_uri) - 1;
+        memcpy(m_root_uri, root_uri.data(), len);
+        m_root_uri[len] = '\0';
+    }
+    else
+    {
+        memset(m_root_uri, 0, sizeof(m_root_uri));
+    }
+
+    std::string poolName = "ZmRESTfulServer:" + std::to_string(local_port);
+    SetPoolName(poolName);
+}
+
+ZmRESTfulServer::~ZmRESTfulServer()
+{}
+
+void ZmRESTfulServer::SetRESTfulCB(OnRESTfulRequestCB oncall)
+{
+    m_on_restful_call = oncall;
+}
+
+void ZmRESTfulServer::SetRESTfulCBAsync(OnRESTfulRequestCBAsync oncall)
+{
+    m_on_restful_async = oncall;
+}
+
+int ZmRESTfulServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t dlen)
+{
+    // ① URI 前缀过滤
+    if (m_root_uri[0])
+    {
+        const char* uri = task->Uri();
+        if (!uri || strncmp(uri, m_root_uri, strlen(m_root_uri)) != 0)
+            return 0;  // 不匹配前缀，返回 404
+    }
+
+    // ② 异步优先（和 JRPC 一样）— 全部请求打包走 pair → Hub → delegate
+    if (m_on_restful_async)
+    {
+        m_on_restful_async(task, data, dlen);
+        return -1;
+    }
+
+    // ③ 同步兜底
+    if (m_on_restful_call)
+    {
+        int code = m_on_restful_call(task, data, dlen);
+        return code;
+    }
+
+    return 0;  // 没设置任何回调
+}
+
+// ============================================================================
+// 工具方法
+// ============================================================================
+
+void ZmRESTfulServer::ReplyJson(ZmHttpdTask* task, int code, const ZMJSON& data)
+{
+    std::string json = data.dump();
+    task->PutReplyHeader("Content-Type", "application/json; charset=utf-8");
+    task->SetReply(code);
+    task->SetReplyData((const BYTE*)json.c_str(), json.size());
+    task->TriggerReply();
+}
+
+void ZmRESTfulServer::ReplyError(ZmHttpdTask* task, int code, std::string_view msg)
+{
+    ZMJSON err = {{"error", {{"code", code}, {"message", msg}}}};
+    ReplyJson(task, code, err);
+}
+
+void ZmRESTfulServer::ReplyEmpty(ZmHttpdTask* task, int code, const char* reason)
+{
+    task->SetReply(code, reason);
+    task->TriggerReply();
+}
+
+void ZmRESTfulServer::ReplyRedirect(ZmHttpdTask* task, const char* location, int code)
+{
+    task->PutReplyHeader("Location", location);
+    task->SetReply(code);
+    task->TriggerReply();
 }

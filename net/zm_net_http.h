@@ -161,6 +161,10 @@ public:
 
     /** Parse the HTTP verbs by the method name, like as 'GET'->ZM_HTTP_VERB_GET */
     static int          ParseVerb(std::string_view method);
+    /** Convert HTTP method enum to string, like as EVHTTP_REQ_GET->"GET" */
+    static const char*  VerbToString(evhttp_cmd_type verb);
+    /** Get MIME type string from file extension */
+    static const char*  GetMimeType(const std::string& path);
     /** Parse the HTTP request first line and return the verbs type */
     static int          StartWithVerbs(std::string_view buf);
     /** Parse the HTTP request first line */
@@ -219,6 +223,12 @@ public:
 
     /** @brief 获取请求的 URI 路径（含 query string），例如 "/api?foo=bar" */
     const char* Uri();
+
+    /** @brief 获取请求的路径部分（不含 query string），例如 "/api/users" */
+    const char* Path();
+
+    /** @brief 获取请求的 query string，例如 "foo=bar&page=1"（无参数时返回空字符串） */
+    const char* QueryStr();
 
     const char* Ip();
     ev_uint16_t Port();
@@ -868,6 +878,86 @@ private:
 
     /** @brief RPC 请求的 URI 前缀，匹配此前缀的请求走 RPC 流程 */
     char                    m_root_uri[128];
+};
+
+
+/**
+ * @brief RESTful HTTP 服务器，在 ZmHttpServer 基础上增加 RESTful 路由与分发
+ *
+ * 内部集成 ZmHttpRouter 提供路径匹配、中间件、路径参数。支持两种路由模式:
+ *   - Direct: handler 在 HTTP worker 线程直接执行，使用 ZmHttpdTask 写响应
+ *   - Pair:   请求通过 bufferevent_pair 注入 Hub → ZmTapDelegateRESTful → 业务线程处理
+ *             业务层通过 tap->httpd_task 直接回写 HTTP 响应（不走 pair 回传）
+ *
+ * @example Direct 模式
+ * @code
+ *   ZmRESTfulServer server(evbase, "/api", 8080);
+ *   server.GetRouter().Get("/api/status", [](ZmHttpdTask* task, const BYTE*, size_t) {
+ *       task->SetReplyData((const BYTE*)"OK", 2);
+ *       return 200;
+ *   });
+ * @endcode
+ *
+ * @example Pair 模式
+ * @code
+ *   server.RouteToPair("/api/users/*");
+ *   server.SetRESTfulCBAsync([](ZmHttpdTask* task, const ZMJSON& meta,
+ *       const BYTE* body, size_t body_len) {
+ *       // 打包帧 → 写 pair → 注入 Hub
+ *   });
+ * @endcode
+ */
+class ZmRESTfulServer : public ZmHttpServer
+{
+public:
+    /**
+     * @brief RESTful 同步回调 — handler 在 HTTP worker 线程直接处理
+     * @return HTTP 状态码（200/201/…），0 表示未处理，>0 框架调 TriggerReply 发送
+     *
+     * @note handler 设置 task 的响应头/响应体即可，不要调 TriggerReply（框架会调）
+     */
+    using OnRESTfulRequestCB = std::function<int(
+        ZmHttpdTask* task, const BYTE* body, size_t body_len)>;
+
+    using OnRESTfulRequestCBAsync = std::function<void(
+        ZmHttpdTask* task, const BYTE* body, size_t body_len)>;
+
+    ZmRESTfulServer(struct event_base* evbase, std::string_view root_uri, uint16_t local_port);
+    virtual ~ZmRESTfulServer();
+
+    /** @brief 设置同步回调（异步未设置时才走） */
+    void SetRESTfulCB(OnRESTfulRequestCB oncall);
+    /** @brief 设置异步回调（优先于同步） */
+    void SetRESTfulCBAsync(OnRESTfulRequestCBAsync oncall);
+
+    // ---- 工具方法 ----
+
+    /** @brief 快捷返回 JSON 响应（Content-Type: application/json） */
+    static void ReplyJson(ZmHttpdTask* task, int code, const ZMJSON& data);
+    /** @brief 快捷返回 JSON 错误响应 {"error":{"code":...,"message":...}} */
+    static void ReplyError(ZmHttpdTask* task, int code, std::string_view msg);
+    /** @brief 快捷返回空响应体（用于 204 No Content、201 Created 等） */
+    static void ReplyEmpty(ZmHttpdTask* task, int code, const char* reason = nullptr);
+    /** @brief 快捷返回重定向（301/302，设置 Location 头） */
+    static void ReplyRedirect(ZmHttpdTask* task, const char* location, int code = 302);
+
+protected:
+    /**
+     * @brief 处理 HTTP 请求（重写 ZmHttpServer 虚函数）
+     *
+     * 前缀匹配 → 构建 meta → 异步优先 → 同步兜底
+     * @return -1 异步模式，>0 同步处理完成，0 未匹配
+     */
+    virtual int OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t dlen) override;
+
+private:
+    /** @brief 同步回调（异步未设置时走） */
+    OnRESTfulRequestCB    m_on_restful_call;
+    /** @brief 异步回调（优先） */
+    OnRESTfulRequestCBAsync m_on_restful_async;
+
+    /** @brief URI 前缀（仅匹配此前缀的请求走 RESTful 流程） */
+    char m_root_uri[128];
 };
 
 
