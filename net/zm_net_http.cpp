@@ -346,6 +346,11 @@ ZmHttpdTask::ZmHttpdTask(struct evhttp_request* request) : m_request(request), m
     // 创建用于存储响应体的 evbuffer，后续通过 SetReplyData 写入
     m_reply_buf = evbuffer_new();
     m_input_buf = nullptr;
+
+    // 创建流式响应数据块缓冲区（启用线程安全锁，工作线程写入，事件循环线程读取）
+    m_chunk_buf = evbuffer_new();
+    evbuffer_enable_locking(m_chunk_buf, nullptr);
+    m_streaming = false;
 }
 
 ZmHttpdTask::~ZmHttpdTask()
@@ -356,6 +361,12 @@ ZmHttpdTask::~ZmHttpdTask()
         evbuffer_free(m_reply_buf);
     }
     m_reply_buf = nullptr;
+
+    if (m_chunk_buf)
+    {
+        evbuffer_free(m_chunk_buf);
+    }
+    m_chunk_buf = nullptr;
 }
 
 struct evhttp_request* ZmHttpdTask::Request()
@@ -552,6 +563,54 @@ void ZmHttpdTask::SetReplyCallback(std::function<void()> cb)
     m_on_reply = std::move(cb);
 }
 
+// ============================ 流式响应 ============================
+
+void ZmHttpdTask::StartStreamReply(int code, const char* reason)
+{
+    m_status_code = code;
+    m_reason = std::string(reason ? reason : "");
+    m_streaming = true;
+    if (m_on_stream_start)
+        m_on_stream_start();
+}
+
+void ZmHttpdTask::SendReplyChunk(const BYTE* data, size_t dlen)
+{
+    if (!data || dlen == 0)
+        return;
+    if (!m_streaming)
+        return;
+
+    // evbuffer_add 在 evbuffer_enable_locking 后线程安全
+    evbuffer_add(m_chunk_buf, data, dlen);
+    if (m_on_stream_chunk)
+        m_on_stream_chunk();
+}
+
+void ZmHttpdTask::EndStreamReply()
+{
+    if (!m_streaming)
+        return;
+    m_streaming = false;
+    if (m_on_stream_end)
+        m_on_stream_end();
+}
+
+void ZmHttpdTask::SetStreamStartCallback(std::function<void()> cb)
+{
+    m_on_stream_start = std::move(cb);
+}
+
+void ZmHttpdTask::SetStreamChunkCallback(std::function<void()> cb)
+{
+    m_on_stream_chunk = std::move(cb);
+}
+
+void ZmHttpdTask::SetStreamEndCallback(std::function<void()> cb)
+{
+    m_on_stream_end = std::move(cb);
+}
+
 // ============================ ZmHttpServer internals ============================
 
 /**
@@ -581,6 +640,17 @@ public:
         // 延迟回复回调：this 不变，整个生命周期只设置一次
         SetReplyCallback([this] {
             event_active(m_reply_event, ZmHttpServer::ZM_HTTPD_CONTROL_REPLY, 0);
+        });
+
+        // 流式响应回调：将工作线程的请求投递到事件循环线程执行
+        SetStreamStartCallback([this] {
+            event_active(m_reply_event, ZmHttpServer::ZM_HTTPD_CONTROL_STREAM_START, 0);
+        });
+        SetStreamChunkCallback([this] {
+            event_active(m_reply_event, ZmHttpServer::ZM_HTTPD_CONTROL_STREAM_CHUNK, 0);
+        });
+        SetStreamEndCallback([this] {
+            event_active(m_reply_event, ZmHttpServer::ZM_HTTPD_CONTROL_STREAM_END, 0);
         });
     }
 
@@ -620,10 +690,12 @@ public:
 
         // ③ 清空响应状态（evbuffer 只 drain，不 free）
         evbuffer_drain(m_reply_buf, evbuffer_get_length(m_reply_buf));
+        evbuffer_drain(m_chunk_buf, evbuffer_get_length(m_chunk_buf));
         m_reply_headers.clear();
         m_reason.clear();
         m_status_code = 0;
         m_input_buf = nullptr;
+        m_streaming = false;
         m_id = ++g_httpd_task_id;
 
         // ★ 以下成员保持不变（生命周期 = doer 对象生命周期）:
@@ -637,7 +709,8 @@ public:
     // 响应发送
     // ========================================================================
 
-    void SendReply()
+    /** @brief 将默认响应头和业务层自定义响应头写入 libevent 请求（SendReply / SendReplyStart 共用） */
+    void WriteResponseHeaders()
     {
         PutReplyHeader("Access-Control-Allow-Origin", "*");
         PutReplyHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
@@ -649,10 +722,46 @@ public:
             evhttp_add_header(evhttp_request_get_output_headers(m_request),
                 it->first.c_str(), it->second.c_str());
         }
+    }
+
+    /** @brief 发送完整 HTTP 响应（一次性），由 ZM_HTTPD_CONTROL_REPLY 触发 */
+    void SendReply()
+    {
+        WriteResponseHeaders();
         evhttp_send_reply(m_request, m_status_code,
             m_reason.empty() ? nullptr : m_reason.c_str(), m_reply_buf);
 
         // ★ 生命周期由调用方 OnEventControl 管理，此处不回收
+    }
+
+    /** @brief 开始流式响应：写响应头，进入 chunked 传输模式 */
+    void SendReplyStart()
+    {
+        WriteResponseHeaders();
+        evhttp_send_reply_start(m_request, m_status_code,
+            m_reason.empty() ? nullptr : m_reason.c_str());
+    }
+
+    /** @brief 将 m_chunk_buf 中的累积数据通过 evhttp_send_reply_chunk 发送（事件循环线程调用） */
+    void SendReplyChunkToClient()
+    {
+        size_t len = evbuffer_get_length(m_chunk_buf);
+        if (len == 0)
+            return;
+
+        struct evbuffer* tmp = evbuffer_new();
+        // evbuffer_remove_buffer: 将 m_chunk_buf 的全部数据移动到 tmp（不拷贝）
+        evbuffer_remove_buffer(m_chunk_buf, tmp, len);
+        evhttp_send_reply_chunk(m_request, tmp);
+        evbuffer_free(tmp);
+    }
+
+    /** @brief 结束流式响应：刷出剩余数据块并发送终止块，doer 由调用方回收 */
+    void SendReplyEnd()
+    {
+        // 先刷出所有未发送的数据块
+        SendReplyChunkToClient();
+        evhttp_send_reply_end(m_request);
     }
 
     // ========================================================================
@@ -668,14 +777,29 @@ public:
         catch (const std::exception& e)
         {
             PUBLIC_LOG_ERROR("[请求#{}] Perform 异常: {}", m_id, e.what());
-            SetReply(ZM_HTTP_STATUS_CODE_INTERNAL_ERROR, "Internal Server Error");
-            TriggerReply();
+            if (m_streaming)
+            {
+                // 流式响应已开始，通过 event_active 结束（事件循环线程负责 evhttp_send_reply_end + 回收）
+                EndStreamReply();
+            }
+            else
+            {
+                SetReply(ZM_HTTP_STATUS_CODE_INTERNAL_ERROR, "Internal Server Error");
+                TriggerReply();
+            }
         }
         catch (...)
         {
             PUBLIC_LOG_ERROR("[请求#{}] Perform 未知异常", m_id);
-            SetReply(ZM_HTTP_STATUS_CODE_INTERNAL_ERROR, "Internal Server Error");
-            TriggerReply();
+            if (m_streaming)
+            {
+                EndStreamReply();
+            }
+            else
+            {
+                SetReply(ZM_HTTP_STATUS_CODE_INTERNAL_ERROR, "Internal Server Error");
+                TriggerReply();
+            }
         }
     }
 
@@ -1185,10 +1309,32 @@ void ZmHttpServer::OnEventControl(evutil_socket_t fd, short what, void* ctx)
         // 通过位与判断触发了哪种控制信号
         if (ZmHttpServer::ZM_HTTPD_CONTROL_REPLY & what)
         {
-            // 工作线程请求发送响应
+            // 工作线程请求发送完整响应
             ZmHttpdDoer* doer = (ZmHttpdDoer*)ctx;
             doer->SendReply();
             // ★ 回收至对象池（替代 delete this）
+            doer->HttpServer()->RecycleDoer(doer);
+        }
+        if (ZmHttpServer::ZM_HTTPD_CONTROL_STREAM_START & what)
+        {
+            // 工作线程请求开始流式响应（仅发送响应头）
+            ZmHttpdDoer* doer = (ZmHttpdDoer*)ctx;
+            doer->SendReplyStart();
+            // ★ 不回收：流式响应进行中，等待 CHUNK / END 信号
+        }
+        if (ZmHttpServer::ZM_HTTPD_CONTROL_STREAM_CHUNK & what)
+        {
+            // 工作线程请求发送一个流式数据块
+            ZmHttpdDoer* doer = (ZmHttpdDoer*)ctx;
+            doer->SendReplyChunkToClient();
+            // ★ 不回收：流式响应进行中
+        }
+        if (ZmHttpServer::ZM_HTTPD_CONTROL_STREAM_END & what)
+        {
+            // 工作线程请求结束流式响应
+            ZmHttpdDoer* doer = (ZmHttpdDoer*)ctx;
+            doer->SendReplyEnd();
+            // ★ 流式响应结束，回收至对象池
             doer->HttpServer()->RecycleDoer(doer);
         }
     }

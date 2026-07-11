@@ -315,6 +315,52 @@ public:
      */
     void ClearReplyBody();
 
+    // ---- 流式响应（Chunked Transfer-Encoding） ----
+
+    /**
+     * @brief 开始流式响应，仅发送 HTTP 响应头（Transfer-Encoding: chunked）
+     *
+     * 调用后连接进入分块传输模式，后续通过 SendReplyChunk() 发送数据块，
+     * 最后通过 EndStreamReply() 结束流式响应。
+     *
+     * 适用于 SSE 推送、大文件下载、实时日志推送等需要边产出边发送的场景。
+     * 可在任意线程调用（通过 event_active 投递到事件循环线程发送响应头）。
+     *
+     * @param code    HTTP 状态码，如 200
+     * @param reason  原因短语，如 "OK"，传入 nullptr 时由 libevent 自动填充
+     *
+     * @note 调用前需通过 PutReplyHeader / SetReply 设置好响应头和状态码
+     * @note handler 应返回 -1（异步模式）阻止框架自动发送完整响应
+     */
+    void StartStreamReply(int code, const char* reason = nullptr);
+
+    /**
+     * @brief 发送一个流式数据块
+     *
+     * 数据块通过线程安全的内部缓冲区传递到事件循环线程，由事件循环调用
+     * evhttp_send_reply_chunk 发送。频繁小块写入时，事件循环可能将多个块
+     * 合并为一次发送（由 libevent 事件合并行为决定，对客户端透明）。
+     *
+     * 可在任意线程调用，不需要等待前一个块发送完成。
+     *
+     * @param data  数据块字节指针
+     * @param dlen  数据块长度（字节数）
+     */
+    void SendReplyChunk(const BYTE* data, size_t dlen);
+
+    /**
+     * @brief 结束流式响应，发送终止块并释放连接
+     *
+     * 若内部缓冲区还有未发送的数据块，会先刷出再发送终止块。
+     * 调用后 doer 被回收，task 不可再使用。
+     *
+     * 可在任意线程调用。
+     */
+    void EndStreamReply();
+
+    /** @brief 查询当前是否处于流式响应模式 */
+    bool IsStreaming() const { return m_streaming; }
+
     /**
      * @brief 发送被延迟的 HTTP 响应
      *
@@ -330,10 +376,20 @@ protected:
     /** @brief 设置延迟回复回调（由 ZmHttpdDoer 在构造时调用） */
     void SetReplyCallback(std::function<void()> cb);
 
+    /** @brief 设置流式响应回调（由 ZmHttpdDoer 在构造时调用） */
+    void SetStreamStartCallback(std::function<void()> cb);
+    void SetStreamChunkCallback(std::function<void()> cb);
+    void SetStreamEndCallback(std::function<void()> cb);
+
 protected:
     friend class ZmHttpdDoer;
 
     std::function<void()> m_on_reply;                ///< 回复信号回调
+
+    /** @brief 流式响应回调（由 ZmHttpdDoer 设置，触发 event_active 投递到事件循环） */
+    std::function<void()> m_on_stream_start;
+    std::function<void()> m_on_stream_chunk;
+    std::function<void()> m_on_stream_end;
     /** @brief 底层 libevent HTTP 请求对象 */
     struct evhttp_request*              m_request;
 
@@ -357,6 +413,12 @@ protected:
 
     /** @brief 请求体原始 evbuffer（由 Perform 设置，用于分块读取大文件） */
     struct evbuffer*                    m_input_buf;
+
+    /** @brief 流式响应数据块累积缓冲区（线程安全锁，工作线程写入，事件循环线程读取并发送） */
+    struct evbuffer*                    m_chunk_buf;
+
+    /** @brief 是否处于流式响应模式 */
+    bool                                m_streaming;
 
 public:
     /**
@@ -461,7 +523,10 @@ public:
      */
     enum
     {
-        ZM_HTTPD_CONTROL_REPLY     = 0x0200,   ///< 工作线程请求发送响应
+        ZM_HTTPD_CONTROL_REPLY        = 0x0200,   ///< 工作线程请求发送完整响应
+        ZM_HTTPD_CONTROL_STREAM_START = 0x0400,   ///< 工作线程请求开始流式响应（发响应头）
+        ZM_HTTPD_CONTROL_STREAM_CHUNK = 0x0800,   ///< 工作线程请求发送流式数据块
+        ZM_HTTPD_CONTROL_STREAM_END   = 0x1000,   ///< 工作线程请求结束流式响应
     };
 
     /**
