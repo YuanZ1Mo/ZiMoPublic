@@ -9,7 +9,7 @@ ZiMoPublic/
 ├── define/          # 通用宏定义、版本号
 ├── json/            # nlohmann/json 封装（类型安全的读写辅助）
 ├── libevent/        # 预编译 libevent 头文件及静态库（事件驱动网络库）
-├── net/             # 网络通信模块（TCP/HTTP/DNS/TAP 代理链/消息广播）
+├── net/             # 网络通信模块（TCP/HTTP/RESTful/DNS/TAP 双协议代理链/路由中间件/消息广播/SSE）
 ├── openssl/         # 预编译 OpenSSL 头文件及静态库
 ├── service/         # Windows 服务基类（SCM 集成、安装/卸载）
 ├── spdlog/          # 定制版 spdlog 日志库 + zm_logger 封装
@@ -86,20 +86,33 @@ ZiMoPublic/
 | `ZmNetSocketTCP` | 阻塞式 TCP 客户端：超时连接、KeepAlive、HTTP CONNECT 代理隧道、非阻塞模式切换 |
 | `ZmNetSocketSSL` | SSL/TLS 客户端：基于 OpenSSL BIO 链，支持 SNI、IPv4/IPv6、证书指纹校验 |
 
-#### zm_net_http — HTTP / JSON-RPC 服务端
+#### zm_net_http — HTTP / JSON-RPC / RESTful 服务端
 
 | 类 | 说明 |
 |----|------|
 | `ZmHttpUtil` | HTTP 工具：动词解析、请求解析、URI 解析、Query 参数提取 |
-| `ZmHttpdTask` | HTTP 请求上下文：读取 URI/方法/请求头，写入响应状态码/头/体 |
+| `ZmHttpdTask` | HTTP 请求上下文：读取 URI/方法/请求头，写入响应状态码/头/体，支持流式分块回复 |
 | `ZmHttpHead` | HTTP 头部封装：解析、构建、键值查询 |
 | `ZmHttpServer` | 多线程 HTTP 服务器：每个请求分配独立 Worker 线程处理，不阻塞事件循环 |
 | `ZmJsonRpcServer` | JSON-RPC 2.0 服务器：协议解析与分发，支持 GET（Base64）/POST、JSONP 回调 |
+| `ZmRESTfulServer` | ★ RESTful HTTP 服务器：继承 ZmHttpServer，支持异步回调 + `TriggerReply()` 直通响应 |
 
 关键设计：
 - **线程模型**：事件循环线程接收请求 → Worker 线程处理 → event_active 通知事件循环线程发送响应
 - **CORS 支持**：自动添加跨域响应头
-- **延迟释放**：响应发送后 1 秒定时器释放 Worker 资源
+- **即时释放**：Worker 资源即时释放（池化复用），减少内存占用
+- **SSE 推送**：支持 `StartStreamReply`/`SendReplyChunk`/`EndStreamReply` 流式分块响应（text/event-stream）
+- **请求头透传**：Worker 线程可通过 `ZmHttpdTask` 读写请求头/响应头，支持业务侧自定义头部
+
+#### zm_net_http_router — HTTP 路由中间件
+
+| 类 | 说明 |
+|----|------|
+| `ZmHttpRouter` | Express 风格的路由器：`Get`/`Post`/`Put`/`Delete`/`Any` 注册，前缀树匹配 |
+| `ZmHttpMiddlewareLogging` | 日志中间件：记录请求方法、路径、耗时 |
+| `ZmHttpMiddlewareRecovery` | 异常恢复中间件：捕获 handler 异常返回 500 |
+
+路由模式：`(task, next)` 函数管道，支持 `*` 通配符兜底路由。
 
 #### zm_net_tap — TAP 代理框架
 
@@ -132,7 +145,22 @@ ZiMoPublic/
 |----|------|
 | `ZmTapDelegateJRPC` | JRPC 协议委托：解析长度前缀帧格式（4 字节大端长度 + JSON 体），通过回调通知上层 |
 
+帧格式：`[4 字节大端长度][JSON body]`
 回调类型：`TapDelegateJrpcRequestReadCB = std::function<void(ZM_TAP_CTX*, const char*)>`
+
+#### zm_net_tap_rest — ★ RESTful 协议委托
+
+| 类 | 说明 |
+|----|------|
+| `ZmTapDelegateRESTful` | RESTful 协议委托：解析 Hub 转发来的 "REST" 帧（4 字节魔数 + 4 字节 body_len + raw_body），解帧后通过线程池分发到业务回调 |
+
+帧格式：`[4 字节 "REST"][4 字节大端 body_len][raw_body]`
+回调类型：`TapDelegateRESTfulRequestCB = std::function<void(ZM_TAP_CTX*, const BYTE*, size_t)>`
+
+与 JRPC delegate 的关键区别：
+- **响应路径**：RESTful 业务层直接操作 `tap->httpd_task->TriggerReply()` 写 HTTP 响应，**不通过 pair 回传**；JRPC 则通过 `ZmTapContext::Response()` 写 pair[1] 回写到 pair[0] 触发 HTTP 响应
+- **请求元信息**：method/path/headers 直接从 `tap->httpd_task` 读取，无需打包进帧，帧体仅含原始 body
+- **独立线程池**：拥有独立的 `ZmThreadPool` 执行业务回调，与 JRPC delegate 互不干扰
 
 #### zm_net_broadcast — TCP 消息广播
 
@@ -173,7 +201,7 @@ ZiMoPublic/
 **上层集成（ZiMoService）：**
 - `BroadcastManager`：包装 `ZmBroadcastServer`，自管理事件循环线程
 - `NetDock`：通过 `OpenBroadcastServer()`/`CloseBroadcastServer()` 管理生命周期
-- `ServicePortal`：暴露 `BroadcastMessage()` 及 JRPC `broadcast` 方法供业务层调用
+- `ServicePortal`：暴露 `BroadcastMessage()` 供 JRPC `broadcast` 方法和 RESTful `POST /broadcast` 共用
 - 前端控制面板显示 Broadcast 运行状态（状态/端口/连接数/发送数）
 
 ### service — Windows 服务框架
@@ -292,6 +320,13 @@ ssl ────────→ openssl
 service ────→ util
 define ───── (无依赖)
 ```
+
+net 模块内部依赖：
+```
+zm_net_tap_rest → zm_net_tap (TAP 基类)
+zm_net_tap_jrpc → zm_net_tap (TAP 基类)
+zm_net_tap_hub  → zm_net_tap + zm_net_tap_jrpc + zm_net_tap_rest
+zm_net_http     → zm_net_runloop + zm_net_http_router
 
 ## 构建与集成
 
