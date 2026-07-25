@@ -12,6 +12,7 @@
 #include "../util/zm_util_str.h"
 
 #include <../libevent/include/event2/util.h>
+#include <../openssl/include/openssl/evp.h>
 
 #include <cstdint>
 
@@ -193,28 +194,24 @@ public:
     /**
      * @brief 创建服务端 SSL 上下文（仅创建 ctx，不加载证书）
      *
-     * 创建并配置服务端 SSL_CTX（TLS_server_method、禁用老协议、自动 DH），
-     * 但不上载证书/私钥。调用者需自行调用 UseCertBuffer / UsePrivateKeyFilePass
-     * 加载证书和私钥，最后调用 SSL_CTX_check_private_key 验证。
-     *
+     * @param sessionCacheSize  会话缓存容量，传入 0 不启用；>0 启用并设置缓存条目数
+     * @param sessionContext    会话上下文标识，仅 sessionCacheSize>0 时有效，最长 32 字节
      * @return 新创建的 SSL_CTX 指针，失败返回 NULL
-     *
-     * @note 调用者负责通过 SSL_CTX_free() 释放返回值
-     * @note 内部调用 OPENSSL_init_ssl() 确保 OpenSSL 已初始化
      */
-    static SSL_CTX* MakeServerCTX();
+    static SSL_CTX* MakeServerCTX(uint32_t sessionCacheSize = 0,
+                                  const char* sessionContext = nullptr);
 
     /**
      * @brief 创建并加载证书的服务端 SSL 上下文（便捷方法）
      *
-     * 等价于 MakeServerCTX() + SSL_CTX_use_certificate_file +
-     * UsePrivateKeyFilePass + SSL_CTX_check_private_key。
-     *
-     * @param certFile  证书 PEM 文件路径
-     * @param keyFile   私钥 PEM 文件路径，无加密时传空密码 ""
-     * @return 成功返回已加载证书的 SSL_CTX，任何步骤失败返回 NULL（已内部释放）
+     * @param certFile          证书 PEM 文件路径
+     * @param keyFile           私钥 PEM 文件路径，无加密时传空密码 ""
+     * @param sessionCacheSize  会话缓存容量，0=不启用
+     * @param sessionContext    会话上下文标识，nullptr=不设置
      */
-    static SSL_CTX* MakeServerCTX(const char* certFile, const char* keyFile);
+    static SSL_CTX* MakeServerCTX(const char* certFile, const char* keyFile,
+                                  uint32_t sessionCacheSize = 0,
+                                  const char* sessionContext = nullptr);
 
     static void     Release();
 
@@ -274,6 +271,145 @@ public:
 private:
     BIO*      m_bio;   /**< OpenSSL BIO 对象 */
     BUF_MEM*  m_buf;   /**< BUF_MEM 指针，由 Buf() 填充 */
+};
+
+// Session Ticket 密钥：48 字节（name[16] + hmac_key[16] + aes_key[16]）
+#define ZM_SESSION_TICKET_KEY_LEN 48
+
+/**
+ * @brief TLS Session Ticket 管理器
+ *
+ * 每个 HTTPS 服务器实例可独立持有一个 ZmSessionTicketManager。
+ * Init() 加载或生成 48 字节随机密钥并持久化到文件；
+ * Bind() 将密钥注册到 SSL_CTX，OpenSSL 自动签发/解密 ticket。
+ *
+ * 支持密钥轮换：RotateKeys() 将当前密钥推入 "上一轮" 槽位，
+ * 旧密钥仍可解密存量 ticket，新 ticket 用新密钥加密。
+ *
+ * 使用方式（在 OnConfigureSSL 中）：
+ * @code
+ *   void OnConfigureSSL(SSL_CTX* ctx) override {
+ *       m_sessionTicket.Init("certs/ticket.key");
+ *       m_sessionTicket.Bind(ctx);
+ *   }
+ * @endcode
+ *
+ * @note 多个服务器加载同一 ticket.key → 共享 session ticket（跨端口恢复）
+ * @note 加载不同 ticket.key → 互相隔离（独立会话空间）
+ */
+class ZmSessionTicketManager
+{
+public:
+    ZmSessionTicketManager();
+    ~ZmSessionTicketManager();
+
+    /**
+     * @brief 初始化 ticket 密钥
+     *
+     * 从 file 加载已有密钥；若文件不存在则生成 48 字节随机密钥并写入文件。
+     *
+     * @param ticketFile  密钥文件路径，nullptr 表示仅内存不持久化
+     * @return true 初始化成功（失败不影响 TLS，回退到完整握手）
+     */
+    bool Init(const char* ticketFile = nullptr);
+
+    /**
+     * @brief 轮换 ticket 密钥
+     *
+     * 当前密钥 → 上一轮（仅解密），生成新密钥用于加密。
+     * 建议每 12-24 小时调用一次。
+     */
+    void RotateKeys();
+
+    /**
+     * @brief 注册 ticket key 回调到 SSL_CTX
+     *
+     * 必须在 Init() 之后、SSL_CTX 投入使用之前调用。
+     */
+    void Bind(struct ssl_ctx_st* ctx);
+
+private:
+    static int  OnTicketKeyCallback(SSL* ssl, unsigned char keyName[16],
+                                    unsigned char iv[EVP_MAX_IV_LENGTH],
+                                    EVP_CIPHER_CTX* cipher, EVP_MAC_CTX* mac, int enc);
+
+    int  handleTicketKey(unsigned char keyName[16],
+                         unsigned char iv[EVP_MAX_IV_LENGTH],
+                         EVP_MAC_CTX* mac, int enc);
+
+    struct TicketKey { unsigned char data[ZM_SESSION_TICKET_KEY_LEN]; };
+
+    TicketKey   m_currentKey;
+    TicketKey   m_prevKey;
+    bool        m_hasPrevKey;
+    std::string m_ticketFile;
+
+    static int  s_exDataIndex;
+};
+
+// 前向声明
+class ZmEvBaseRunLoop;
+
+/**
+ * @brief Session Ticket 密钥定时轮换器
+ *
+ * 内部持有独立 ZmEvBaseRunLoop 线程 + ZmSessionTicketManager，
+ * 按指定间隔自动轮换 ticket 密钥，轮换后触发回调通知使用者。
+ *
+ * 多个 HTTPS 服务器可共享同一个 Rotator，统一密钥管理，
+ * 避免各自计时导致的重复写入和密钥不一致。
+ *
+ * 使用方式：
+ * @code
+ *   ZmTicketKeyRotator rotator;
+ *   rotator.Init("certs/ticket.key");
+ *   rotator.Start(12 * 3600, []() { LOG("rotated"); });
+ *
+ *   serverA->BindTicket(&rotator.GetTicketManager());
+ *   serverB->BindTicket(&rotator.GetTicketManager());
+ * @endcode
+ */
+class ZmTicketKeyRotator
+{
+public:
+    using OnRotateCB = std::function<void()>;
+
+    ZmTicketKeyRotator();
+    ~ZmTicketKeyRotator();
+
+    /** @brief 加载或生成 ticket 密钥文件 */
+    bool Init(const char* ticketFile);
+
+    /**
+     * @brief 启动定时轮换
+     * @param intervalSeconds  轮换间隔（秒），如 12*3600
+     * @param onRotate         轮换后回调，nullptr = 不需要通知
+     */
+    bool Start(time_t intervalSeconds, OnRotateCB onRotate = nullptr);
+
+    /** @brief 立即触发一次轮换（线程安全，投递到事件循环线程执行） */
+    void RotateNow();
+
+    /** @brief 停止定时器 + 停止事件循环线程 */
+    void Stop();
+
+    bool IsRunning() const;
+
+    ZmSessionTicketManager& GetTicketManager() { return m_ticketMgr; }
+
+private:
+    static void OnTimer(evutil_socket_t, short, void* arg);
+    static void OnCtrl(evutil_socket_t, short, void* arg);
+
+    void doRotate();
+
+    enum { CTRL_ROTATE = 0x0200 };
+
+    ZmSessionTicketManager  m_ticketMgr;
+    ZmEvBaseRunLoop*        m_evLoop;
+    struct event*           m_timer;
+    struct event*           m_ctrlEvent;
+    OnRotateCB              m_onRotate;
 };
 
 #endif /* ZM_SSL_CTX_H */

@@ -836,6 +836,11 @@ public:
         PutReplyHeader("Access-Control-Allow-Headers", "*");
         PutReplyHeader("ZmHttpServer-Version", ZIMO_SERVER_VERSION);
 
+        // ★ HSTS：仅在 HTTPS 模式下启用，告知浏览器"永远用 HTTPS 访问本站"
+        // 后续可通过 OnConfigureSSL 的 mTLS 扩展点进一步定制安全头
+        if (m_httpd->IsHttps())
+            PutReplyHeader("Strict-Transport-Security", "max-age=31536000");
+
         for (auto it = m_reply_headers.begin(); it != m_reply_headers.end(); it++)
         {
             evhttp_add_header(evhttp_request_get_output_headers(m_request),
@@ -1247,18 +1252,21 @@ bool ZmHttpHead::IsEmpty()
 
 ZmHttpServer::ZmHttpServer(struct event_base* evbase, uint16_t local_port,
                          const char* certFile, const char* keyFile,
-                         uint16_t redirect_from_port)
+                         uint16_t redirect_from_port,
+                         uint32_t sessionCacheSize,
+                         const char* sessionContext)
     : m_evbase(evbase), m_evhttpd(nullptr), m_threadPoolName(), m_threadPool(nullptr),
       m_local_port(local_port), m_port_bind_failed(false), m_ssl_ctx(nullptr),
+      m_oldCtx(nullptr), m_ctxCleanupTimer(nullptr),
       m_redirect_from_port(redirect_from_port), m_redirectEvhttp(nullptr),
       m_httpdDoerPool(nullptr)
 {
-    // 仅在 certFile 和 keyFile 都非空时启用 HTTPS，SSL_CTX 生命周期由此类完全管理
     if (certFile && certFile[0] && keyFile && keyFile[0])
     {
-        m_ssl_ctx = ZmSSLContext::MakeServerCTX(certFile, keyFile);
+        m_ssl_ctx = ZmSSLContext::MakeServerCTX(certFile, keyFile,
+                                                 sessionCacheSize, sessionContext);
         if (m_ssl_ctx)
-            OnConfigureSSL(m_ssl_ctx);  // ★ 扩展点：子类可覆写以实现 mTLS
+            OnConfigureSSL(m_ssl_ctx);  // ★ 扩展点：子类可覆写以实现 mTLS 等
     }
 }
 
@@ -1327,6 +1335,18 @@ void ZmHttpServer::Close()
 
     // m_evbase 由外部管理生命周期，不在此释放
 
+    // 释放证书热加载残留的旧 ctx（如果有）
+    if (m_ctxCleanupTimer)
+    {
+        event_free(m_ctxCleanupTimer);
+        m_ctxCleanupTimer = nullptr;
+    }
+    if (m_oldCtx)
+    {
+        SSL_CTX_free((SSL_CTX*)m_oldCtx);
+        m_oldCtx = nullptr;
+    }
+
     // 释放 SSL 上下文（如果有）
     if (m_ssl_ctx)
     {
@@ -1338,6 +1358,60 @@ void ZmHttpServer::Close()
 bool ZmHttpServer::IsOpen() const
 {
     return m_evhttpd != nullptr;
+}
+
+// ============================================================================
+// 证书热加载
+// ============================================================================
+
+bool ZmHttpServer::ReloadCertificate(const char* certFile, const char* keyFile)
+{
+    if (!certFile || !keyFile || !m_evbase)
+        return false;
+
+    // ① 创建新 SSL_CTX（沿用当前 session cache 配置，如需变更可扩展参数）
+    SSL_CTX* newCtx = ZmSSLContext::MakeServerCTX(certFile, keyFile);
+    if (!newCtx)
+    {
+        PUBLIC_LOG_WARN("ReloadCertificate: new cert/key load failed, keeping existing cert (port {})", m_local_port);
+        return false;
+    }
+
+    // ② 原子替换（事件循环线程操作，无竞态）
+    //     新连接 → OnSSLBuffereventCB 读 m_ssl_ctx → 拿到 newCtx
+    //     旧连接 → 已有独立的 SSL*，不受影响
+    SSL_CTX* old = (SSL_CTX*)m_ssl_ctx;
+    m_ssl_ctx = newCtx;
+
+    // ③ 清理上一次热加载残留的旧 ctx 和定时器
+    if (m_ctxCleanupTimer)
+    {
+        event_free(m_ctxCleanupTimer);
+        m_ctxCleanupTimer = nullptr;
+    }
+    if (m_oldCtx)
+    {
+        SSL_CTX_free((SSL_CTX*)m_oldCtx);
+        m_oldCtx = nullptr;
+    }
+
+    // ④ 保留当前的旧 ctx，延时 5 分钟后释放（等现有 TLS 连接完成或超时）
+    if (old)
+    {
+        m_oldCtx = old;
+        m_ctxCleanupTimer = event_new(m_evbase, -1, 0,
+            [](evutil_socket_t, short, void* arg) {
+                SSL_CTX_free((SSL_CTX*)arg);
+            }, old);
+        if (m_ctxCleanupTimer)
+        {
+            struct timeval tv = {300, 0};  // 5 minutes
+            event_add(m_ctxCleanupTimer, &tv);
+        }
+    }
+
+    PUBLIC_LOG_INFO("Certificate reloaded successfully (port {})", m_local_port);
+    return true;
 }
 
 void ZmHttpServer::SetPoolName(const std::string& name)
@@ -1688,8 +1762,10 @@ bool ZmHttpServer::BindEventBase(struct event_base* evbase)
 // ============================ ZmJsonRpcServer ============================
 
 ZmJsonRpcServer::ZmJsonRpcServer(struct event_base* evbase, std::string_view root_uri, uint16_t local_port,
-                               const char* certFile, const char* keyFile)
-    : ZmHttpServer(evbase, local_port, certFile, keyFile)
+                               const char* certFile, const char* keyFile,
+                               uint32_t sessionCacheSize, const char* sessionContext)
+    : ZmHttpServer(evbase, local_port, certFile, keyFile, 0,
+                   sessionCacheSize, sessionContext)
 {
     if (!root_uri.empty())
     {
@@ -1953,8 +2029,10 @@ int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
 // ============================================================================
 
 ZmRESTfulServer::ZmRESTfulServer(struct event_base* evbase, std::string_view root_uri, uint16_t local_port,
-                               const char* certFile, const char* keyFile)
-    : ZmHttpServer(evbase, local_port, certFile, keyFile)
+                               const char* certFile, const char* keyFile,
+                               uint32_t sessionCacheSize, const char* sessionContext)
+    : ZmHttpServer(evbase, local_port, certFile, keyFile, 0,
+                   sessionCacheSize, sessionContext)
 {
     if (!root_uri.empty())
     {

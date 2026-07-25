@@ -581,19 +581,21 @@ public:
     typedef std::function<int(ZmHttpdTask*, const BYTE*, size_t)> OnHttpdRequestCB;
 
     /**
-     * @brief 构造 HTTP 服务器
+     * @brief 构造 HTTP/HTTPS 服务器
      * @param evbase              外部 libevent 事件循环对象（不由此类接管生命周期）
      * @param local_port          监听端口号
-     * @param certFile            证书 PEM 文件路径，非空且 keyFile 也非空时启用 HTTPS；nullptr = HTTP
-     * @param keyFile             私钥 PEM 文件路径，非空且 certFile 也非空时启用 HTTPS；nullptr = HTTP
-     * @param redirect_from_port  当 HTTPS 启用时，在此端口创建轻量级 HTTP→HTTPS 301 全量重定向服务器；
-     *                            0 表示不启用。注意：此重定向不经过 Router/中间件，仅适用于通用 HTTP 端口。
-     *                            API 端口（JRPC/RESTful）不应启用，POST 请求重定向会丢失请求体。
+     * @param certFile            证书 PEM 文件路径，非空启用 HTTPS
+     * @param keyFile             私钥 PEM 文件路径，非空启用 HTTPS
+     * @param redirect_from_port  当 HTTPS 启用时，在此端口创建 301 重定向服务器；0 表示不启用
+     * @param sessionCacheSize    TLS 会话缓存容量，0=不启用
+     * @param sessionContext      会话上下文标识，sessionCacheSize>0 时必填
      */
     ZmHttpServer(struct event_base* evbase, uint16_t local_port,
                  const char* certFile = nullptr,
                  const char* keyFile = nullptr,
-                 uint16_t redirect_from_port = 0);
+                 uint16_t redirect_from_port = 0,
+                 uint32_t sessionCacheSize = 0,
+                 const char* sessionContext = nullptr);
 
     /** @brief 析构，释放 evhttp 和控制事件（不释放外部 event_base） */
     virtual ~ZmHttpServer();
@@ -612,6 +614,18 @@ public:
 
     /** @brief 查询是否已启用 HTTPS（m_ssl_ctx 非空） */
     bool IsHttps() const { return m_ssl_ctx != nullptr; }
+
+    /**
+     * @brief 热加载 SSL 证书（无需重启服务）
+     *
+     * 创建新 SSL_CTX，原子替换 m_ssl_ctx。新旧 ctx 在事件循环线程操作（无竞态）。
+     * 旧 ctx 延时 5 分钟后释放，确保现有 TLS 连接完成或超时。
+     *
+     * @param certFile  新证书 PEM 文件路径
+     * @param keyFile   新私钥 PEM 文件路径
+     * @return true 加载并替换成功，false 证书无效（旧证书继续有效）
+     */
+    bool ReloadCertificate(const char* certFile, const char* keyFile);
 
     /**
      * @brief 设置内部线程池名称（调试时 VS 线程列表可见）
@@ -764,6 +778,12 @@ private:
     /** @brief SSL 上下文指针（nullptr = HTTP，非空 = HTTPS） */
     struct ssl_ctx_st* m_ssl_ctx;
 
+    /** @brief 证书热加载时保留的旧 SSL_CTX（延时释放，给现有连接缓冲时间） */
+    struct ssl_ctx_st* m_oldCtx;
+
+    /** @brief 旧 SSL_CTX 延时清理定时器 */
+    struct event*      m_ctxCleanupTimer;
+
     /** @brief HTTP→HTTPS 重定向服务器端口（0 = 不启用） */
     uint16_t           m_redirect_from_port;
 
@@ -867,7 +887,8 @@ public:
      * @param local_port  监听端口号
      */
     ZmJsonRpcServer(struct event_base* evbase, std::string_view root_uri, uint16_t local_port,
-                    const char* certFile = nullptr, const char* keyFile = nullptr);
+                    const char* certFile = nullptr, const char* keyFile = nullptr,
+                    uint32_t sessionCacheSize = 0, const char* sessionContext = nullptr);
 
     /** @brief 析构 */
     virtual ~ZmJsonRpcServer();
@@ -1027,7 +1048,8 @@ public:
         ZmHttpdTask* task, const BYTE* body, size_t body_len)>;
 
     ZmRESTfulServer(struct event_base* evbase, std::string_view root_uri, uint16_t local_port,
-                    const char* certFile = nullptr, const char* keyFile = nullptr);
+                    const char* certFile = nullptr, const char* keyFile = nullptr,
+                    uint32_t sessionCacheSize = 0, const char* sessionContext = nullptr);
     virtual ~ZmRESTfulServer();
 
     /** @brief 设置同步回调（异步未设置时才走） */

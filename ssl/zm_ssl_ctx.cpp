@@ -7,11 +7,14 @@
 
 #include "zm_ssl_fingerprint.h"
 #include "../util/zm_util_file.h"
+#include "../net/zm_net_runloop.h"
 
+#include <../libevent/include/event2/event.h>
 #include <../openssl/include/openssl/ssl.h>
 #include <../openssl/include/openssl/pkcs12.h>
 #include <../openssl/include/openssl/crypto.h>
 #include <../openssl/include/openssl/err.h>
+#include <../openssl/include/openssl/rand.h>
 
 /**
  * @brief 获取 OpenSSL 错误描述字符串
@@ -403,6 +406,16 @@ SSL_CTX* ZmSSLContext::MakeClientCTX()
     }
 
     SSL_CTX_set_options(sslctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
+
+    // 现代密码套件：仅 ECDHE 前向安全 + GCM/CHACHA20 AEAD 加密
+    SSL_CTX_set_cipher_list(sslctx,
+        "ECDHE-ECDSA-AES256-GCM-SHA384:"
+        "ECDHE-RSA-AES256-GCM-SHA384:"
+        "ECDHE-ECDSA-AES128-GCM-SHA256:"
+        "ECDHE-RSA-AES128-GCM-SHA256:"
+        "ECDHE-ECDSA-CHACHA20-POLY1305:"
+        "ECDHE-RSA-CHACHA20-POLY1305");
+
     SSL_CTX_set_verify(sslctx, SSL_VERIFY_NONE, NULL);
     return sslctx;
 }
@@ -414,7 +427,8 @@ SSL_CTX* ZmSSLContext::MakeClientCTX(const char* certFile, const char* keyFile)
     if (NULL == ctx)
         return NULL;
 
-    if (SSL_CTX_use_certificate_file(ctx, certFile, SSL_FILETYPE_PEM) != 1)
+    // ★ 使用 certificate_chain_file：支持 PEM 文件中包含服务器证书 + 中间 CA 链
+    if (SSL_CTX_use_certificate_chain_file(ctx, certFile) != 1)
     {
         SSL_CTX_free(ctx);
         return NULL;
@@ -436,7 +450,8 @@ SSL_CTX* ZmSSLContext::MakeClientCTX(const char* certFile, const char* keyFile)
 }
 
 /* See header for documentation */
-SSL_CTX* ZmSSLContext::MakeServerCTX()
+SSL_CTX* ZmSSLContext::MakeServerCTX(uint32_t sessionCacheSize,
+                                     const char* sessionContext)
 {
     OPENSSL_init_ssl(0, NULL);
 
@@ -446,20 +461,44 @@ SSL_CTX* ZmSSLContext::MakeServerCTX()
 
     // 禁用不安全的老协议版本，仅允许 TLS 1.2+
     SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
-    // 启用自动 DH 参数协商
+
+    // 现代密码套件：仅 ECDHE 前向安全 + GCM/CHACHA20 AEAD 加密
+    SSL_CTX_set_cipher_list(ctx,
+        "ECDHE-ECDSA-AES256-GCM-SHA384:"
+        "ECDHE-RSA-AES256-GCM-SHA384:"
+        "ECDHE-ECDSA-AES128-GCM-SHA256:"
+        "ECDHE-RSA-AES128-GCM-SHA256:"
+        "ECDHE-ECDSA-CHACHA20-POLY1305:"
+        "ECDHE-RSA-CHACHA20-POLY1305");
+
+    // 启用自动 DH/ECDH 参数协商
     SSL_CTX_set_dh_auto(ctx, 1);
+    SSL_CTX_set_ecdh_auto(ctx, 1);
+
+    // Session Cache：仅在显式传入容量时启用（默认不启用）
+    if (sessionCacheSize > 0 && sessionContext)
+    {
+        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_SERVER);
+        SSL_CTX_sess_set_cache_size(ctx, sessionCacheSize);
+        SSL_CTX_set_session_id_context(ctx,
+            (const unsigned char*)sessionContext,
+            (unsigned int)strlen(sessionContext));
+    }
 
     return ctx;
 }
 
 /* See header for documentation */
-SSL_CTX* ZmSSLContext::MakeServerCTX(const char* certFile, const char* keyFile)
+SSL_CTX* ZmSSLContext::MakeServerCTX(const char* certFile, const char* keyFile,
+                                     uint32_t sessionCacheSize,
+                                     const char* sessionContext)
 {
-    SSL_CTX* ctx = MakeServerCTX();
+    SSL_CTX* ctx = MakeServerCTX(sessionCacheSize, sessionContext);
     if (NULL == ctx)
         return NULL;
 
-    if (SSL_CTX_use_certificate_file(ctx, certFile, SSL_FILETYPE_PEM) != 1)
+    // ★ 使用 certificate_chain_file：支持 PEM 文件中包含服务器证书 + 中间 CA 链
+    if (SSL_CTX_use_certificate_chain_file(ctx, certFile) != 1)
     {
         SSL_CTX_free(ctx);
         return NULL;
@@ -569,4 +608,231 @@ const char* ZmMemoryBIO::BufData()
 size_t ZmMemoryBIO::BufLen()
 {
     return Buf() ? m_buf->length : 0;
+}
+
+// ============================================================================
+// ZmSessionTicketManager
+// ============================================================================
+
+int ZmSessionTicketManager::s_exDataIndex = -1;
+
+ZmSessionTicketManager::ZmSessionTicketManager()
+    : m_hasPrevKey(false)
+{
+    memset(&m_currentKey, 0, sizeof(m_currentKey));
+    memset(&m_prevKey, 0, sizeof(m_prevKey));
+}
+
+ZmSessionTicketManager::~ZmSessionTicketManager()
+{
+    // 密钥用完后清零，防止内存泄漏后泄露密钥
+    OPENSSL_cleanse(&m_currentKey, sizeof(m_currentKey));
+    OPENSSL_cleanse(&m_prevKey, sizeof(m_prevKey));
+}
+
+bool ZmSessionTicketManager::Init(const char* ticketFile)
+{
+    if (ticketFile && ticketFile[0])
+        m_ticketFile = ticketFile;
+
+    bool loaded = false;
+
+    // ① 尝试从已有文件加载
+    if (!m_ticketFile.empty())
+    {
+        ZmByteBuffer heap(ZM_SESSION_TICKET_KEY_LEN + 16);
+        if (ZmFile::Read(m_ticketFile.c_str(), heap) &&
+            heap.Size() >= ZM_SESSION_TICKET_KEY_LEN)
+        {
+            memcpy(&m_currentKey, heap.Head(), ZM_SESSION_TICKET_KEY_LEN);
+            loaded = true;
+        }
+    }
+
+    // ② 不存在或无效 → 生成随机密钥
+    if (!loaded)
+    {
+        if (RAND_bytes(m_currentKey.data, ZM_SESSION_TICKET_KEY_LEN) != 1)
+            return false;
+
+        // 持久化到文件
+        if (!m_ticketFile.empty())
+            ZmFile::Write(m_ticketFile.c_str(), m_currentKey.data, ZM_SESSION_TICKET_KEY_LEN);
+    }
+
+    return true;
+}
+
+void ZmSessionTicketManager::RotateKeys()
+{
+    memcpy(&m_prevKey, &m_currentKey, sizeof(m_prevKey));
+    m_hasPrevKey = true;
+
+    RAND_bytes(m_currentKey.data, ZM_SESSION_TICKET_KEY_LEN);
+
+    if (!m_ticketFile.empty())
+        ZmFile::Write(m_ticketFile.c_str(), m_currentKey.data, ZM_SESSION_TICKET_KEY_LEN);
+}
+
+void ZmSessionTicketManager::Bind(struct ssl_ctx_st* ctx)
+{
+    if (!ctx) return;
+
+    SSL_CTX* sslctx = (SSL_CTX*)ctx;
+
+    // 首次调用时分配 ex_data 索引
+    if (s_exDataIndex < 0)
+        s_exDataIndex = SSL_CTX_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
+
+    // 将 this 存入 SSL_CTX，回调时取回
+    SSL_CTX_set_ex_data(sslctx, s_exDataIndex, this);
+    SSL_CTX_set_tlsext_ticket_key_evp_cb(sslctx, OnTicketKeyCallback);
+}
+
+int ZmSessionTicketManager::OnTicketKeyCallback(SSL* ssl, unsigned char keyName[16],
+                                                 unsigned char iv[EVP_MAX_IV_LENGTH],
+                                                 EVP_CIPHER_CTX* /*cipher*/,
+                                                 EVP_MAC_CTX* mac, int enc)
+{
+    ZmSessionTicketManager* self = (ZmSessionTicketManager*)
+        SSL_CTX_get_ex_data(SSL_get_SSL_CTX(ssl), s_exDataIndex);
+    if (!self)
+        return 0;
+
+    return self->handleTicketKey(keyName, iv, mac, enc);
+}
+
+int ZmSessionTicketManager::handleTicketKey(unsigned char keyName[16],
+                                             unsigned char iv[EVP_MAX_IV_LENGTH],
+                                             EVP_MAC_CTX* mac, int enc)
+{
+    static char kDigestName[] = "SHA256";
+    OSSL_PARAM params[2];
+    params[0] = OSSL_PARAM_construct_utf8_string("digest", kDigestName, 0);
+    params[1] = OSSL_PARAM_construct_end();
+
+    if (enc)
+    {
+        memcpy(keyName, m_currentKey.data, 16);
+        EVP_MAC_init(mac, m_currentKey.data + 16, 16, params);
+        memcpy(iv, m_currentKey.data + 32, 16);
+        return 1;
+    }
+    else
+    {
+        if (memcmp(keyName, m_currentKey.data, 16) == 0)
+        {
+            EVP_MAC_init(mac, m_currentKey.data + 16, 16, params);
+            memcpy(iv, m_currentKey.data + 32, 16);
+            return 1;
+        }
+        if (m_hasPrevKey && memcmp(keyName, m_prevKey.data, 16) == 0)
+        {
+            EVP_MAC_init(mac, m_prevKey.data + 16, 16, params);
+            memcpy(iv, m_prevKey.data + 32, 16);
+            return 1;
+        }
+        return 0;
+    }
+}
+
+// ============================================================================
+// ZmTicketKeyRotator
+// ============================================================================
+
+ZmTicketKeyRotator::ZmTicketKeyRotator()
+    : m_evLoop(nullptr), m_timer(nullptr), m_ctrlEvent(nullptr)
+{}
+
+ZmTicketKeyRotator::~ZmTicketKeyRotator()
+{
+    Stop();
+}
+
+bool ZmTicketKeyRotator::Init(const char* ticketFile)
+{
+    return m_ticketMgr.Init(ticketFile);
+}
+
+bool ZmTicketKeyRotator::Start(time_t intervalSeconds, OnRotateCB onRotate)
+{
+    if (m_evLoop)
+        return false;  // 已经启动
+
+    m_onRotate = onRotate;
+
+    // ① 创建独立事件循环线程
+    m_evLoop = new ZmEvBaseRunLoop("TicketKeyRotator");
+    if (!m_evLoop->Loop())
+    {
+        delete m_evLoop;
+        m_evLoop = nullptr;
+        return false;
+    }
+
+    struct event_base* evbase = m_evLoop->GetEventBase();
+
+    // ② 持久定时器：到期自动轮换
+    m_timer = event_new(evbase, -1, EV_PERSIST, OnTimer, this);
+    if (m_timer)
+    {
+        struct timeval tv = { (long)intervalSeconds, 0 };
+        event_add(m_timer, &tv);
+    }
+
+    // ③ 控制事件：支持跨线程 RotateNow() 调用
+    m_ctrlEvent = event_new(evbase, -1, EV_READ | EV_PERSIST, OnCtrl, this);
+    if (m_ctrlEvent)
+        event_add(m_ctrlEvent, nullptr);
+
+    return true;
+}
+
+void ZmTicketKeyRotator::RotateNow()
+{
+    if (m_ctrlEvent)
+        event_active(m_ctrlEvent, CTRL_ROTATE, 0);
+}
+
+bool ZmTicketKeyRotator::IsRunning() const
+{
+    return m_evLoop != nullptr && m_evLoop->IsLooped();
+}
+
+void ZmTicketKeyRotator::Stop()
+{
+    if (m_timer)
+    {
+        event_free(m_timer);
+        m_timer = nullptr;
+    }
+    if (m_ctrlEvent)
+    {
+        event_free(m_ctrlEvent);
+        m_ctrlEvent = nullptr;
+    }
+    if (m_evLoop)
+    {
+        m_evLoop->Stop();
+        delete m_evLoop;
+        m_evLoop = nullptr;
+    }
+}
+
+void ZmTicketKeyRotator::OnTimer(evutil_socket_t, short, void* arg)
+{
+    ((ZmTicketKeyRotator*)arg)->doRotate();
+}
+
+void ZmTicketKeyRotator::OnCtrl(evutil_socket_t, short what, void* arg)
+{
+    if (what & CTRL_ROTATE)
+        ((ZmTicketKeyRotator*)arg)->doRotate();
+}
+
+void ZmTicketKeyRotator::doRotate()
+{
+    m_ticketMgr.RotateKeys();
+    if (m_onRotate)
+        m_onRotate();
 }
