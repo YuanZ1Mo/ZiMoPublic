@@ -325,6 +325,35 @@ public:
      */
     void ClearReplyBody();
 
+    /**
+     * @brief 设置当前连接的收发限速（单连接独立限速）
+     *
+     * 对底层 bufferevent 设置读写速率令牌桶，需在响应数据发送前调用。
+     * 仅限制响应体数据的传输速率，不影响请求头解析和响应头发送。
+     *
+     * @param download_bps 每秒最大发送字节数（服务器→客户端），0 表示不限速
+     * @param upload_bps   每秒最大接收字节数（客户端→服务器），0 表示不限速
+     * @return true 成功，false 失败（连接无效或 bufferevent 不支持限速）
+     *
+     * @note 基于 libevent bufferevent_set_rate_limit，不会丢失零拷贝特性。
+     *       每个连接独立限速，互不影响。可在传输过程中重复调用以动态调速。
+     */
+    bool SetRateLimit(size_t download_bps = 0, size_t upload_bps = 0);
+
+    /**
+     * @brief 将当前连接加入共享带宽池
+     *
+     * 同一组内所有连接共享组的总带宽。用于按用户/IP 聚合限速，
+     * 防止多线程下载器绕过单连接限速。
+     *
+     * @param group  共享带宽池指针（由 bufferevent_rate_limit_group_new 创建）
+     * @return true 成功，false 失败（连接无效或 group 为 nullptr）
+     *
+     * @note 需在 SetReplyFile / SetReplyData 之前调用。
+     *       可与 SetRateLimit 叠加使用：连接实际速度取两者的最小值。
+     */
+    bool JoinRateLimitGroup(struct bufferevent_rate_limit_group* group);
+
     // ---- 流式响应（Chunked Transfer-Encoding） ----
 
     /**

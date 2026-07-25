@@ -616,6 +616,57 @@ void ZmHttpdTask::ClearReplyBody()
         evbuffer_drain(m_reply_buf, evbuffer_get_length(m_reply_buf));
 }
 
+bool ZmHttpdTask::SetRateLimit(size_t download_bps, size_t upload_bps)
+{
+    if (download_bps == 0 && upload_bps == 0)
+        return false;
+
+    struct evhttp_connection* conn = evhttp_request_get_connection(m_request);
+    if (!conn)
+        return false;
+
+    struct bufferevent* bev = evhttp_connection_get_bufferevent(conn);
+    if (!bev)
+        return false;
+
+    // 令牌桶参数：libevent 要求 rate >= 1 且 burst >= rate
+    // 为 0 的方向填入 EV_RATE_LIMIT_MAX，相当于不限速
+    size_t read_rate   = upload_bps   ? upload_bps   : (size_t)EV_RATE_LIMIT_MAX;
+    size_t read_burst  = upload_bps   ? upload_bps   : (size_t)EV_RATE_LIMIT_MAX;
+    size_t write_rate  = download_bps ? download_bps : (size_t)EV_RATE_LIMIT_MAX;
+    size_t write_burst = download_bps ? download_bps : (size_t)EV_RATE_LIMIT_MAX;
+
+    struct ev_token_bucket_cfg* cfg = ev_token_bucket_cfg_new(
+        read_rate,  read_burst,
+        write_rate, write_burst,
+        nullptr
+    );
+
+    if (!cfg)
+        return false;
+
+    int ret = bufferevent_set_rate_limit(bev, cfg);
+    ev_token_bucket_cfg_free(cfg);  // bev 已持有自身引用，释放本地引用
+
+    return ret == 0;
+}
+
+bool ZmHttpdTask::JoinRateLimitGroup(struct bufferevent_rate_limit_group* group)
+{
+    if (!group)
+        return false;
+
+    struct evhttp_connection* conn = evhttp_request_get_connection(m_request);
+    if (!conn)
+        return false;
+
+    struct bufferevent* bev = evhttp_connection_get_bufferevent(conn);
+    if (!bev)
+        return false;
+
+    return bufferevent_add_to_rate_limit_group(bev, group) == 0;
+}
+
 void ZmHttpdTask::TriggerReply()
 {
     if (m_on_reply)
