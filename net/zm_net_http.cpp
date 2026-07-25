@@ -9,11 +9,15 @@
 #include "zm_net_ip.h"
 #include "../util/zm_util_thread.h"
 #include "../util/zm_util_libevent.h"
+#include "../ssl/zm_ssl_ctx.h"
 #include "../define/zm_version_define.h"
 #include "../spdlog/zm_logger.h"
 
 #include <../libevent/include/event2/bufferevent.h>
+#include <../libevent/include/event2/bufferevent_ssl.h>
 #include <../libevent/include/event2/buffer.h>
+#include <../openssl/include/openssl/ssl.h>
+#include <../openssl/include/openssl/err.h>
 
 #include <algorithm>
 #include <atomic>
@@ -1241,10 +1245,22 @@ bool ZmHttpHead::IsEmpty()
 
 // ============================ ZmHttpServer ============================
 
-ZmHttpServer::ZmHttpServer(struct event_base* evbase, uint16_t local_port)
+ZmHttpServer::ZmHttpServer(struct event_base* evbase, uint16_t local_port,
+                         const char* certFile, const char* keyFile,
+                         uint16_t redirect_from_port)
     : m_evbase(evbase), m_evhttpd(nullptr), m_threadPoolName(), m_threadPool(nullptr),
-      m_local_port(local_port), m_port_bind_failed(false), m_httpdDoerPool(nullptr)
-{}
+      m_local_port(local_port), m_port_bind_failed(false), m_ssl_ctx(nullptr),
+      m_redirect_from_port(redirect_from_port), m_redirectEvhttp(nullptr),
+      m_httpdDoerPool(nullptr)
+{
+    // 仅在 certFile 和 keyFile 都非空时启用 HTTPS，SSL_CTX 生命周期由此类完全管理
+    if (certFile && certFile[0] && keyFile && keyFile[0])
+    {
+        m_ssl_ctx = ZmSSLContext::MakeServerCTX(certFile, keyFile);
+        if (m_ssl_ctx)
+            OnConfigureSSL(m_ssl_ctx);  // ★ 扩展点：子类可覆写以实现 mTLS
+    }
+}
 
 ZmHttpServer::~ZmHttpServer()
 {
@@ -1295,6 +1311,13 @@ void ZmHttpServer::Close()
         m_httpdDoerPool = nullptr;
     }
 
+    // ★ 先释放 HTTP→HTTPS 重定向服务器（如有）
+    if (m_redirectEvhttp)
+    {
+        evhttp_free(m_redirectEvhttp);
+        m_redirectEvhttp = nullptr;
+    }
+
     // 释放 evhttp（停止接受新连接）
     if (m_evhttpd)
     {
@@ -1303,6 +1326,13 @@ void ZmHttpServer::Close()
     }
 
     // m_evbase 由外部管理生命周期，不在此释放
+
+    // 释放 SSL 上下文（如果有）
+    if (m_ssl_ctx)
+    {
+        SSL_CTX_free((SSL_CTX*)m_ssl_ctx);
+        m_ssl_ctx = nullptr;
+    }
 }
 
 bool ZmHttpServer::IsOpen() const
@@ -1455,6 +1485,106 @@ void ZmHttpServer::OnEventControl(evutil_socket_t fd, short what, void* ctx)
     }
 }
 
+// ============================================================================
+// HTTPS SSL bufferevent 工厂（由 evhttp_set_bevcb 注册，每个新连接调用一次）
+// ============================================================================
+
+struct bufferevent* ZmHttpServer::OnSSLBuffereventCB(struct event_base* base, void* arg)
+{
+    SSL_CTX* ctx = (SSL_CTX*)arg;
+    SSL* ssl = SSL_new(ctx);
+    if (!ssl)
+        return nullptr;
+
+    // fd 传 -1：evhttp 随后通过 bufferevent_setfd() 绑定实际的 socket fd
+    // BUFFEREVENT_SSL_ACCEPTING：服务端模式，自动调用 SSL_accept()
+    // BEV_OPT_CLOSE_ON_FREE：bev 释放时自动关闭底层 socket
+    struct bufferevent* bev = bufferevent_openssl_socket_new(
+        base, -1, ssl,
+        BUFFEREVENT_SSL_ACCEPTING,
+        BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+
+    return bev;
+}
+
+// ============================================================================
+// HTTP→HTTPS 301 重定向回调（轻量级）
+//
+// 【设计意图】通用 HTTP 端口（80）仅做全量 301 → HTTPS，语义极简，无需经
+// ZmHttpdDoer / ZmHttpdTask / Router / 中间件 等完整管线。直接在事件循环线程调用
+// evhttp_send_reply，零线程切换、零内存分配(除临时 evbuffer)。
+//
+// 【适用场景】
+//   - 浏览器用户习惯性输入 http://ip/ → 自动跳 https://ip/
+//   - 搜索引擎索引了旧 HTTP 链接 → 301 通知其更新
+//
+// 【不适合的场景与权衡】
+//   - 不按路径做差异化重定向（未走 Router，无路由匹配）
+//   - 不经过中间件（日志/限流等通用逻辑需另外实现）
+//   - 固定 301（POST→GET），如需保留 HTTP 方法用 307/308 需改造
+//   - API 端点（JRPC/RESTful）不应启用此重定向（POST 丢 body、客户端应直接配 https://）
+//
+// 后续如需增强：可行方案是将 redirect_from_port 上的请求也纳入 ZmHttpdDoer 管线，
+// 由 Router 根据路径决定 301/307/或不重定向。
+// ============================================================================
+
+void ZmHttpServer::OnRedirectRequestCB(struct evhttp_request* req, void* arg)
+{
+    if (!req)
+        return;
+
+    ZmHttpServer* server = (ZmHttpServer*)arg;
+    uint16_t httpsPort = server ? server->m_local_port : 443;
+
+    // 安全获取 URI（null 时回退为 "/"）
+    const char* uri = evhttp_request_get_uri(req);
+    if (!uri)
+        uri = "/";
+
+    // 从请求头获取 Host（用于构造重定向 URL），安全处理 null
+    const char* host = nullptr;
+    struct evkeyvalq* inHeaders = evhttp_request_get_input_headers(req);
+    if (inHeaders)
+        host = evhttp_find_header(inHeaders, "Host");
+
+    // 构造目标 URL
+    char redirectUrl[2048];
+    if (host)
+    {
+        // 去掉 Host 头中可能带有的端口号（如 Host: example.com:80）
+        std::string hostOnly(host);
+        size_t colonPos = hostOnly.find(':');
+        if (colonPos != std::string::npos)
+            hostOnly = hostOnly.substr(0, colonPos);
+
+        snprintf(redirectUrl, sizeof(redirectUrl), "https://%s:%d%s",
+            hostOnly.c_str(), httpsPort, uri);
+    }
+    else
+    {
+        snprintf(redirectUrl, sizeof(redirectUrl), "https://localhost:%d%s",
+            httpsPort, uri);
+    }
+
+    // 发送 301 响应
+    struct evbuffer* body = evbuffer_new();
+    if (body)
+    {
+        evbuffer_add_printf(body,
+            "<html><body>Redirecting to <a href=\"%s\">%s</a></body></html>",
+            redirectUrl, redirectUrl);
+
+        struct evkeyvalq* outHeaders = evhttp_request_get_output_headers(req);
+        if (outHeaders)
+        {
+            evhttp_add_header(outHeaders, "Location", redirectUrl);
+            evhttp_add_header(outHeaders, "Content-Type", "text/html; charset=utf-8");
+        }
+        evhttp_send_reply(req, 301, "Moved Permanently", body);
+        evbuffer_free(body);
+    }
+}
+
 int ZmHttpServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t dlen)
 {
     return m_on_request ? m_on_request(task, data, dlen) : ZM_HTTP_STATUS_CODE_NOT_FOUND;
@@ -1490,6 +1620,16 @@ bool ZmHttpServer::BindEventBase(struct event_base* evbase)
     // 不限制最大并发连接数（0 表示禁用限制），实际上限由线程池和系统资源决定
     evhttp_set_max_connections(m_evhttpd, 0);
 
+    // ★ HTTPS: 如果提供了 SSL_CTX，注入 SSL bufferevent 工厂
+    // evhttp 在每次 accept 新连接时调用此工厂创建 bufferevent，
+    // 返回的 bufferevent_openssl 自动完成 SSL 握手和加解密，对上层透明
+    if (m_ssl_ctx)
+    {
+        evhttp_set_bevcb(m_evhttpd, ZmHttpServer::OnSSLBuffereventCB,
+                         m_ssl_ctx);
+        PUBLIC_LOG_INFO("HTTPS mode enabled on port {}", m_local_port);
+    }
+
     do
     {
         if (m_local_port)
@@ -1509,6 +1649,26 @@ bool ZmHttpServer::BindEventBase(struct event_base* evbase)
     if (ret)
     {
         // 端口绑定成功
+
+        // ★ HTTPS 模式 + 指定 redirect_from_port：创建轻量 HTTP→HTTPS 301 重定向服务器
+        if (m_ssl_ctx && m_redirect_from_port > 0)
+        {
+            m_redirectEvhttp = evhttp_new(evbase);
+            if (m_redirectEvhttp)
+            {
+                evhttp_set_gencb(m_redirectEvhttp, ZmHttpServer::OnRedirectRequestCB, this);
+                if (evhttp_bind_socket_with_handle(m_redirectEvhttp, "0.0.0.0", m_redirect_from_port))
+                {
+                    PUBLIC_LOG_INFO("HTTP→HTTPS redirect on port {} → {}", m_redirect_from_port, m_local_port);
+                }
+                else
+                {
+                    PUBLIC_LOG_WARN("HTTP→HTTPS redirect bind port {} failed", m_redirect_from_port);
+                    evhttp_free(m_redirectEvhttp);
+                    m_redirectEvhttp = nullptr;
+                }
+            }
+        }
     }
     else
     {
@@ -1527,8 +1687,9 @@ bool ZmHttpServer::BindEventBase(struct event_base* evbase)
 
 // ============================ ZmJsonRpcServer ============================
 
-ZmJsonRpcServer::ZmJsonRpcServer(struct event_base* evbase, std::string_view root_uri, uint16_t local_port)
-    : ZmHttpServer(evbase, local_port)
+ZmJsonRpcServer::ZmJsonRpcServer(struct event_base* evbase, std::string_view root_uri, uint16_t local_port,
+                               const char* certFile, const char* keyFile)
+    : ZmHttpServer(evbase, local_port, certFile, keyFile)
 {
     if (!root_uri.empty())
     {
@@ -1791,8 +1952,9 @@ int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
 // ZmRESTfulServer — RESTful HTTP 服务器实现
 // ============================================================================
 
-ZmRESTfulServer::ZmRESTfulServer(struct event_base* evbase, std::string_view root_uri, uint16_t local_port)
-    : ZmHttpServer(evbase, local_port)
+ZmRESTfulServer::ZmRESTfulServer(struct event_base* evbase, std::string_view root_uri, uint16_t local_port,
+                               const char* certFile, const char* keyFile)
+    : ZmHttpServer(evbase, local_port, certFile, keyFile)
 {
     if (!root_uri.empty())
     {

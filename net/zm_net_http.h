@@ -25,6 +25,9 @@
 #include <stdint.h>
 #include <string_view>
 
+// SSL_CTX 前向声明（仅在启用 HTTPS 时需要，避免头文件全量引入 openssl/ssl.h）
+struct ssl_ctx_st;
+
 #define JRPC_VERSION "2.0"
 
 // 2xx 成功
@@ -579,10 +582,18 @@ public:
 
     /**
      * @brief 构造 HTTP 服务器
-     * @param evbase     外部 libevent 事件循环对象（不由此类接管生命周期）
-     * @param local_port 监听端口号
+     * @param evbase              外部 libevent 事件循环对象（不由此类接管生命周期）
+     * @param local_port          监听端口号
+     * @param certFile            证书 PEM 文件路径，非空且 keyFile 也非空时启用 HTTPS；nullptr = HTTP
+     * @param keyFile             私钥 PEM 文件路径，非空且 certFile 也非空时启用 HTTPS；nullptr = HTTP
+     * @param redirect_from_port  当 HTTPS 启用时，在此端口创建轻量级 HTTP→HTTPS 301 全量重定向服务器；
+     *                            0 表示不启用。注意：此重定向不经过 Router/中间件，仅适用于通用 HTTP 端口。
+     *                            API 端口（JRPC/RESTful）不应启用，POST 请求重定向会丢失请求体。
      */
-    ZmHttpServer(struct event_base* evbase, uint16_t local_port);
+    ZmHttpServer(struct event_base* evbase, uint16_t local_port,
+                 const char* certFile = nullptr,
+                 const char* keyFile = nullptr,
+                 uint16_t redirect_from_port = 0);
 
     /** @brief 析构，释放 evhttp 和控制事件（不释放外部 event_base） */
     virtual ~ZmHttpServer();
@@ -598,6 +609,9 @@ public:
 
     /** @brief 查询服务器是否已初始化 */
     bool IsOpen() const;
+
+    /** @brief 查询是否已启用 HTTPS（m_ssl_ctx 非空） */
+    bool IsHttps() const { return m_ssl_ctx != nullptr; }
 
     /**
      * @brief 设置内部线程池名称（调试时 VS 线程列表可见）
@@ -664,7 +678,52 @@ public:
      */
     static void OnEventControl(evutil_socket_t fd, short what, void* ctx);
 
+    /**
+     * @brief HTTPS SSL bufferevent 工厂回调（由 evhttp_set_bevcb 注册）
+     *
+     * 每个新连接到来时，evhttp 调用此函数创建 SSL 加密的 bufferevent。
+     * 创建 bufferevent_openssl_socket_new 并设置为 ACCEPTING（服务端）模式，
+     * SSL 握手由 libevent 自动完成，对上层 HTTP 协议解析完全透明。
+     *
+     * @param base  libevent event_base
+     * @param arg   SSL_CTX 指针，在 evhttp_set_bevcb 中作为 cbarg 传入
+     * @return      SSL bufferevent 指针，evhttp 随后通过 bufferevent_setfd 绑定 socket
+     */
+    static struct bufferevent* OnSSLBuffereventCB(struct event_base* base, void* arg);
+
+    /**
+     * @brief HTTP→HTTPS 301 全量重定向回调（轻量级，不走 ZmHttpdDoer / Router 管线）
+     *
+     * redirect_from_port 上收到任意请求时，构造 https://host:port/uri 并返回 301。
+     * 在事件循环线程直接调用 evhttp_send_reply，零线程切换。
+     *
+     * 【限制】不按路径区分、不经中间件、固定 301（POST→GET）。仅适用于通用 HTTP 端口，
+     * 不适合 API 端口（POST 丢 body、客户端应直接配置 https://）。
+     *
+     * @param req  原始 HTTP 请求
+     * @param arg  ZmHttpServer 实例指针（用于获取 HTTPS 端口号）
+     */
+    static void OnRedirectRequestCB(struct evhttp_request* req, void* arg);
+
 protected:
+    /**
+     * @brief SSL 上下文配置完成后的扩展点（子类可覆写以实现 mTLS、自定义校验等）
+     *
+     * 在 MakeServerCTX 成功之后、BindEventBase 之前调用。默认实现为空（单向认证）。
+     *
+     * @param ctx  已加载服务器证书和私钥的 SSL_CTX，可在此基础上继续配置
+     *
+     * @example mTLS 双向认证
+     * @code
+     *   void OnConfigureSSL(SSL_CTX* ctx) override {
+     *       SSL_CTX_load_verify_locations(ctx, "client-ca.crt", nullptr);
+     *       SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER |
+     *                          SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
+     *   }
+     * @endcode
+     */
+    virtual void OnConfigureSSL(struct ssl_ctx_st* ctx) {}
+
     /**
      * @brief 处理 HTTP 请求的业务逻辑（虚函数，子类可重写）
      * @param task  请求上下文对象
@@ -701,6 +760,21 @@ private:
 
     /** @brief 端口绑定是否失败（BindEventBase 中设置） */
     bool               m_port_bind_failed;
+
+    /** @brief SSL 上下文指针（nullptr = HTTP，非空 = HTTPS） */
+    struct ssl_ctx_st* m_ssl_ctx;
+
+    /** @brief HTTP→HTTPS 重定向服务器端口（0 = 不启用） */
+    uint16_t           m_redirect_from_port;
+
+    /**
+     * @brief HTTP→HTTPS 重定向服务器（轻量级 evhttp，不经 ZmHttpdDoer/Router 管线）
+     *
+     * 仅在 m_redirect_from_port > 0 时创建。每个请求直接在事件循环线程处理：
+     * 提取 Host 头构造 https:// URL → evhttp_send_reply(301)。
+     * 适用浏览器全量跳转，不适合 API（POST→GET、无路由匹配、无中间件）。
+     */
+    struct evhttp*     m_redirectEvhttp;
 
     /** @brief 通用 HTTP 请求处理回调 */
     OnHttpdRequestCB   m_on_request;
@@ -792,7 +866,8 @@ public:
      * @param root_uri    RPC 请求的 URI 前缀，仅匹配此前缀的请求走 RPC 流程，为空或 nullptr 时所有请求走 RPC
      * @param local_port  监听端口号
      */
-    ZmJsonRpcServer(struct event_base* evbase, std::string_view root_uri, uint16_t local_port);
+    ZmJsonRpcServer(struct event_base* evbase, std::string_view root_uri, uint16_t local_port,
+                    const char* certFile = nullptr, const char* keyFile = nullptr);
 
     /** @brief 析构 */
     virtual ~ZmJsonRpcServer();
@@ -951,7 +1026,8 @@ public:
     using OnRESTfulRequestCBAsync = std::function<void(
         ZmHttpdTask* task, const BYTE* body, size_t body_len)>;
 
-    ZmRESTfulServer(struct event_base* evbase, std::string_view root_uri, uint16_t local_port);
+    ZmRESTfulServer(struct event_base* evbase, std::string_view root_uri, uint16_t local_port,
+                    const char* certFile = nullptr, const char* keyFile = nullptr);
     virtual ~ZmRESTfulServer();
 
     /** @brief 设置同步回调（异步未设置时才走） */

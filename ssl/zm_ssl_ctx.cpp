@@ -402,8 +402,82 @@ SSL_CTX* ZmSSLContext::MakeClientCTX()
         return NULL;
     }
 
+    SSL_CTX_set_options(sslctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
     SSL_CTX_set_verify(sslctx, SSL_VERIFY_NONE, NULL);
     return sslctx;
+}
+
+/* See header for documentation */
+SSL_CTX* ZmSSLContext::MakeClientCTX(const char* certFile, const char* keyFile)
+{
+    SSL_CTX* ctx = MakeClientCTX();
+    if (NULL == ctx)
+        return NULL;
+
+    if (SSL_CTX_use_certificate_file(ctx, certFile, SSL_FILETYPE_PEM) != 1)
+    {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    if (UsePrivateKeyFilePass(ctx, keyFile, "") != 1)
+    {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    if (!SSL_CTX_check_private_key(ctx))
+    {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    return ctx;
+}
+
+/* See header for documentation */
+SSL_CTX* ZmSSLContext::MakeServerCTX()
+{
+    OPENSSL_init_ssl(0, NULL);
+
+    SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
+    if (NULL == ctx)
+        return NULL;
+
+    // 禁用不安全的老协议版本，仅允许 TLS 1.2+
+    SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
+    // 启用自动 DH 参数协商
+    SSL_CTX_set_dh_auto(ctx, 1);
+
+    return ctx;
+}
+
+/* See header for documentation */
+SSL_CTX* ZmSSLContext::MakeServerCTX(const char* certFile, const char* keyFile)
+{
+    SSL_CTX* ctx = MakeServerCTX();
+    if (NULL == ctx)
+        return NULL;
+
+    if (SSL_CTX_use_certificate_file(ctx, certFile, SSL_FILETYPE_PEM) != 1)
+    {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    if (UsePrivateKeyFilePass(ctx, keyFile, "") != 1)
+    {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    if (!SSL_CTX_check_private_key(ctx))
+    {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    return ctx;
 }
 
 void ZmSSLContext::Release()

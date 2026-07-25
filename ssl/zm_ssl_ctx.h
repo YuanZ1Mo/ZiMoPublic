@@ -172,12 +172,49 @@ public:
     static void ExtractCert(ZmStringList& pems, const BYTE* data, size_t dlen, const char* password);
 
     /**
-    * @brief 创建客户端 SSL 上下文
+    * @brief 创建客户端 SSL 上下文（仅创建 ctx，不加载证书）
     *
-    * @param smx_version  SMX 版本号，0 表示标准 TLS
     * @return 新创建的 SSL_CTX 指针，失败返回 NULL
     */
     static SSL_CTX* MakeClientCTX();
+
+    /**
+     * @brief 创建并加载证书的客户端 SSL 上下文（便捷方法，用于双向认证/mTLS）
+     *
+     * 等价于 MakeClientCTX() + SSL_CTX_use_certificate_file +
+     * UsePrivateKeyFilePass + SSL_CTX_check_private_key。
+     *
+     * @param certFile  客户端证书 PEM 文件路径
+     * @param keyFile   客户端私钥 PEM 文件路径，无加密时传空密码 ""
+     * @return 成功返回已加载证书的 SSL_CTX，任何步骤失败返回 NULL（已内部释放）
+     */
+    static SSL_CTX* MakeClientCTX(const char* certFile, const char* keyFile);
+
+    /**
+     * @brief 创建服务端 SSL 上下文（仅创建 ctx，不加载证书）
+     *
+     * 创建并配置服务端 SSL_CTX（TLS_server_method、禁用老协议、自动 DH），
+     * 但不上载证书/私钥。调用者需自行调用 UseCertBuffer / UsePrivateKeyFilePass
+     * 加载证书和私钥，最后调用 SSL_CTX_check_private_key 验证。
+     *
+     * @return 新创建的 SSL_CTX 指针，失败返回 NULL
+     *
+     * @note 调用者负责通过 SSL_CTX_free() 释放返回值
+     * @note 内部调用 OPENSSL_init_ssl() 确保 OpenSSL 已初始化
+     */
+    static SSL_CTX* MakeServerCTX();
+
+    /**
+     * @brief 创建并加载证书的服务端 SSL 上下文（便捷方法）
+     *
+     * 等价于 MakeServerCTX() + SSL_CTX_use_certificate_file +
+     * UsePrivateKeyFilePass + SSL_CTX_check_private_key。
+     *
+     * @param certFile  证书 PEM 文件路径
+     * @param keyFile   私钥 PEM 文件路径，无加密时传空密码 ""
+     * @return 成功返回已加载证书的 SSL_CTX，任何步骤失败返回 NULL（已内部释放）
+     */
+    static SSL_CTX* MakeServerCTX(const char* certFile, const char* keyFile);
 
     static void     Release();
 
