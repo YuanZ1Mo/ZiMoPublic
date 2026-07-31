@@ -689,8 +689,17 @@ void ZmHttpdTask::StartStreamReply(int code, const char* reason)
     m_status_code = code;
     m_reason = std::string(reason ? reason : "");
     m_streaming = true;
+    // 注册连接关闭回调:客户端断开(连接释放)时置 m_connClosed,供流式发送线程断连检测。
+    // 连接可能已先于注册被释放(断开与请求处理竞争)→ 跳过注册,由 SendReplyStart 兜底标记
+    if (struct evhttp_connection* conn = evhttp_request_get_connection(m_request))
+        evhttp_connection_set_closecb(conn, OnConnCloseCb, this);
     if (m_on_stream_start)
         m_on_stream_start();
+}
+
+void ZmHttpdTask::OnConnCloseCb(struct evhttp_connection* /*conn*/, void* ctx)
+{
+    static_cast<ZmHttpdTask*>(ctx)->m_connClosed.store(true);
 }
 
 void ZmHttpdTask::SendReplyChunk(const BYTE* data, size_t dlen)
@@ -815,6 +824,7 @@ public:
         m_status_code = 0;
         m_input_buf = nullptr;
         m_streaming = false;
+        m_connClosed = false;
         m_id = ++g_httpd_task_id;
 
         // ★ 以下成员保持不变（生命周期 = doer 对象生命周期）:
@@ -862,6 +872,13 @@ public:
     void SendReplyStart()
     {
         WriteResponseHeaders();
+        // 连接已先于流开始断开 → 标记关闭,
+        // 发送线程将据此尽快退出,避免向已释放连接空发
+        if (!evhttp_request_get_connection(m_request))
+        {
+            m_connClosed.store(true);
+            return;
+        }
         evhttp_send_reply_start(m_request, m_status_code,
             m_reason.empty() ? nullptr : m_reason.c_str());
     }
@@ -885,6 +902,10 @@ public:
     {
         // 先刷出所有未发送的数据块
         SendReplyChunkToClient();
+        // 流已结束:解除 closecb(连接可能 keep-alive 复用、延迟关闭),
+        // 防止回调在 doer 回收/复用/删除后仍指向其内存(悬垂指针)
+        if (struct evhttp_connection* conn = evhttp_request_get_connection(m_request))
+            evhttp_connection_set_closecb(conn, nullptr, nullptr);
         evhttp_send_reply_end(m_request);
     }
 

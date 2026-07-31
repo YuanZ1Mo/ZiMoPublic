@@ -23,6 +23,7 @@
 #include <../libevent/include/event2/event.h>
 
 #include <stdint.h>
+#include <atomic>
 #include <string_view>
 
 // SSL_CTX 前向声明（仅在启用 HTTPS 时需要，避免头文件全量引入 openssl/ssl.h）
@@ -404,6 +405,18 @@ public:
     bool IsStreaming() const { return m_streaming; }
 
     /**
+     * @brief 查询连接是否已关闭（客户端断开/连接释放）
+     */
+    bool IsConnClosed() const { return m_connClosed.load(); }
+
+    /**
+     * @brief libevent 连接关闭回调（连接释放时触发，事件循环线程执行）
+     * @param conn 被关闭的连接（libevent 回调参数，本实现不使用）
+     * @param ctx  ZmHttpdTask 实例指针
+     */
+    static void OnConnCloseCb(struct evhttp_connection* conn, void* ctx);
+
+    /**
      * @brief 发送被延迟的 HTTP 响应
      *
      * 通过 event_active 将 REPLY 信号投递到 HTTP 服务器的 event loop 线程，
@@ -461,6 +474,9 @@ protected:
 
     /** @brief 是否处于流式响应模式 */
     bool                                m_streaming;
+
+    /** @brief 连接关闭标志（closecb 置位；doer 池复用时在 Reset 中清零） */
+    std::atomic<bool>                   m_connClosed {false};
 
 public:
     /**
