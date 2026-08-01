@@ -295,30 +295,6 @@ void ZmTapContext::SetDropTimer(ZM_TAP_CTX* tap, int seconds, int micros, uint32
     }
 }
 
-void ZmTapContext::Response(ZM_TAP_CTX* tap, const ZMJSON& jsResponse)
-{
-    if (!tap) return;
-
-    if (tap->state != ZM_TAP_STATE_INUSE)
-    {
-        //PUBLIC_LOG_WARN("TAP 已失效，丢弃响应，TAP:{}, state:{}", (void*)tap, tap->state);
-        return;
-    }
-
-    ZmTapDelegate* back_delegate = BackChainPop(tap);
-    if (back_delegate)
-    {
-        std::string jstr = jsResponse.dump();
-        SetOnBackData(tap, jstr.size(), jstr.c_str());
-        back_delegate->OnTapDelegateBackEvent(tap);
-    }
-    else
-    {
-        PUBLIC_LOG_WARN("TAP 回传链为空，无法写入响应，TAP:{}", (void*)tap);
-        tap->Drop("back chain empty");
-    }
-}
-
 void ZmTapContext::SetOptData(ZM_TAP_CTX* tap, size_t optlen, const BYTE* optdata)
 {
     if (tap->requester_data)

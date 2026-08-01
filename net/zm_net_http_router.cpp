@@ -195,6 +195,11 @@ ZmHttpRouter::MatchRoute(const std::string& path,
     auto segs = SplitPath(path.c_str());
     const Node* node = m_root.get();
 
+    // 静态/参数分支旁的通配符兄弟节点（回溯点）：沿静态分支下钻后若子树死路，
+    // 回退到最近一次记录的通配符兄弟（如 "/control/asd" → 根级 "*" 兜底路由）。
+    const Node* savedWildcard = nullptr;
+    size_t      savedMWCount  = 0;   // 回溯点已收集的中间件数（用于裁剪误积累的中间件）
+
     for (size_t i = 0; i < segs.size(); i++)
     {
         const auto& seg = segs[i];
@@ -214,6 +219,12 @@ ZmHttpRouter::MatchRoute(const std::string& path,
 
         if (matched)
         {
+            // 静态分支旁存在通配符兄弟 → 记录回溯点（覆盖为更深的一次）
+            if (wildcard)
+            {
+                savedWildcard = wildcard;
+                savedMWCount  = result.nodeMWs.size();
+            }
             node = matched;
             if (!matched->middlewares.empty())
                 result.nodeMWs.insert(result.nodeMWs.end(),
@@ -221,6 +232,11 @@ ZmHttpRouter::MatchRoute(const std::string& path,
         }
         else if (param)
         {
+            if (wildcard)
+            {
+                savedWildcard = wildcard;
+                savedMWCount  = result.nodeMWs.size();
+            }
             outParams[param->segment.substr(1)] = seg;
             node = param;
             if (!param->middlewares.empty())
@@ -237,6 +253,16 @@ ZmHttpRouter::MatchRoute(const std::string& path,
         }
         else
         {
+            // 死路：子树无法匹配剩余段 → 回溯到最近记录的通配符兄弟
+            if (savedWildcard)
+            {
+                result.nodeMWs.resize(savedMWCount);
+                if (!savedWildcard->middlewares.empty())
+                    result.nodeMWs.insert(result.nodeMWs.end(),
+                        savedWildcard->middlewares.begin(), savedWildcard->middlewares.end());
+                result.handlers = &savedWildcard->handlers;
+                return result;
+            }
             return result;  // 无匹配，handlers 为 nullptr
         }
     }
@@ -255,6 +281,16 @@ ZmHttpRouter::MatchRoute(const std::string& path,
                 result.handlers = &c->handlers;
                 return result;
             }
+        }
+        // 段已耗尽但节点无处理器 → 同样回溯到通配符兄弟
+        if (savedWildcard)
+        {
+            result.nodeMWs.resize(savedMWCount);
+            if (!savedWildcard->middlewares.empty())
+                result.nodeMWs.insert(result.nodeMWs.end(),
+                    savedWildcard->middlewares.begin(), savedWildcard->middlewares.end());
+            result.handlers = &savedWildcard->handlers;
+            return result;
         }
         return result;  // handlers 为 nullptr
     }

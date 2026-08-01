@@ -164,9 +164,6 @@ public:
                        std::function<bool(const ZM_TAP_CTX*)> fnmatches);
 
 public:
-    // --- 跨线程安全操作方法 ---
-    /** @brief 异步写入 JSON 响应（跨线程安全） */
-    static void Response(ZM_TAP_CTX* tap, const ZMJSON& jsResponse);
     /** @brief 异步设置 TAP 超时定时器, 注意,如果设置了drop_timeout_error_code,请不要提前手动Drop这个tap（跨线程安全） */
     static void SetDropTimer(ZM_TAP_CTX* tap, int seconds = 0, int micros = 0, uint32_t drop_timeout_error_code = 0);
     // --- 静态工具方法 ---

@@ -59,6 +59,11 @@ public:
 	 * @param tap 目标 TAP 上下文 */
 	void OnTapDelegateBackEvent(ZM_TAP_CTX* tap) override;
 
+public:
+	// --- 跨线程安全操作方法 ---
+	/** @brief 异步写入 JSON 响应（跨线程安全） */
+	static void Response(ZM_TAP_CTX* tap, const ZMJSON& jsResponse);
+
 private:
 	/** @brief 向 bufferevent 输出端写入 4 字节大端长度前缀 + JSON 响应体
 	 *

@@ -167,6 +167,30 @@ void ZmTapDelegateJRPC::OnTapDelegateBackEvent(ZM_TAP_CTX* tap)
 	WriteResponse(tap, (const char*)tap->onback_data, tap->onback_dlen);
 }
 
+void ZmTapDelegateJRPC::Response(ZM_TAP_CTX* tap, const ZMJSON& jsResponse)
+{
+	if (!tap) return;
+
+	if (tap->state != ZM_TAP_STATE_INUSE)
+	{
+		//PUBLIC_LOG_WARN("TAP 已失效，丢弃响应，TAP:{}, state:{}", (void*)tap, tap->state);
+		return;
+	}
+
+	ZmTapDelegate* back_delegate = ZmTapContext::BackChainPop(tap);
+	if (back_delegate)
+	{
+		std::string jstr = jsResponse.dump();
+		ZmTapContext::SetOnBackData(tap, jstr.size(), jstr.c_str());
+		back_delegate->OnTapDelegateBackEvent(tap);
+	}
+	else
+	{
+		PUBLIC_LOG_WARN("TAP 回传链为空，无法写入响应，TAP:{}", (void*)tap);
+		tap->Drop("back chain empty");
+	}
+}
+
 // ============================================================================
 // 内部方法
 // ============================================================================

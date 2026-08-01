@@ -5,6 +5,9 @@
 
 #include <event2/buffer.h>
 
+#include <io.h>   // _close
+#include <string_view>
+
 // ============================================================================
 // ZmTapDelegateRESTful 构造 / 析构
 // ============================================================================
@@ -33,6 +36,165 @@ void ZmTapDelegateRESTful::StopThreadPool()
         delete m_threadPool;
         m_threadPool = nullptr;
     }
+}
+
+// ============================================================================
+// 跨线程安全响应方法
+// ============================================================================
+//
+// 所有方法均可在任意线程调用(底层 task 操作经 event_active 投递到事件循环线程)。
+// 每个方法先做 TAP 有效性防护:state != ZM_TAP_STATE_INUSE 说明 TAP 已被回收,
+// 直接静默丢弃响应(与 JRPC::Response 一致),防止访问已释放的 httpd_task。
+//
+// Drop 语义:
+//   - 完整返回类(Json/Error/Empty/Raw/Redirect/File)写完响应后自动 tap->Drop(),
+//     触发 pair[0] EOF → HttpRestfulManager::OnPair0Event 归还 pair 池;
+//   - 流式类(Stream*/SSE*)由 Start 开启、Chunk/Event 发送、End 统一收尾,
+//     Start/Chunk 不 Drop,End 时 EndStreamReply + Drop。
+
+/** @brief 校验 TAP 有效性并取出 httpd_task;无效返回 nullptr(无 task 时顺带回收 TAP) */
+static ZmHttpdTask* GetAliveTapTask(ZM_TAP_CTX* tap)
+{
+    if (!tap || tap->state != ZM_TAP_STATE_INUSE)
+    {
+        PUBLIC_LOG_WARN("[RESTfulDelegate] TAP 已失效,丢弃响应, TAP:{}", (void*)tap);
+        return nullptr;
+    }
+
+    ZmHttpdTask* task = tap->httpd_task;
+    if (!task)
+    {
+        PUBLIC_LOG_WARN("[RESTfulDelegate] TAP 无 httpd_task,丢弃响应, TAP:{}", (void*)tap);
+        tap->Drop("no httpd_task");
+        return nullptr;
+    }
+    return task;
+}
+
+void ZmTapDelegateRESTful::ResponseJson(ZM_TAP_CTX* tap, int code, const ZMJSON& data)
+{
+    ZmHttpdTask* task = GetAliveTapTask(tap);
+    if (!task) return;
+    ZmRESTfulServer::ReplyJson(task, code, data);
+    tap->Drop();
+}
+
+void ZmTapDelegateRESTful::ResponseError(ZM_TAP_CTX* tap, int code, std::string_view msg)
+{
+    ZmHttpdTask* task = GetAliveTapTask(tap);
+    if (!task) return;
+    ZmRESTfulServer::ReplyError(task, code, msg);
+    tap->Drop();
+}
+
+void ZmTapDelegateRESTful::ResponseEmpty(ZM_TAP_CTX* tap, int code, const char* reason)
+{
+    ZmHttpdTask* task = GetAliveTapTask(tap);
+    if (!task) return;
+    ZmRESTfulServer::ReplyEmpty(task, code, reason);
+    tap->Drop();
+}
+
+void ZmTapDelegateRESTful::ResponseRaw(ZM_TAP_CTX* tap, int code, const BYTE* data, size_t dlen,
+                                       const char* contentType)
+{
+    ZmHttpdTask* task = GetAliveTapTask(tap);
+    if (!task) return;
+    task->PutReplyHeader("Content-Type", contentType ? contentType : "text/plain; charset=utf-8");
+    task->SetReply(code);
+    if (data && dlen > 0)
+        task->SetReplyData(data, dlen);
+    task->TriggerReply();
+    tap->Drop();
+}
+
+void ZmTapDelegateRESTful::ResponseRedirect(ZM_TAP_CTX* tap, const char* location, int code)
+{
+    ZmHttpdTask* task = GetAliveTapTask(tap);
+    if (!task) return;
+    ZmRESTfulServer::ReplyRedirect(task, location, code);
+    tap->Drop();
+}
+
+void ZmTapDelegateRESTful::ResponseFile(ZM_TAP_CTX* tap, int fd, ev_off_t offset, ev_off_t length,
+                                        const char* attachmentName, size_t downloadBps)
+{
+    ZmHttpdTask* task = GetAliveTapTask(tap);
+    if (!task)
+    {
+        // TAP 已失效,fd 无人接管,由本方法负责关闭
+        if (fd >= 0) _close(fd);
+        return;
+    }
+
+    if (attachmentName && attachmentName[0])
+    {
+        std::string disposition = "attachment; filename=\"" + std::string(attachmentName) + "\"";
+        task->PutReplyHeader("Content-Disposition", disposition);
+    }
+    if (downloadBps > 0)
+        task->SetRateLimit(downloadBps, 0);
+
+    task->SetReply(200);
+    if (task->SetReplyFile(fd, offset, length) < 0)
+    {
+        // SetReplyFile 失败不接管 fd(文档:失败时调用者自行 close)
+        if (fd >= 0) _close(fd);
+        task->SetReply(ZM_HTTP_STATUS_CODE_INTERNAL_ERROR, "File send failed");
+        task->TriggerReply();
+        tap->Drop();
+        return;
+    }
+    // 成功:fd 所有权已转移给 libevent(EVBUF_FS_CLOSE_ON_FREE 自动关闭)
+    task->TriggerReply();
+    tap->Drop();
+}
+
+void ZmTapDelegateRESTful::ResponseStreamStart(ZM_TAP_CTX* tap, int code,
+    std::initializer_list<std::pair<const char*, const char*>> headers)
+{
+    ZmHttpdTask* task = GetAliveTapTask(tap);
+    if (!task) return;
+
+    for (const auto& h : headers)
+        task->PutReplyHeader(h.first, h.second);
+    task->StartStreamReply(code);
+}
+
+void ZmTapDelegateRESTful::ResponseStreamChunk(ZM_TAP_CTX* tap, const BYTE* data, size_t dlen)
+{
+    ZmHttpdTask* task = GetAliveTapTask(tap);
+    if (!task) return;
+    task->SendReplyChunk(data, dlen);
+}
+
+void ZmTapDelegateRESTful::ResponseStreamEnd(ZM_TAP_CTX* tap)
+{
+    ZmHttpdTask* task = GetAliveTapTask(tap);
+    if (!task) return;
+    task->EndStreamReply();
+    tap->Drop();
+}
+
+void ZmTapDelegateRESTful::ResponseSSEStart(ZM_TAP_CTX* tap)
+{
+    ResponseStreamStart(tap, 200, {
+        {"Content-Type", "text/event-stream"},
+        {"Cache-Control", "no-cache"}
+    });
+}
+
+void ZmTapDelegateRESTful::ResponseSSEEvent(ZM_TAP_CTX* tap, const ZMJSON& data)
+{
+    ZmHttpdTask* task = GetAliveTapTask(tap);
+    if (!task) return;
+    std::string line = "data: " + data.dump() + "\n\n";
+    task->SendReplyChunk((const BYTE*)line.c_str(), line.size());
+}
+
+void ZmTapDelegateRESTful::ResponseSSEEnd(ZM_TAP_CTX* tap)
+{
+    ResponseStreamEnd(tap);
 }
 
 // ============================================================================
