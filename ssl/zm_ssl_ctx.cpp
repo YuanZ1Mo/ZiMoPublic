@@ -6,6 +6,7 @@
 #include "zm_ssl_ctx.h"
 
 #include "zm_ssl_fingerprint.h"
+#include "../spdlog/zm_logger.h"
 #include "../util/zm_util_file.h"
 #include "../net/zm_net_runloop.h"
 
@@ -614,20 +615,15 @@ size_t ZmMemoryBIO::BufLen()
 // ZmSessionTicketManager
 // ============================================================================
 
-int ZmSessionTicketManager::s_exDataIndex = -1;
-
 ZmSessionTicketManager::ZmSessionTicketManager()
-    : m_hasPrevKey(false)
 {
-    memset(&m_currentKey, 0, sizeof(m_currentKey));
-    memset(&m_prevKey, 0, sizeof(m_prevKey));
+    memset(&m_key, 0, sizeof(m_key));
 }
 
 ZmSessionTicketManager::~ZmSessionTicketManager()
 {
-    // 密钥用完后清零，防止内存泄漏后泄露密钥
-    OPENSSL_cleanse(&m_currentKey, sizeof(m_currentKey));
-    OPENSSL_cleanse(&m_prevKey, sizeof(m_prevKey));
+    // 密钥用完后清零,防止内存泄漏后泄露密钥
+    OPENSSL_cleanse(&m_key, sizeof(m_key));
 }
 
 bool ZmSessionTicketManager::Init(const char* ticketFile)
@@ -637,27 +633,34 @@ bool ZmSessionTicketManager::Init(const char* ticketFile)
 
     bool loaded = false;
 
-    // ① 尝试从已有文件加载
+    // ① 尝试从已有文件加载(兼容旧 48B 格式,自动重生成覆盖)
     if (!m_ticketFile.empty())
     {
-        ZmByteBuffer heap(ZM_SESSION_TICKET_KEY_LEN + 16);
-        if (ZmFile::Read(m_ticketFile.c_str(), heap) &&
-            heap.Size() >= ZM_SESSION_TICKET_KEY_LEN)
+        ZmByteBuffer heap(ZM_TICKET_KEYS_LEN + 16);
+        if (ZmFile::Read(m_ticketFile.c_str(), heap))
         {
-            memcpy(&m_currentKey, heap.Head(), ZM_SESSION_TICKET_KEY_LEN);
-            loaded = true;
+            if (heap.Size() == ZM_TICKET_KEYS_LEN)
+            {
+                memcpy(&m_key, heap.Head(), ZM_TICKET_KEYS_LEN);
+                loaded = true;
+            }
+            else if (heap.Size() == 48)
+            {
+                // 旧 48B 格式(name16|hmac16|aes16)从未启用过,直接重生成
+                PUBLIC_LOG_WARN("ticket key 文件 {} 为旧 48B 格式,重新生成 80B 密钥", m_ticketFile);
+            }
         }
     }
 
     // ② 不存在或无效 → 生成随机密钥
     if (!loaded)
     {
-        if (RAND_bytes(m_currentKey.data, ZM_SESSION_TICKET_KEY_LEN) != 1)
+        if (RAND_bytes(m_key.data, ZM_TICKET_KEYS_LEN) != 1)
             return false;
 
         // 持久化到文件
         if (!m_ticketFile.empty())
-            ZmFile::Write(m_ticketFile.c_str(), m_currentKey.data, ZM_SESSION_TICKET_KEY_LEN);
+            ZmFile::Write(m_ticketFile.c_str(), m_key.data, ZM_TICKET_KEYS_LEN);
     }
 
     return true;
@@ -665,75 +668,34 @@ bool ZmSessionTicketManager::Init(const char* ticketFile)
 
 void ZmSessionTicketManager::RotateKeys()
 {
-    memcpy(&m_prevKey, &m_currentKey, sizeof(m_prevKey));
-    m_hasPrevKey = true;
-
-    RAND_bytes(m_currentKey.data, ZM_SESSION_TICKET_KEY_LEN);
+    if (RAND_bytes(m_key.data, ZM_TICKET_KEYS_LEN) != 1)
+        return;  // 本轮轮换失败,保留旧 key 继续使用
 
     if (!m_ticketFile.empty())
-        ZmFile::Write(m_ticketFile.c_str(), m_currentKey.data, ZM_SESSION_TICKET_KEY_LEN);
+        ZmFile::Write(m_ticketFile.c_str(), m_key.data, ZM_TICKET_KEYS_LEN);
 }
 
-void ZmSessionTicketManager::Bind(struct ssl_ctx_st* ctx)
+void ZmSessionTicketManager::SetKeys(struct ssl_ctx_st* ctx)
 {
     if (!ctx) return;
 
-    SSL_CTX* sslctx = (SSL_CTX*)ctx;
-
-    // 首次调用时分配 ex_data 索引
-    if (s_exDataIndex < 0)
-        s_exDataIndex = SSL_CTX_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
-
-    // 将 this 存入 SSL_CTX，回调时取回
-    SSL_CTX_set_ex_data(sslctx, s_exDataIndex, this);
-    SSL_CTX_set_tlsext_ticket_key_evp_cb(sslctx, OnTicketKeyCallback);
+    if (SSL_CTX_set_tlsext_ticket_keys((SSL_CTX*)ctx, m_key.data,
+                                       ZM_TICKET_KEYS_LEN) != 1)
+    {
+        // 失败不影响 TLS:回退 OpenSSL 内部随机密钥(仅恢复不跨重启)
+        PUBLIC_LOG_WARN("SetKeys: SSL_CTX_set_tlsext_ticket_keys 失败,回退内部随机密钥");
+    }
 }
 
-int ZmSessionTicketManager::OnTicketKeyCallback(SSL* ssl, unsigned char keyName[16],
-                                                 unsigned char iv[EVP_MAX_IV_LENGTH],
-                                                 EVP_CIPHER_CTX* /*cipher*/,
-                                                 EVP_MAC_CTX* mac, int enc)
+void ZmSessionTicketManager::SetTicketDataCB(struct ssl_ctx_st* ctx,
+                                             int (*gen_cb)(SSL*, void*),
+                                             int (*dec_cb)(SSL*, SSL_SESSION*,
+                                                           const unsigned char*,
+                                                           size_t, int, void*),
+                                             void* arg)
 {
-    ZmSessionTicketManager* self = (ZmSessionTicketManager*)
-        SSL_CTX_get_ex_data(SSL_get_SSL_CTX(ssl), s_exDataIndex);
-    if (!self)
-        return 0;
-
-    return self->handleTicketKey(keyName, iv, mac, enc);
-}
-
-int ZmSessionTicketManager::handleTicketKey(unsigned char keyName[16],
-                                             unsigned char iv[EVP_MAX_IV_LENGTH],
-                                             EVP_MAC_CTX* mac, int enc)
-{
-    static char kDigestName[] = "SHA256";
-    OSSL_PARAM params[2];
-    params[0] = OSSL_PARAM_construct_utf8_string("digest", kDigestName, 0);
-    params[1] = OSSL_PARAM_construct_end();
-
-    if (enc)
-    {
-        memcpy(keyName, m_currentKey.data, 16);
-        EVP_MAC_init(mac, m_currentKey.data + 16, 16, params);
-        memcpy(iv, m_currentKey.data + 32, 16);
-        return 1;
-    }
-    else
-    {
-        if (memcmp(keyName, m_currentKey.data, 16) == 0)
-        {
-            EVP_MAC_init(mac, m_currentKey.data + 16, 16, params);
-            memcpy(iv, m_currentKey.data + 32, 16);
-            return 1;
-        }
-        if (m_hasPrevKey && memcmp(keyName, m_prevKey.data, 16) == 0)
-        {
-            EVP_MAC_init(mac, m_prevKey.data + 16, 16, params);
-            memcpy(iv, m_prevKey.data + 32, 16);
-            return 1;
-        }
-        return 0;
-    }
+    if (!ctx) return;
+    SSL_CTX_set_session_ticket_cb((SSL_CTX*)ctx, gen_cb, dec_cb, arg);
 }
 
 // ============================================================================

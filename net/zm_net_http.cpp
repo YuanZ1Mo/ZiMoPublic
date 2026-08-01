@@ -1280,8 +1280,11 @@ ZmHttpServer::ZmHttpServer(struct event_base* evbase, uint16_t local_port,
       m_local_port(local_port), m_port_bind_failed(false), m_ssl_ctx(nullptr),
       m_oldCtx(nullptr), m_ctxCleanupTimer(nullptr),
       m_redirect_from_port(redirect_from_port), m_redirectEvhttp(nullptr),
-      m_httpdDoerPool(nullptr)
+      m_httpdDoerPool(nullptr), m_hasTicketKeys(false), m_sessionCacheSize(sessionCacheSize),
+      m_sessionContext(sessionContext ? sessionContext : "")
 {
+    memset(m_ticketKeys, 0, sizeof(m_ticketKeys));
+
     if (certFile && certFile[0] && keyFile && keyFile[0])
     {
         m_ssl_ctx = ZmSSLContext::MakeServerCTX(certFile, keyFile,
@@ -1390,12 +1393,22 @@ bool ZmHttpServer::ReloadCertificate(const char* certFile, const char* keyFile)
     if (!certFile || !keyFile || !m_evbase)
         return false;
 
-    // ① 创建新 SSL_CTX（沿用当前 session cache 配置，如需变更可扩展参数）
-    SSL_CTX* newCtx = ZmSSLContext::MakeServerCTX(certFile, keyFile);
+    // ① 创建新 SSL_CTX（沿用当前 session cache 配置 + ticket 密钥）
+    SSL_CTX* newCtx = ZmSSLContext::MakeServerCTX(certFile, keyFile,
+                                                   m_sessionCacheSize,
+                                                   m_sessionContext.empty()
+                                                       ? nullptr
+                                                       : m_sessionContext.c_str());
     if (!newCtx)
     {
         PUBLIC_LOG_WARN("ReloadCertificate: new cert/key load failed, keeping existing cert (port {})", m_local_port);
         return false;
+    }
+    if (m_hasTicketKeys)
+    {
+        // 补设 ticket 密钥:新 ctx 默认使用 OpenSSL 内部随机密钥,
+        // 不补设会与其余服务器密钥不一致,导致共享的 ticket 无法恢复
+        SSL_CTX_set_tlsext_ticket_keys(newCtx, m_ticketKeys, ZM_TICKET_KEYS_LEN);
     }
 
     // ② 原子替换（事件循环线程操作，无竞态）
@@ -1433,6 +1446,61 @@ bool ZmHttpServer::ReloadCertificate(const char* certFile, const char* keyFile)
 
     PUBLIC_LOG_INFO("Certificate reloaded successfully (port {})", m_local_port);
     return true;
+}
+
+// ============================================================================
+// TLS session ticket 密钥(方案 B:OpenSSL 内部密钥)
+// ============================================================================
+
+namespace
+{
+// 投递参数打包:服务器指针 + 密钥拷贝(event_base_once 回调用)
+struct ZmPostTicketKeyArg
+{
+    ZmHttpServer*    server;
+    unsigned char    keys[ZM_TICKET_KEYS_LEN];
+};
+
+void OnPostSetTicketKeys(evutil_socket_t, short, void* arg)
+{
+    ZmPostTicketKeyArg* p = (ZmPostTicketKeyArg*)arg;
+    p->server->SetTicketKeys(p->keys, sizeof(p->keys));  // 事件循环线程内执行
+    delete p;
+}
+}
+
+void ZmHttpServer::SetTicketKeys(const unsigned char* keys, size_t len)
+{
+    if (!keys || len != ZM_TICKET_KEYS_LEN)
+        return;
+
+    memcpy(m_ticketKeys, keys, ZM_TICKET_KEYS_LEN);
+    m_hasTicketKeys = true;
+
+    if (m_ssl_ctx)
+    {
+        // 事件循环线程内调用:启动路径无并发;轮换路径经 PostSetTicketKeys 投递
+        // 宏展开为 SSL_CTX_ctrl(ctx, ..., void*),C++ 下需显式去 const(OpenSSL 只拷贝不修改)
+        SSL_CTX_set_tlsext_ticket_keys((SSL_CTX*)m_ssl_ctx, (void*)keys, (long)len);
+    }
+}
+
+void ZmHttpServer::PostSetTicketKeys(const unsigned char* keys, size_t len)
+{
+    if (!keys || len != ZM_TICKET_KEYS_LEN || !m_evbase)
+        return;
+
+    ZmPostTicketKeyArg* p = new ZmPostTicketKeyArg;
+    p->server = this;
+    memcpy(p->keys, keys, ZM_TICKET_KEYS_LEN);
+
+    // event_base_once 线程安全,回调仅在事件循环线程执行。
+    // 注意:本方法不保证回调在服务器析构前执行 —— 调用方必须在销毁
+    // ZmHttpServer 之前先停止并释放事件循环(残留 once 事件在
+    // event_base_free 时被丢弃,不会在析构后执行);否则存在
+    // 回调访问已释放对象的窗口(轮换 12h 一次,实际概率极低)。
+    if (event_base_once(m_evbase, -1, EV_TIMEOUT, OnPostSetTicketKeys, p, NULL) == -1)
+        delete p;   // 投递失败,释放已分配的参数,避免泄漏
 }
 
 void ZmHttpServer::SetPoolName(const std::string& name)

@@ -17,6 +17,8 @@
 
 #include "../json/zm_json.h"
 #include "../util/zm_util_str.h"
+// 需要 ZM_TICKET_KEYS_LEN(ticket 密钥长度宏),仅引入 evp.h 等轻量头,不含 openssl/ssl.h
+#include "../ssl/zm_ssl_ctx.h"
 
 #include <../libevent/include/event2/http.h>
 #include <../libevent/include/event2/keyvalq_struct.h>
@@ -644,6 +646,23 @@ public:
     bool ReloadCertificate(const char* certFile, const char* keyFile);
 
     /**
+     * @brief 设置 TLS session ticket 密钥(80 字节,ZM_TICKET_KEYS_LEN)
+     *
+     * 须在服务器事件循环线程内调用(唯一调用路径为 PostSetTicketKeys 投递回调)。
+     * 内部保存拷贝,证书热加载后自动补设到新 SSL_CTX。
+     */
+    void SetTicketKeys(const unsigned char* keys, size_t len);
+
+    /**
+     * @brief 将 ticket 密钥投递到本服务器事件循环线程设置(线程安全)
+     *
+     * 轮换场景使用:任意线程可调用,实际在事件循环线程内执行
+     * SSL_CTX_set_tlsext_ticket_keys,避免与并发握手竞争。
+     * 残留未执行的投递在 event_base 释放时被丢弃,不会在服务器析构后执行。
+     */
+    void PostSetTicketKeys(const unsigned char* keys, size_t len);
+
+    /**
      * @brief 设置内部线程池名称（调试时 VS 线程列表可见）
      * @param name  新名称，如 "JRPC-39440"
      */
@@ -799,6 +818,18 @@ private:
 
     /** @brief 旧 SSL_CTX 延时清理定时器 */
     struct event*      m_ctxCleanupTimer;
+
+    /** @brief ticket 密钥拷贝（未设置时为 0） */
+    unsigned char      m_ticketKeys[ZM_TICKET_KEYS_LEN];
+
+    /** @brief 是否已设置 ticket 密钥 */
+    bool               m_hasTicketKeys;
+
+    /** @brief session cache 容量（热加载沿用） */
+    uint32_t           m_sessionCacheSize;
+
+    /** @brief session cache 上下文（热加载沿用） */
+    std::string        m_sessionContext;
 
     /** @brief HTTP→HTTPS 重定向服务器端口（0 = 不启用） */
     uint16_t           m_redirect_from_port;

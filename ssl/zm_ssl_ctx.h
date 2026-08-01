@@ -19,6 +19,7 @@
 // OpenSSL 结构体前向声明（头文件中仅通过指针使用）
 struct ssl_st;
 struct ssl_ctx_st;
+struct ssl_session_st;
 struct x509_st;
 struct bio_st;
 struct buf_mem_st;
@@ -273,29 +274,32 @@ private:
     BUF_MEM*  m_buf;   /**< BUF_MEM 指针，由 Buf() 填充 */
 };
 
-// Session Ticket 密钥：48 字节（name[16] + hmac_key[16] + aes_key[16]）
-#define ZM_SESSION_TICKET_KEY_LEN 48
+// TLS Session Ticket 密钥:80 字节(name[16] + hmac_key[32] + aes_key[32])
+// 与 OpenSSL SSL_CTX_set_tlsext_ticket_keys() 的格式一致:
+//   tick_key_name[16] | tick_hmac_key[32] | tick_aes_key[32]
+//   (AES-256-CBC + HMAC-SHA256)
+#define ZM_TICKET_KEYS_LEN 80
 
 /**
  * @brief TLS Session Ticket 管理器
  *
- * 每个 HTTPS 服务器实例可独立持有一个 ZmSessionTicketManager。
- * Init() 加载或生成 48 字节随机密钥并持久化到文件；
- * Bind() 将密钥注册到 SSL_CTX，OpenSSL 自动签发/解密 ticket。
+ * Init() 加载或生成 80 字节随机密钥并持久化到文件;
+ * SetKeys() 通过 SSL_CTX_set_tlsext_ticket_keys() 写入 SSL_CTX,
+ * OpenSSL 用该密钥签发/解密 session ticket(无状态、可跨进程共享)。
  *
- * 支持密钥轮换：RotateKeys() 将当前密钥推入 "上一轮" 槽位，
- * 旧密钥仍可解密存量 ticket，新 ticket 用新密钥加密。
+ * 支持密钥轮换:RotateKeys() 生成新密钥并落盘。
+ * 注意:OpenSSL 内部仅保存一把 key,轮换后旧 ticket 立即失效,
+ * 持有旧 ticket 的客户端将做一次完整握手(见设计文档 4.2)。
  *
- * 使用方式（在 OnConfigureSSL 中）：
+ * 使用方式(在 OnConfigureSSL 中):
  * @code
  *   void OnConfigureSSL(SSL_CTX* ctx) override {
  *       m_sessionTicket.Init("certs/ticket.key");
- *       m_sessionTicket.Bind(ctx);
+ *       m_sessionTicket.SetKeys(ctx);
  *   }
  * @endcode
  *
- * @note 多个服务器加载同一 ticket.key → 共享 session ticket（跨端口恢复）
- * @note 加载不同 ticket.key → 互相隔离（独立会话空间）
+ * @note 多个服务器 SetKeys 同一把 key → 共享 session ticket(跨端口/跨进程恢复)
  */
 class ZmSessionTicketManager
 {
@@ -306,45 +310,51 @@ public:
     /**
      * @brief 初始化 ticket 密钥
      *
-     * 从 file 加载已有密钥；若文件不存在则生成 48 字节随机密钥并写入文件。
+     * 从 file 加载已有密钥;文件不存在则生成 80 字节随机密钥并写入文件。
+     * 兼容旧 48 字节格式文件(自动重生成 80 字节并覆盖)。
      *
-     * @param ticketFile  密钥文件路径，nullptr 表示仅内存不持久化
-     * @return true 初始化成功（失败不影响 TLS，回退到完整握手）
+     * @param ticketFile  密钥文件路径,nullptr 表示仅内存不持久化
+     * @return true 初始化成功(失败不影响 TLS,回退 OpenSSL 内部随机密钥)
      */
     bool Init(const char* ticketFile = nullptr);
 
     /**
      * @brief 轮换 ticket 密钥
      *
-     * 当前密钥 → 上一轮（仅解密），生成新密钥用于加密。
+     * 生成新 80 字节密钥并落盘。旧 ticket 在轮换后立即失效(完整握手)。
      * 建议每 12-24 小时调用一次。
      */
     void RotateKeys();
 
+    /** @brief 当前密钥指针(80 字节),供 SetKeys 使用 */
+    const unsigned char* Key() const { return m_key.data; }
+
     /**
-     * @brief 注册 ticket key 回调到 SSL_CTX
+     * @brief 将密钥写入 SSL_CTX(等价 SSL_CTX_set_tlsext_ticket_keys)
      *
-     * 必须在 Init() 之后、SSL_CTX 投入使用之前调用。
+     * 必须在 SSL_CTX 投入使用前调用;运行中调用需在事件循环线程内。
      */
-    void Bind(struct ssl_ctx_st* ctx);
+    void SetKeys(struct ssl_ctx_st* ctx);
+
+    /**
+     * @brief 注册 ticket appdata 回调(预留能力,默认不注册)
+     *
+     * 包装 OpenSSL 3.2+ 的 SSL_CTX_set_session_ticket_cb():
+     * - gen_cb:ticket 签发前调用,可用 SSL_SESSION_set1_ticket_appdata 嵌入应用数据
+     * - dec_cb:ticket 解密后调用,按 SSL_TICKET_STATUS / SSL_TICKET_RETURN 决策
+     * 本次仅提供透传,业务用法后续按需添加。
+     */
+    void SetTicketDataCB(struct ssl_ctx_st* ctx,
+                         int (*gen_cb)(struct ssl_st*, void*),
+                         int (*dec_cb)(struct ssl_st*, struct ssl_session_st*,
+                                       const unsigned char*, size_t, int, void*),
+                         void* arg);
 
 private:
-    static int  OnTicketKeyCallback(SSL* ssl, unsigned char keyName[16],
-                                    unsigned char iv[EVP_MAX_IV_LENGTH],
-                                    EVP_CIPHER_CTX* cipher, EVP_MAC_CTX* mac, int enc);
+    struct TicketKeys { unsigned char data[ZM_TICKET_KEYS_LEN]; };
 
-    int  handleTicketKey(unsigned char keyName[16],
-                         unsigned char iv[EVP_MAX_IV_LENGTH],
-                         EVP_MAC_CTX* mac, int enc);
-
-    struct TicketKey { unsigned char data[ZM_SESSION_TICKET_KEY_LEN]; };
-
-    TicketKey   m_currentKey;
-    TicketKey   m_prevKey;
-    bool        m_hasPrevKey;
-    std::string m_ticketFile;
-
-    static int  s_exDataIndex;
+    TicketKeys  m_key;          ///< 当前密钥
+    std::string m_ticketFile;   ///< 密钥文件路径(空 = 仅内存)
 };
 
 // 前向声明
@@ -365,8 +375,8 @@ class ZmEvBaseRunLoop;
  *   rotator.Init("certs/ticket.key");
  *   rotator.Start(12 * 3600, []() { LOG("rotated"); });
  *
- *   serverA->BindTicket(&rotator.GetTicketManager());
- *   serverB->BindTicket(&rotator.GetTicketManager());
+ *   serverA->SetTicketKeys(rotator.GetTicketManager().Key(), ZM_TICKET_KEYS_LEN);
+ *   serverB->SetTicketKeys(rotator.GetTicketManager().Key(), ZM_TICKET_KEYS_LEN);
  * @endcode
  */
 class ZmTicketKeyRotator
