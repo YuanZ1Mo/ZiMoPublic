@@ -5,6 +5,7 @@
 
 #include "zm_net_http.h"
 
+#include "zm_net_req_loop.h"   // close 通知器投递 CLOSE 需要 ZmReqLoop 完整定义
 #include "zm_net_socket.h"
 #include "zm_net_ip.h"
 #include "../util/zm_util_thread.h"
@@ -689,17 +690,10 @@ void ZmHttpdTask::StartStreamReply(int code, const char* reason)
     m_status_code = code;
     m_reason = std::string(reason ? reason : "");
     m_streaming = true;
-    // 注册连接关闭回调:客户端断开(连接释放)时置 m_connClosed,供流式发送线程断连检测。
-    // 连接可能已先于注册被释放(断开与请求处理竞争)→ 跳过注册,由 SendReplyStart 兜底标记
-    if (struct evhttp_connection* conn = evhttp_request_get_connection(m_request))
-        evhttp_connection_set_closecb(conn, OnConnCloseCb, this);
+    // 注:close 通知由 ZmHttpServer 的 per-connection 通知器统一广播(方案 3),
+    // 此处不再注册单槽 closecb(单槽会被同连接后续请求覆盖,且 doer 回收后悬垂)
     if (m_on_stream_start)
         m_on_stream_start();
-}
-
-void ZmHttpdTask::OnConnCloseCb(struct evhttp_connection* /*conn*/, void* ctx)
-{
-    static_cast<ZmHttpdTask*>(ctx)->m_connClosed.store(true);
 }
 
 void ZmHttpdTask::SendReplyChunk(const BYTE* data, size_t dlen)
@@ -825,6 +819,8 @@ public:
         m_input_buf = nullptr;
         m_streaming = false;
         m_connClosed = false;
+        m_boundLoop = nullptr;   // ★ 清旧请求的 A 绑定,防池复用后 close 投递到已释放的 loop
+        m_recycled = false;      // ★ 清回收标记:本次请求结束后才可再次 RecycleDoer 入池
         m_id = ++g_httpd_task_id;
 
         // ★ 以下成员保持不变（生命周期 = doer 对象生命周期）:
@@ -902,10 +898,6 @@ public:
     {
         // 先刷出所有未发送的数据块
         SendReplyChunkToClient();
-        // 流已结束:解除 closecb(连接可能 keep-alive 复用、延迟关闭),
-        // 防止回调在 doer 回收/复用/删除后仍指向其内存(悬垂指针)
-        if (struct evhttp_connection* conn = evhttp_request_get_connection(m_request))
-            evhttp_connection_set_closecb(conn, nullptr, nullptr);
         evhttp_send_reply_end(m_request);
     }
 
@@ -953,6 +945,9 @@ public:
 private:
     ZmHttpServer* m_httpd;
     struct event* m_reply_event;  ///< "响应就绪"信号事件（挂在 httpd 的 event_base 上）
+    bool m_recycled = false;      ///< 已回收标记(REPLY|STREAM_END 双驱动兜底,防双入池;Reset 时清)
+
+    friend class ZmHttpServer;   // RecycleDoer 访问 m_recycled(双驱动防重入护栏)
 };
 
 // ============================================================================
@@ -967,7 +962,7 @@ private:
 //   m_freelist  — 空闲待复用的 doer（m_allDoers 的子集）
 //
 // 在飞 doer（m_allDoers 中但不在 m_freelist 中）不在析构时强制释放，
-// 它们会在后续 REPLY 回调到达时通过 RecycleDoer(nullptr 兜底) 自删除。
+// 它们会在后续 REPLY 回调到达时由 RecycleDoer 回收(池满或 shutdown 时多余 doer 被 delete)。
 //
 class ZmHttpdDoerPool
 {
@@ -986,7 +981,7 @@ public:
             delete doer;
 
         // ② 统计在飞 doer（m_allDoers 中有但 m_freelist 中已无）
-        //    这些 doer 的 event 尚未触发 REPLY，由 RecycleDoer nullptr 兜底自删除
+        //    这些 doer 的 event 尚未触发 REPLY,由 RecycleDoer 回收(池满或 shutdown 时多余 doer 被 delete)
         size_t inflight = m_allDoers.size() - m_freelist.size();
         if (inflight > 0)
         {
@@ -1327,8 +1322,19 @@ bool ZmHttpServer::Init()
     return true;
 }
 
+void ZmHttpServer::DrainWorkers()
+{
+    if (m_threadPool)
+    {
+        delete m_threadPool;
+        m_threadPool = nullptr;
+    }
+}
+
 void ZmHttpServer::Close()
 {
+    m_closing.store(true);   // ★ 通知器 map 进入"仅 ClearAll 可碰"状态,防主线程与循环线程并发
+
     // ★ 先停线程池（join 所有 worker，确保不再有新 doer 进入处理流程）
     if (m_threadPool)
     {
@@ -1377,6 +1383,9 @@ void ZmHttpServer::Close()
         SSL_CTX_free((SSL_CTX*)m_ssl_ctx);
         m_ssl_ctx = nullptr;
     }
+
+    NotifierClearAll();     // 清理残留通知器(fired 通知器按设计留在 map 中等此清理;
+                            // evhttp_connection_free 会无条件触发 closecb,不能依赖它自清理)
 }
 
 bool ZmHttpServer::IsOpen() const
@@ -1528,6 +1537,10 @@ ZmHttpdDoer* ZmHttpServer::AcquireDoer(struct evhttp_request* request)
 
 void ZmHttpServer::RecycleDoer(ZmHttpdDoer* doer)
 {
+    if (doer->m_recycled)   // 已回收(REPLY|STREAM_END 合并等双驱动路径),防双入池
+        return;
+    doer->m_recycled = true;
+    NotifierRemove(doer);   // 摘除通知器,防 close 广播到已回收 doer(UAF)
     if (m_httpdDoerPool)
         m_httpdDoerPool->Recycle(doer);
     else
@@ -1595,13 +1608,114 @@ void ZmHttpServer::Perform(ZmHttpdTask* task)
     }
 }
 
+// ============================================================================
+// close 通知器(方案 3):per-connection 广播,替换单槽 closecb(流式路径)
+// 事件循环线程独享(m_closeNotifiers 无锁):Add/Remove 均在循环线程执行(Close 期间由主线程 ClearAll 独占清理,Add/Remove 以 m_closing 跳过);
+// closecb 在循环线程触发,Close 的 evhttp_free 中由主线程触发(只读不删)
+// ============================================================================
+
+void ZmHttpServer::OnConnCloseNotifierCB(struct evhttp_connection* /*conn*/, void* arg)
+{
+    auto* notifier = static_cast<ZmHttpServer::ZmConnCloseNotifier*>(arg);
+    if (!notifier || notifier->fired)
+        return;
+
+    if (notifier->closing && notifier->closing->load())
+        return;   // 服务器 Close 中:A 池已销毁,不再投 CLOSE(doer 正在整体拆除)
+
+    notifier->fired = true;
+
+    for (ZmHttpdTask* task : notifier->members)
+    {
+        task->MarkConnClosed();
+        // 已绑定 A → 投 CLOSE 到 A 的 loop;★ ctx 必须为 task(ProcessClose 身份校验契约)
+        // 未绑定(或已解绑):业务入口查 m_connClosed 快路径兜底,投递会被身份校验丢弃
+        if (ZmReqLoop* loop = task->BoundLoop())
+            loop->PostToLoop(ZmReqLoop::REQ_LOOP_SIG_CLOSE, task);
+    }
+    // 注:notifier 的删除由 NotifierRemove / NotifierClearAll 完成,closecb 只置 fired
+}
+
+void ZmHttpServer::NotifierAdd(ZmHttpdTask* task)
+{
+    if (m_closing.load())
+        return;   // Close 期间不再登记
+
+    struct evhttp_connection* conn = evhttp_request_get_connection(task->Request());
+    if (!conn)
+        return;   // 连接已死(客户端断开与请求处理竞争):由 m_connClosed 兜底
+
+    auto it = m_closeNotifiers.find(conn);
+    if (it != m_closeNotifiers.end() && it->second->fired)
+    {
+        // 旧通知器已触发且连接地址被新连接复用:换新通知器并重新注册 closecb,
+        // 否则新连接断开时零广播(旧成员后续 Remove 对新条目是良性 no-op)
+        delete it->second;
+        m_closeNotifiers.erase(it);
+        it = m_closeNotifiers.end();
+    }
+
+    ZmConnCloseNotifier* n;
+    if (it == m_closeNotifiers.end())
+    {
+        n = new ZmConnCloseNotifier();
+        n->closing = &m_closing;   // closecb 门:Close 期间跳过 CLOSE 投递(A 池已先停)
+        m_closeNotifiers[conn] = n;
+        evhttp_connection_set_closecb(conn, OnConnCloseNotifierCB, n);
+    }
+    else
+    {
+        n = it->second;
+    }
+    n->members.push_back(task);
+}
+
+void ZmHttpServer::NotifierRemove(ZmHttpdTask* task)
+{
+    if (m_closing.load())
+        return;   // Close 期间不触碰 map(NotifierClearAll 统一清理)
+
+    struct evhttp_connection* conn = evhttp_request_get_connection(task->Request());
+    if (!conn)
+        return;   // 连接已释放:doer 残留于 fired 通知器 members 属良性(closecb 不会重触发,由 ClearAll 统一清理)
+    auto it = m_closeNotifiers.find(conn);
+    if (it == m_closeNotifiers.end())
+        return;
+    ZmConnCloseNotifier* n = it->second;
+    auto& members = n->members;
+    members.erase(std::remove(members.begin(), members.end(), task), members.end());
+    if (members.empty() || n->fired)
+    {
+        if (!n->fired)
+            evhttp_connection_set_closecb(conn, nullptr, nullptr);
+        m_closeNotifiers.erase(it);
+        delete n;
+    }
+}
+
+void ZmHttpServer::NotifierClearAll()
+{
+    for (auto& kv : m_closeNotifiers)
+        delete kv.second;
+    m_closeNotifiers.clear();
+}
+
 void ZmHttpServer::OnHttpRequestCB(struct evhttp_request* request, void* arg)
 {
     const char* uri = evhttp_request_get_uri(request);
     if (uri && arg)
     {
         ZmHttpServer* server = (ZmHttpServer*)arg;
+        if (!server->m_threadPool)
+        {
+            // 关闭进行中(worker 已排空):直接拒绝,防空指针解引用
+            // (覆盖 DrainWorkers→evhttp_free 整个关闭窗口的新请求)
+            evhttp_send_error(request, ZM_HTTP_STATUS_CODE_SERVICE_UNAVAILABLE, nullptr);
+            return;
+        }
         ZmHttpdDoer* doer = server->AcquireDoer(request);
+        doer->SetArriveTime((int64_t)::GetTickCount64());   // 请求到达时间戳(deadline 起点)
+        server->NotifierAdd(doer);                          // 登记 close 通知器(循环线程,无竞态)
         server->m_threadPool->Submit([doer]() { doer->Process(); }, "Doer");
     }
     else
@@ -1880,19 +1994,9 @@ ZMJSON ZmJsonRpcServer::MakeError(int code, std::string_view message)
     return ZMJSON{ {"code", code}, {"message", message} };
 }
 
-void ZmJsonRpcServer::SetJsonRpcCB(OnJsonRpcRequestCB oncall)
-{
-    m_on_jsonrpc_call = oncall;
-}
-
 void ZmJsonRpcServer::SetJsonRpcCBAsync(OnJsonRpcRequestCBAsync oncall_async)
 {
     m_on_jsonrpc_call_async = oncall_async;
-}
-
-int ZmJsonRpcServer::OnJsonRpcRequest(ZmHttpdTask* task, const ZMJSON& request, ZMJSON& response)
-{
-    return m_on_jsonrpc_call ? m_on_jsonrpc_call(task, request, response) : -1;
 }
 
 bool ZmJsonRpcServer::OnJsonRpcRequestAsync(ZmHttpdTask* task, const ZMJSON& request, ZMJSON& reply)
@@ -2065,19 +2169,10 @@ int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
                     request["params"] = params;
                     request["headers"] = headers;
 
-                    // 异步路径优先：设置了异步回调则忽略同步回调
+                    // 仅异步回调：未设置则报 PORTAL_NOJRPC
                     if (OnJsonRpcRequestAsync(task, request, reply))
                     {
                         return -1; // 异步处理中，响应稍后到达
-                    }
-                    // 回调返回 < 0 表示该 method 不存在, 等于0表示没设置同步回调, 所以业务层不要返回0
-                    else if (int ret = OnJsonRpcRequest(task, request, response))
-                    {
-                        if (ret < 0)
-                        {
-                            errcode = ZM_JRPC_ERR_METHOD_NOT_FOUND;
-                            errmsg = "Method not found";
-                        }
                     }
                     else
                     {
@@ -2141,11 +2236,6 @@ ZmRESTfulServer::ZmRESTfulServer(struct event_base* evbase, std::string_view roo
 ZmRESTfulServer::~ZmRESTfulServer()
 {}
 
-void ZmRESTfulServer::SetRESTfulCB(OnRESTfulRequestCB oncall)
-{
-    m_on_restful_call = oncall;
-}
-
 void ZmRESTfulServer::SetRESTfulCBAsync(OnRESTfulRequestCBAsync oncall)
 {
     m_on_restful_async = oncall;
@@ -2161,20 +2251,12 @@ int ZmRESTfulServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
             return 0;  // 不匹配前缀，返回 404
     }
 
-    // ② 异步优先（和 JRPC 一样）— 全部请求打包走 pair → Hub → delegate
+    // ② 异步分发 — 全部请求投递给异步回调
     if (m_on_restful_async)
     {
         m_on_restful_async(task, data, dlen);
         return -1;
     }
-
-    // ③ 同步兜底
-    if (m_on_restful_call)
-    {
-        int code = m_on_restful_call(task, data, dlen);
-        return code;
-    }
-
     return 0;  // 没设置任何回调
 }
 

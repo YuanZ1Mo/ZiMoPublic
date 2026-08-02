@@ -9,7 +9,7 @@ ZiMoPublic/
 ├── define/          # 通用宏定义、版本号
 ├── json/            # nlohmann/json 封装（类型安全的读写辅助）
 ├── libevent/        # 预编译 libevent 头文件及静态库（事件驱动网络库）
-├── net/             # 网络通信模块（TCP/HTTP/RESTful/DNS/TAP 双协议代理链/路由中间件/消息广播/SSE）
+├── net/             # 网络通信模块（TCP/HTTP/RESTful/DNS/ZmReqLoop 请求调度/路由中间件/消息广播/SSE）
 ├── openssl/         # 预编译 OpenSSL 头文件及静态库
 ├── service/         # Windows 服务基类（SCM 集成、安装/卸载）
 ├── spdlog/          # 定制版 spdlog 日志库 + zm_logger 封装
@@ -114,53 +114,29 @@ ZiMoPublic/
 
 路由模式：`(task, next)` 函数管道，支持 `*` 通配符兜底路由。
 
-#### zm_net_tap — TAP 代理框架
+#### zm_net_req_loop — per-request 事件循环线程 + ZmReqLoopPool 池（事件驱动，池随基类同文件）
 
-| 结构体/类 | 说明 |
-|-----------|------|
-| `ZM_TAP_CTX` | TAP 上下文结构体，代表一个网络连接会话的完整状态（含缓冲区、DNS、超时、回传链） |
-| `ZM_TAP_SLOT` | TAP 池槽位，含回指指针保证扩容时引用稳定 |
-| `ZmTapContext` | TAP 对象池：O(1) 获取/回收、自动扩容、原子序号生成 |
-| `ZmTapDelegate` | TAP 协议委托基类：定义读写/连接/错误/DNS/回传等虚函数回调 |
-| `ZmTapContextEventHandler` | 静态回调分发器，将 libevent C 回调桥接到 C++ 虚函数 |
+| 类 | 说明 |
+|----|------|
+| `ZmReqLoop` | per-request 事件循环线程：业务 = 入口回调 + 续体回调，全部在本线程（event_base）上执行 |
+| `ZmReqLoopPool` | 请求池：预创建 + 扩容（上限）+ 排队（doer 线程等待，不阻塞 HTTP 事件循环）；每台 HTTP 服务器各自持有一个实例 |
 
 关键设计：
-- **对象池**：空闲栈复用，O(1) Get/Drop
-- **代理链**：最多 4 层的回传代理链（LIFO），响应依次经过各 delegate 处理
-- **协议探测**：首包到达时识别协议魔数，动态切换到对应 delegate
-- **柔性数组 TLV**：`ZM_EXT_TLV_HEAD` 使用 MSVC 柔性数组扩展
+- **事件驱动**：close/超时/外部返回均以事件（`PostToLoop`）送达本线程，per-request 状态仅本线程触碰，无跨线程竞争
+- **生命周期**：池 Acquire → PostToLoop(START) → ProcessStart（Bind + onStart）→ 业务分段推进 → 回复 helper（TryReply + task 直通 + Release）→ 回池
+- **deadline 兜底**：绝对截止时间 = 请求到达 + 业务预算；到期缺省 504（可覆写 onTimeout），流式开始自动取消 deadline
+- **回收纪律**：Release() 后不得再碰 task；epoch++ 使队列中陈旧事件失效（防池复用后跨请求污染）
 
-#### zm_net_tap_hub — Hub 代理路由
-
-| 类 | 说明 |
-|----|------|
-| `ZmTapHubBase` | Hub 基类：提供 IPv4/IPv6 双栈 evconnlistener 监听管理 |
-| `ZmTapHubProxy` | Hub 代理：协议探测 + delegate 动态切换，支持多协议前端共享路由 |
-
-工作流程：`Accept → 首包协议探测 → 匹配 delegate → 切换回调 → 后续数据由 delegate 处理`
-
-#### zm_net_tap_jrpc — JRPC 协议委托
+#### zm_net_req_loop_protocol — JRPC/RESTful 回复 helper（task 直通，子类独立文件）
 
 | 类 | 说明 |
 |----|------|
-| `ZmTapDelegateJRPC` | JRPC 协议委托：解析长度前缀帧格式（4 字节大端长度 + JSON 体），通过回调通知上层 |
+| `ZmReqLoopJrpc` | JRPC 回复子类：持 per-request 回复函数（服务器侧 replyCB 包装），`Response()` 内部走 TryReply 门 + task 直通 |
+| `ZmReqLoopRest` | RESTful 回复子类：`ResponseJson`/`ResponseError`/`ResponseEmpty`/`ResponseRaw`/`ResponseRedirect`/`ResponseFile`、流式 `ResponseStreamStart`/`ResponseStreamChunk`/`ResponseStreamEnd`、SSE `ResponseSSEStart`/`ResponseSSEEvent`/`ResponseSSEEnd`；流式 helper 自动取消 deadline |
 
-帧格式：`[4 字节大端长度][JSON body]`
-回调类型：`TapDelegateJrpcRequestReadCB = std::function<void(ZM_TAP_CTX*, const char*)>`
-
-#### zm_net_tap_rest — ★ RESTful 协议委托
-
-| 类 | 说明 |
-|----|------|
-| `ZmTapDelegateRESTful` | RESTful 协议委托：解析 Hub 转发来的 "REST" 帧（4 字节魔数 + 4 字节 body_len + raw_body），解帧后通过线程池分发到业务回调 |
-
-帧格式：`[4 字节 "REST"][4 字节大端 body_len][raw_body]`
-回调类型：`TapDelegateRESTfulRequestCB = std::function<void(ZM_TAP_CTX*, const BYTE*, size_t)>`
-
-与 JRPC delegate 的关键区别：
-- **响应路径**：RESTful 业务层直接操作 `tap->httpd_task->TriggerReply()` 写 HTTP 响应，**不通过 pair 回传**；JRPC 则通过 `ZmTapContext::Response()` 写 pair[1] 回写到 pair[0] 触发 HTTP 响应
-- **请求元信息**：method/path/headers 直接从 `tap->httpd_task` 读取，无需打包进帧，帧体仅含原始 body
-- **独立线程池**：拥有独立的 `ZmThreadPool` 执行业务回调，与 JRPC delegate 互不干扰
+回调类型（数据仅回调期间有效）：
+- `ZmReqLoopJrpcRequestCB = std::function<void(ZmReqLoop*, const char*)>` — JRPC 业务回调（reqData 为请求 JSON 字符串）
+- `ZmReqLoopRestfulRequestCB = std::function<void(ZmReqLoop*, const BYTE*, size_t)>` — RESTful 业务回调（body 指向请求 evbuffer，回复前有效，勿拷贝后使用）
 
 #### zm_net_broadcast — TCP 消息广播
 
@@ -323,10 +299,9 @@ define ───── (无依赖)
 
 net 模块内部依赖：
 ```
-zm_net_tap_rest → zm_net_tap (TAP 基类)
-zm_net_tap_jrpc → zm_net_tap (TAP 基类)
-zm_net_tap_hub  → zm_net_tap + zm_net_tap_jrpc + zm_net_tap_rest
-zm_net_http     → zm_net_runloop + zm_net_http_router
+zm_net_req_loop          → zm_net_runloop + util（ZmThread）
+zm_net_req_loop_protocol → zm_net_req_loop + json
+zm_net_http         → zm_net_runloop + zm_net_http_router
 
 ## 构建与集成
 

@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include <atomic>
 #include <string_view>
+#include <unordered_map>
 
 // SSL_CTX 前向声明（仅在启用 HTTPS 时需要，避免头文件全量引入 openssl/ssl.h）
 struct ssl_ctx_st;
@@ -193,6 +194,8 @@ public:
 
 
 
+
+class ZmReqLoop;   // 前向声明(per-request 事件循环,见 zm_net_req_loop.h)
 
 /**
  * @brief 封装单个 HTTP 请求的上下文，提供请求读取和响应写入的抽象接口
@@ -411,12 +414,19 @@ public:
      */
     bool IsConnClosed() const { return m_connClosed.load(); }
 
-    /**
-     * @brief libevent 连接关闭回调（连接释放时触发，事件循环线程执行）
-     * @param conn 被关闭的连接（libevent 回调参数，本实现不使用）
-     * @param ctx  ZmHttpdTask 实例指针
-     */
-    static void OnConnCloseCb(struct evhttp_connection* conn, void* ctx);
+    /** @brief 请求到达时间戳(毫秒,GetTickCount64),OnHttpRequestCB 记录,供业务预算/超时计算 */
+    void SetArriveTime(int64_t ms) { m_arriveMs = ms; }
+    int64_t ArriveMs() const { return m_arriveMs; }
+
+    /** @brief 标记连接已关闭(close 通知器调用,任意线程安全) */
+    void MarkConnClosed() { m_connClosed.store(true); }
+
+    /** @brief 暴露连接关闭原子标志(供 ZmReqLoopPool 排队等待轮询) */
+    std::atomic<bool>& ConnClosedFlag() { return m_connClosed; }
+
+    /** @brief 绑定/解绑当前请求的 A(ZmReqLoop),close 通知器经此投递 CLOSE(原子) */
+    void BindLoop(ZmReqLoop* l) { m_boundLoop.store(l); }
+    ZmReqLoop* BoundLoop() const { return m_boundLoop.load(); }
 
     /**
      * @brief 发送被延迟的 HTTP 响应
@@ -477,8 +487,13 @@ protected:
     /** @brief 是否处于流式响应模式 */
     bool                                m_streaming;
 
-    /** @brief 连接关闭标志（closecb 置位；doer 池复用时在 Reset 中清零） */
+    /** @brief 连接关闭标志（close 通知器置位；doer 池复用时在 Reset 中清零） */
     std::atomic<bool>                   m_connClosed {false};
+
+    /** @brief 请求到达时间戳(毫秒),OnHttpRequestCB 设置 */
+    int64_t m_arriveMs = 0;
+    /** @brief 绑定的 A(ZmReqLoop),close 通知器读取投递 CLOSE;原子防跨线程竞态 */
+    std::atomic<ZmReqLoop*> m_boundLoop{nullptr};
 
 public:
     /**
@@ -626,6 +641,14 @@ public:
 
     /** @brief 关闭 HTTP 服务器：停止线程池、释放控制事件和 evhttp（不释放外部 event_base） */
     void Close();
+
+    /** @brief 武装关闭门(m_closing=true):通知器 Add/Remove/closecb 投递全部跳过。
+     *  管理器须在停止 ZmReqLoopPool 之前调用(ZmReqLoopPool 销毁后 closecb 不得再触碰 loop)。幂等。 */
+    void BeginClose() { m_closing.store(true); }
+
+    /** @brief 排空 HTTP worker 线程池(join):调用后不再有 doer 进入处理流程。
+     *  供管理器在停止 ZmReqLoopPool 前调用,消除 doer 与 ZmReqLoopPool 销毁的竞态。幂等。 */
+    void DrainWorkers();
 
     /** @brief 查询服务器是否已初始化 */
     bool IsOpen() const;
@@ -848,6 +871,29 @@ private:
 
     /** @brief ZmHttpdDoer 对象池（事件循环线程独享，无需锁） */
     ZmHttpdDoerPool*   m_httpdDoerPool;
+
+    /** @brief per-connection close 通知器(方案 3):连接上所有在飞 doer 共享,close 时广播
+     *  @note 单槽 closecb 覆盖问题的修复:closecb 的 ctx 是通知器,而非单个 doer */
+    struct ZmConnCloseNotifier
+    {
+        std::vector<ZmHttpdTask*> members;   ///< 该连接所有在飞请求
+        bool fired = false;                  ///< 已触发(防 reset/free 双触发)
+        std::atomic<bool>* closing = nullptr;   ///< 指向服务器的 m_closing(Close 期间 closecb 跳过投递)
+    };
+
+    std::unordered_map<struct evhttp_connection*, ZmConnCloseNotifier*> m_closeNotifiers;  ///< 循环线程独享,无锁(Close 期间由主线程 ClearAll 独占清理,Add/Remove 以 m_closing 跳过)
+
+    /** @brief Close 进行中:通知器 Add/Remove 跳过 map 操作(Close 由非循环线程调用) */
+    std::atomic<bool> m_closing {false};
+
+    /** @brief 连接关闭回调(closecb):广播到该连接所有在飞 doer */
+    static void OnConnCloseNotifierCB(struct evhttp_connection* conn, void* arg);
+    /** @brief 将 doer 登记进连接的通知器(请求到达时调用,循环线程) */
+    void NotifierAdd(ZmHttpdTask* task);
+    /** @brief 从通知器摘除 doer;空则注销 closecb 并删除通知器(doer 回收时调用) */
+    void NotifierRemove(ZmHttpdTask* task);
+    /** @brief 清理全部通知器(服务器 Close/析构时调用) */
+    void NotifierClearAll();
 };
 
 
@@ -863,7 +909,6 @@ private:
 * -32000    Internal portal does not have JRPC processing channel set up 门户未设置jrpcReq回调函数
 */
 #define ZM_JRPC_ERR_INVALID_REQUEST  -32600  // 无效请求（不是有效的 JSON-RPC 2.0 请求）
-#define ZM_JRPC_ERR_METHOD_NOT_FOUND -32601  // 方法不存在
 #define ZM_JRPC_ERR_INVALID_PARAMS   -32602  // 参数无效（params 格式/类型不符）
 #define ZM_JRPC_ERR_INTERNAL         -32603  // 内部错误（服务端处理异常）
 #define ZM_JRPC_ERR_PARSE            -32700  // 解析错误（JSON 格式非法）
@@ -883,13 +928,15 @@ private:
  * @example 使用方式
  * @code
  *   ZmJsonRpcServer server("/rpc", 39440);
- *   server.SetJsonRpcCBEx([](ZmHttpdTask* task, const std::string& method,
- *       const ZMJSON& params, ZMJSON& result, ZMJSON& error) -> int {
- *       if (method == "add") {
- *           result["sum"] = params["a"].get<int>() + params["b"].get<int>();
- *           return 0;
- *       }
- *       return -1;  // method not found
+ *   server.SetJsonRpcCBAsync([](ZmHttpdTask* task, const ZMJSON& request,
+ *       std::function<void(const ZMJSON& response)> replyCB) {
+ *       ZMJSON rsp;
+ *       if (request["method"] == "add")
+ *           rsp["result"] = {{"sum", request["params"]["a"].get<int>()
+ *               + request["params"]["b"].get<int>()}};
+ *       else
+ *           rsp["error"] = ZmJsonRpcServer::MakeError(-32601, "Method not found");
+ *       replyCB(rsp);   // 任意线程可调,框架自动构造响应并发送
  *   });
  *   server.Startup();
  * @endcode
@@ -898,29 +945,14 @@ class ZmJsonRpcServer : public ZmHttpServer
 {
 public:
     /**
-     * @brief JSON-RPC 请求处理回调（带 task 参数），优先级高于 OnJsonRpcRequestCB
-     * @param  task    请求上下文对象
-     * @param  method  RPC 方法名
-     * @param  params  RPC 参数对象
-     * @param  result  输出结果对象
-     * @param  error   输出错误对象
-     * @header header  请求头设置
-     * @return        >= 0 表示方法已处理，< 0 表示方法未找到
-     */
-    typedef std::function<int(ZmHttpdTask* task, const ZMJSON& request, ZMJSON& response)> OnJsonRpcRequestCB;
-
-    /**
-     * @brief JSON-RPC 异步请求处理回调（优先级最高）
+     * @brief JSON-RPC 异步请求处理回调
      * @param task    请求上下文对象
-     * @param method  RPC 方法名
-     * @param params  RPC 参数对象
-     * @param reply   响应回调，业务层处理完成后调用 reply(result, error, ) 发送响应
+     * @param reply   响应回调，业务层处理完成后调用 reply(response) 发送响应
      *
-     * 与同步回调不同，本回调立即返回（不阻塞 Worker 线程）。业务层在异步处理
-     * 完成后调用 reply 函数，reply 内部构造 JSON-RPC 2.0 响应并通过
-     * SendDeferredReply 发送回 HTTP 客户端。
+     * 本回调立即返回（不阻塞 Worker 线程）。业务层在异步处理完成后调用
+     * reply 函数，reply 内部构造 JSON-RPC 2.0 响应并通过 SendDeferredReply
+     * 发送回 HTTP 客户端。
      *
-     * @note 设置了异步回调后，同步回调被忽略。
      * @note reply 可在任意线程调用（内部通过 event_active 安全投递到 HTTP event loop）。
      */
     typedef std::function<void(ZmHttpdTask* task, const ZMJSON& request,
@@ -954,47 +986,23 @@ public:
     static ZMJSON MakeError(int code, std::string_view message);
 
     /**
-     * @brief 设置 JSON-RPC 同步请求回调
-     * @param oncall  回调函数
-     *
-     * @note 回调函数在业务层不要返回0, 因为返回0表示没设置同步回调
-     *       回调函数返回 < 0 表示该 method 不被业务层接收
-     */
-    void SetJsonRpcCB(OnJsonRpcRequestCB oncall);
-
-    /**
-     * @brief 设置 JSON-RPC 异步请求回调（优先级最高）
+     * @brief 设置 JSON-RPC 异步请求回调
      * @param oncall_async  异步回调函数
      *
-     * @note 设置后同步回调被忽略，所有匹配 root_uri 的请求走异步路径。
-     *       异步回调中业务层调用 reply(result, error) 发送响应，框架自动构造
+     * @note 设置后所有匹配 root_uri 的请求走异步路径。
+     *       异步回调中业务层调用 reply(response) 发送响应，框架自动构造
      *       JSON-RPC 2.0 标准响应信封并通过 task->SendDeferredReply() 发送。
      */
     void SetJsonRpcCBAsync(OnJsonRpcRequestCBAsync oncall_async);
 
 protected:
     /**
-     * @brief 分发 JSON-RPC 请求到注册的回调（虚函数，子类可重写）
-     * @param task    请求上下文对象
-     * @param method  RPC 方法名
-     * @param params  RPC 参数对象
-     * @param result  输出结果对象
-     * @param error   输出错误对象
-     * @return        >= 0 表示方法已处理，< 0 表示方法未找到
-     *
-     * @note 分发优先级: CBEx > CB > 返回 -1
-     */
-    virtual int OnJsonRpcRequest(ZmHttpdTask* task, const ZMJSON& request, ZMJSON& response);
-
-    /**
     * @brief 分发 JSON-RPC 请求到注册的异步回调（虚函数，子类可重写）
     * @param task    请求上下文对象
-    * @param method  RPC 方法名
-    * @param params  RPC 参数对象
     * @param reply   输出结果对象
     * @return        true 表示方法已回调到异步函数，false 表示没设置
     *
-    * @note 分发优先级: CBEx > CB > 返回 -1
+    * @note 当前仅保留异步回调(OnJsonRpcRequestCBAsync)一条分发路径
     */
     virtual bool OnJsonRpcRequestAsync(ZmHttpdTask* task, const ZMJSON& request, ZMJSON& reply);
 
@@ -1005,7 +1013,7 @@ protected:
      *   1. URI 不匹配 root_uri 时交给父类处理
      *   2. GET 请求从 query string 读取 Base64 编码的 jsonbody 并解码
      *   3. 解析 JSON 请求体，校验 method/params 字段
-     *   4. 调用 OnJsonRpcRequest 分发到业务回调
+     *   4. 调用 OnJsonRpcRequestAsync 分发到业务异步回调
      *   5. 按 JSON-RPC 2.0 规范构造响应（result 和 error 二选一）
      *   6. 支持 JSONP 模式（callback 参数非空时包裹为 callback(json)）
      *
@@ -1017,14 +1025,14 @@ protected:
     virtual int OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t dlen);
 
     /**
-     * @brief 构造 JSON-RPC HTTP 响应并写入 task（同步和异步路径共用）
+     * @brief 构造 JSON-RPC HTTP 响应并写入 task（异步路径使用）
      *
      * 根据请求中是否携带 callback 参数自动选择响应格式：
      * - 无 callback → 标准 JSON 响应，Content-Type: application/json
      * - 有 callback → JSONP 格式 callback(json)，Content-Type: application/javascript
      *
      * 同时设置 Server 响应头（含服务端版本号）、HTTP 状态码 200 和响应体。
-     * 调用者负责触发实际发送（同步路径由框架自动发送，异步路径需调用 SendDeferredReply）。
+     * 调用者负责触发实际发送（异步路径需调用 SendDeferredReply）。
      *
      * @param task         请求上下文对象（从中读取 callback 参数）
      * @param rsp_envelope 已填充 jsonrpc/id/method/result/error 的响应 JSON 对象
@@ -1042,10 +1050,7 @@ protected:
     static void OnJsonRpcAsyncReply(ZmJsonRpcServer* server, ZmHttpdTask* task, ZMJSON& reply, const ZMJSON& response);
 
 private:
-    /** @brief JSON-RPC 请求回调, 返回 < 0 表示该 method 不存在, 所以业务层不要返回0,因为返回0表示没设置同步回调 */
-    OnJsonRpcRequestCB    m_on_jsonrpc_call;
-
-    /** @brief JSON-RPC 异步请求回调（优先级最高，设置后忽略同步回调） */
+    /** @brief JSON-RPC 异步请求回调（设置后所有匹配请求走异步路径） */
     OnJsonRpcRequestCBAsync m_on_jsonrpc_call_async;
 
     /** @brief RPC 请求的 URI 前缀，匹配此前缀的请求走 RPC 流程 */
@@ -1056,41 +1061,20 @@ private:
 /**
  * @brief RESTful HTTP 服务器，在 ZmHttpServer 基础上增加 RESTful 路由与分发
  *
- * 内部集成 ZmHttpRouter 提供路径匹配、中间件、路径参数。支持两种路由模式:
- *   - Direct: handler 在 HTTP worker 线程直接执行，使用 ZmHttpdTask 写响应
- *   - Pair:   请求通过 bufferevent_pair 注入 Hub → ZmTapDelegateRESTful → 业务线程处理
- *             业务层通过 tap->httpd_task 直接回写 HTTP 响应（不走 pair 回传）
+ * 业务处理统一走异步回调:请求按 root_uri 前缀过滤命中后，
+ * 经 ZmReqLoopPool 投递到业务线程(ZmReqLoop)，
+ * 业务层通过 ZmReqLoopRest::Response* 回复 helper 直接回写 HTTP 响应。
  *
- * @example Direct 模式
+ * @example 异步模式
  * @code
- *   ZmRESTfulServer server(evbase, "/api", 8080);
- *   server.GetRouter().Get("/api/status", [](ZmHttpdTask* task, const BYTE*, size_t) {
- *       task->SetReplyData((const BYTE*)"OK", 2);
- *       return 200;
- *   });
- * @endcode
- *
- * @example Pair 模式
- * @code
- *   server.RouteToPair("/api/users/*");
- *   server.SetRESTfulCBAsync([](ZmHttpdTask* task, const ZMJSON& meta,
- *       const BYTE* body, size_t body_len) {
- *       // 打包帧 → 写 pair → 注入 Hub
+ *   server.SetRESTfulCBAsync([](ZmHttpdTask* task, const BYTE* body, size_t len) {
+ *       // 异步处理:经 ZmReqLoopPool 投递到业务线程 → ZmReqLoopRest::Response* 回复
  *   });
  * @endcode
  */
 class ZmRESTfulServer : public ZmHttpServer
 {
 public:
-    /**
-     * @brief RESTful 同步回调 — handler 在 HTTP worker 线程直接处理
-     * @return HTTP 状态码（200/201/…），0 表示未处理，>0 框架调 TriggerReply 发送
-     *
-     * @note handler 设置 task 的响应头/响应体即可，不要调 TriggerReply（框架会调）
-     */
-    using OnRESTfulRequestCB = std::function<int(
-        ZmHttpdTask* task, const BYTE* body, size_t body_len)>;
-
     using OnRESTfulRequestCBAsync = std::function<void(
         ZmHttpdTask* task, const BYTE* body, size_t body_len)>;
 
@@ -1099,9 +1083,7 @@ public:
                     uint32_t sessionCacheSize = 0, const char* sessionContext = nullptr);
     virtual ~ZmRESTfulServer();
 
-    /** @brief 设置同步回调（异步未设置时才走） */
-    void SetRESTfulCB(OnRESTfulRequestCB oncall);
-    /** @brief 设置异步回调（优先于同步） */
+    /** @brief 设置异步回调 */
     void SetRESTfulCBAsync(OnRESTfulRequestCBAsync oncall);
 
     // ---- 工具方法 ----
@@ -1119,15 +1101,13 @@ protected:
     /**
      * @brief 处理 HTTP 请求（重写 ZmHttpServer 虚函数）
      *
-     * 前缀匹配 → 构建 meta → 异步优先 → 同步兜底
-     * @return -1 异步模式，>0 同步处理完成，0 未匹配
+     * 前缀匹配 → 异步分发（全部请求投递到异步回调）
+     * @return -1 已投递异步处理，0 未匹配/未设置回调
      */
     virtual int OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t dlen) override;
 
 private:
-    /** @brief 同步回调（异步未设置时走） */
-    OnRESTfulRequestCB    m_on_restful_call;
-    /** @brief 异步回调（优先） */
+    /** @brief 异步回调 */
     OnRESTfulRequestCBAsync m_on_restful_async;
 
     /** @brief URI 前缀（仅匹配此前缀的请求走 RESTful 流程） */
