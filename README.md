@@ -9,12 +9,13 @@ ZiMoPublic/
 ├── define/          # 通用宏定义、版本号
 ├── json/            # nlohmann/json 封装（类型安全的读写辅助）
 ├── libevent/        # 预编译 libevent 头文件及静态库（事件驱动网络库）
-├── net/             # 网络通信模块（TCP/HTTP/RESTful/DNS/ZmReqLoop 请求调度/路由中间件/消息广播/SSE）
+├── net/             # 网络通信模块（TCP/HTTP 服务端与客户端/RESTful/DNS/ZmReqLoop 请求调度/路由中间件/消息广播/SSE）
 ├── openssl/         # 预编译 OpenSSL 头文件及静态库
 ├── service/         # Windows 服务基类（SCM 集成、安装/卸载）
 ├── spdlog/          # 定制版 spdlog 日志库 + zm_logger 封装
 ├── ssl/             # SSL/TLS 上下文管理、证书指纹校验
 ├── util/            # 通用工具（线程、字符串、文件、容器、加密、系统）
+├── zlib/            # zlib 1.3.1 头文件及静态库（gzip/deflate 解压，HTTP 客户端自动解压用）
 ```
 
 ## 各模块详解
@@ -113,6 +114,35 @@ ZiMoPublic/
 | `ZmHttpMiddlewareRecovery` | 异常恢复中间件：捕获 handler 异常返回 500 |
 
 路由模式：`(task, next)` 函数管道，支持 `*` 通配符兜底路由。
+
+#### zm_net_http_client — HTTP/S 客户端（自带事件循环线程）
+
+基于 libevent evhttp + OpenSSL + zlib 的完整 HTTP/HTTPS 客户端。每个 `ZmHttpClient` 实例持有独立事件循环线程（event_base + evdns_base），任意线程可安全调用；单实例并发请求由连接池承载，`ZmHttpClientPool` 提供实例级池化（预创建 + 扩容 + 排队）。
+
+| 类 | 说明 |
+|----|------|
+| `ZmHttpClientRequest` | 请求构建器（链式）：方法/URL/请求头、四种请求体（内存/JSON/表单/文件或流式 chunked）、超时（连接/读写/总）、重定向、代理（含认证）、Basic/Bearer 认证、cookie jar、gzip、重试、流式回调（SSE/数据块/进度）、落盘、Range、响应体上限、请求级 TLS 覆盖 |
+| `ZmHttpClientResponse` | 响应：状态码、头（大小写不敏感查询）、体、Content-Length |
+| `ZmHttpClientResult` | 请求结果：传输错误码 + 错误文本 + 响应。`Ok()` 只判传输层——404/500 等仍是"成功到达的响应"（与 curl/Go 同口径） |
+| `ZmHttpClient` | 客户端：`Send`（同步，返回 `std::unique_ptr<ZmHttpClientResult>`，自动释放）/ `SendAsync`（异步，回调在循环线程执行且恰好触发一次）/ `Cancel(id)` / `CancelAll` / `CloseAll` |
+| `ZmHttpClientPool` | 客户端实例池：预创建 + 扩容（上限）+ 排队（50ms 轮询，带中止标志）；回池须无在飞请求（CancelAll）+ 全部连接已销毁（CloseAll） |
+
+特性：
+
+- **连接池** — 按 `scheme:host:port` 空闲 keep-alive 复用（每主机上限 4，复用前校验 bev 有效性，失效自动丢弃）
+- **重定向** — 301/302/303/307/308 语义正确（301 POST、302/303 转 GET 清体，307/308 保留方法/体）；跨主机剥离 `Authorization`/`Cookie`/`Referer`/`Origin`（防凭据与内部路径泄漏）；跳转预算与重试预算分离；总超时覆盖整条链
+- **cookie jar** — RFC 6265 子集：域后缀 + 路径前缀匹配、`Secure`、`Max-Age`/`Expires`（Max-Age 优先）、仅主机域 cookie、IP 字面量忽略 Domain 属性、跨域 Domain 拒绝存储（防投毒）；进程内不持久化
+- **gzip/deflate 自动解压** — 请求侧自动补 `Accept-Encoding: gzip, deflate`；响应侧经 zlib 边解压边分发，64KB 有界输出缓冲防解压炸弹；`Content-Encoding` 为 br 等其他编码原样透传
+- **重试** — 仅幂等方法（GET/HEAD/PUT/DELETE）+ 连接类错误，指数退避（封顶），chunked 上传不重试；退避定时器可取消（收口/取消立即终止）
+- **代理** — HTTP absolute-form + HTTPS CONNECT 隧道（含 `SetProxyAuth` 代理认证，逐跳头仅发代理）；代理连接不回池（防 key 错配）
+- **TLS** — SNI（IP 字面量不发送）、mTLS 客户端证书（客户端级 / 请求级覆盖）、自定义 CA、verify 开关；SSL_CTX 懒构建 + 配置变更脏重建（旧身份空闲连接自动作废）
+- **流式** — SSE 逐事件（`data:` 行解析，帧上限 1MB 防膨胀）、`OnDataChunk` 增量回调、`OutputFile` 边收边写落盘、chunked 流式上传泵（输出缓冲回调驱动，背压有界 ≤ 2 块）、进度回调（`sent/received, total`）
+- **响应体上限** — `SetMaxBodySize`（解压后字节口径）：流式增量分发时中止（取消流）、全量收口时报错，超限 → `ZM_HTTPC_ERR_RESPONSE_TOO_LARGE`
+- **超时** — 连接 / 读写（`SetReadWriteTimeout`，默认跟随连接超时）/ 总超时（deadline 覆盖整条链含重试，流式 2xx 后自动取消由读写超时接管）
+
+错误码：`ZM_HTTPC_ERR_CONNECT` / `CONNECT_TIMEOUT` / `TIMEOUT` / `CANCELLED` / `PARSE` / `FILE_IO` / `STREAM_BROKEN` / `SSL` / `PROXY` / `REDIRECT` / `RESPONSE_TOO_LARGE` / `UNSUPPORTED`。
+
+**线程模型**：单循环线程内零锁；任意线程经 `event_base_once` 投递；回调（SSE/数据块/进度/异步完成）全部在循环线程执行，回调内勿做重活、勿同步重入本客户端。
 
 #### zm_net_req_loop — per-request 事件循环线程 + ZmReqLoopPool 池（事件驱动，池随基类同文件）
 
@@ -279,12 +309,21 @@ STOPPED →(Start) STARTING → RUNNING →(Stop) STOPPING → STOPPED
 - `InvokeLater` / `InvokeCancel` 全局接口
 - Worker 自动增长（上限 128）
 
-### libevent / openssl — 第三方预编译库
+### libevent / openssl / zlib — 第三方预编译库
 
 - **libevent**：事件驱动网络库，提供 `event_base`、`evhttp`、`evdns`、`bufferevent` 等
 - **openssl**：SSL/TLS 加密库，提供 `SSL_CTX`、`BIO`、`X509` 等
+- **zlib**：gzip/deflate 数据压缩库（zlib 1.3.1，`zlibstatic.lib`），HTTP 客户端响应自动解压用
 
-两个库均以预编译头文件 + 静态库形式引入，无需单独编译。
+三个库均以预编译头文件 + 静态库形式引入，无需单独编译。目录布局与 libevent/openssl 一致：
+
+```
+zlib/
+├── include/          # zlib.h + zconf.h
+└── lib/VC/x64/MT/    # zlibstatic.lib
+```
+
+注意：`zconf.h` 由 CMake 构建时生成（不在 zlib 源码包内），重新编译 zlib 后需同步复制 `zconf.h` 与 `Release\zlibstatic.lib` 到本目录。
 
 ## 依赖关系
 
@@ -292,6 +331,7 @@ STOPPED →(Start) STARTING → RUNNING →(Stop) STOPPING → STOPPED
 net ────────→ ssl ──→ util
 net ────────→ json ──→ util
 net ────────→ libevent
+net ────────→ zlib          (HTTP 客户端 gzip/deflate 自动解压)
 ssl ────────→ openssl
 service ────→ util
 define ───── (无依赖)
@@ -302,15 +342,21 @@ net 模块内部依赖：
 zm_net_req_loop          → zm_net_runloop + util（ZmThread）
 zm_net_req_loop_protocol → zm_net_req_loop + json
 zm_net_http         → zm_net_runloop + zm_net_http_router
+zm_net_http_client  → zm_net_runloop + ssl(ZmSSLContext) + zlib + openssl + libevent
+```
 
 ## 构建与集成
 
-ZiMoPublic 作为源码级公共库，由上层项目（如 ZiMoService）直接引用其头文件并链接预编译的 libevent/openssl 静态库。
+ZiMoPublic 作为源码级公共库，由上层项目（如 ZiMoService）直接引用其头文件并链接预编译的 libevent/openssl/zlib 静态库。
 
 上层项目的 vcxproj 中应配置：
 - **附加包含目录**：`$(ProjectDir)..\ZiMoPublic\` 及其子目录
-- **库目录**：`libevent` 和 `openssl` 的预编译 `.lib` 路径
+- **库目录**：`libevent`、`openssl`、`zlib` 的预编译 `.lib` 路径
 - **强制包含**：`stdafx.h`（或对应的预编译头）
+
+OpenSSL 以静态库（`libcrypto_static.lib` / `libssl_static.lib`）链接时：
+- 需定义 `OPENSSL_STATIC` 预处理器宏（头文件声明改为非 dllimport）
+- 额外链接 `crypt32.lib`（静态 OpenSSL 的 Windows 证书存储 winstore 依赖）
 
 ## 设计原则
 

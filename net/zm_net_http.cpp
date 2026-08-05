@@ -6,6 +6,8 @@
 #include "zm_net_http.h"
 
 #include "zm_net_req_loop.h"   // close 通知器投递 CLOSE 需要 ZmReqLoop 完整定义
+#include "zm_net_req_loop_pool.h"   // m_reqLoopPool 完整定义(new/Init/Acquire/Shutdown)
+#include "zm_net_req_loop_protocol.h"   // ZmReqLoopJrpc(信封存储/static_cast 依赖)
 #include "zm_net_socket.h"
 #include "zm_net_ip.h"
 #include "../util/zm_util_thread.h"
@@ -820,6 +822,7 @@ public:
         m_streaming = false;
         m_connClosed = false;
         m_boundLoop = nullptr;   // ★ 清旧请求的 A 绑定,防池复用后 close 投递到已释放的 loop
+        m_userData.reset();      // ★ 清旧请求的用户数据(如 JRPC 响应信封),防池复用污染下一请求
         m_recycled = false;      // ★ 清回收标记:本次请求结束后才可再次 RecycleDoer 入池
         m_id = ++g_httpd_task_id;
 
@@ -1272,6 +1275,8 @@ ZmHttpServer::ZmHttpServer(struct event_base* evbase, uint16_t local_port,
                          uint32_t sessionCacheSize,
                          const char* sessionContext)
     : m_evbase(evbase), m_evhttpd(nullptr), m_threadPoolName(), m_threadPool(nullptr),
+      m_reqLoopPool(nullptr), m_loopPoolPrealloc(0), m_loopPoolMax(0),
+      m_loopPoolBudgetMs(0), m_loopPoolEnabled(false),
       m_local_port(local_port), m_port_bind_failed(false), m_ssl_ctx(nullptr),
       m_oldCtx(nullptr), m_ctxCleanupTimer(nullptr),
       m_redirect_from_port(redirect_from_port), m_redirectEvhttp(nullptr),
@@ -1315,11 +1320,69 @@ bool ZmHttpServer::Init()
             (uint16_t)std::thread::hardware_concurrency(), poolName);
     }
 
+    // 创建业务 ZmReqLoopPool(EnableLoopPool 启用后;JRPC/RESTful 派生类构造时默认启用)
+    // 预创建/上限/预算默认值(hw / hw*4 / 5000ms)
+    if (m_loopPoolEnabled)
+    {
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw == 0) hw = 1;
+        m_reqLoopPool = new ZmReqLoopPool();
+        // loop 工厂(SetLoopPoolFactory):JRPC 需产出 ZmReqLoopJrpc 承载信封
+        if (m_loopPoolFactory)
+            m_reqLoopPool->SetLoopFactory(m_loopPoolFactory);
+        if (!m_reqLoopPool->Init(
+                m_loopPoolPrealloc > 0 ? m_loopPoolPrealloc : (int)hw,
+                m_loopPoolMax > 0 ? m_loopPoolMax : (int)hw * 40,
+                m_loopPoolBudgetMs > 0 ? m_loopPoolBudgetMs : 5000))
+        {
+            DEFAULT_LOG_ERROR("业务 ZmReqLoopPool初始化失败");
+            delete m_reqLoopPool;
+            m_reqLoopPool = nullptr;
+            return false;
+        }
+    }
+
     // 创建 doer 对象池（预创建 = CPU 核数，与线程池规模匹配，免去首批请求的分配延迟）
     if (!m_httpdDoerPool)
         m_httpdDoerPool = new ZmHttpdDoerPool(this, std::thread::hardware_concurrency());
 
     return true;
+}
+
+void ZmHttpServer::EnableLoopPool(int prealloc, int maxLoops, uint32_t budgetMs)
+{
+    m_loopPoolPrealloc = prealloc;
+    m_loopPoolMax = maxLoops;
+    m_loopPoolBudgetMs = budgetMs;
+    m_loopPoolEnabled = true;
+}
+
+void ZmHttpServer::SetLoopPoolFactory(std::function<ZmReqLoop*()> factory)
+{
+    m_loopPoolFactory = std::move(factory);
+}
+
+ZmReqLoop* ZmHttpServer::AcquireLoop(ZmHttpdTask* task)
+{
+    if (!m_reqLoopPool)
+        return nullptr;
+    // 排队上限 = 剩余预算;客户端已断则提前放弃
+    int64_t remainMs = task->ArriveMs() + (int64_t)m_reqLoopPool->BudgetMs()
+                     - (int64_t)::GetTickCount64();
+    if (remainMs <= 0) remainMs = 1;
+    return m_reqLoopPool->Acquire((int)remainMs, &task->ConnClosedFlag());
+}
+
+void ZmHttpServer::DispatchLoop(ZmHttpdTask* task, ZmReqLoop* loop,
+    std::function<void(ZmReqLoop*)> onStart)
+{
+    task->BindLoop(loop);
+    auto* ctx = new ZmReqLoop::StartCtx();
+    ctx->task = task;
+    ctx->deadlineMs = task->ArriveMs() + (int64_t)m_reqLoopPool->BudgetMs();
+    ctx->handlers.onStart = std::move(onStart);
+    loop->PostToLoop(ZmReqLoop::REQ_LOOP_SIG_START, ctx,
+        [](void* p) { delete static_cast<ZmReqLoop::StartCtx*>(p); });
 }
 
 void ZmHttpServer::DrainWorkers()
@@ -1340,6 +1403,14 @@ void ZmHttpServer::Close()
     {
         delete m_threadPool;
         m_threadPool = nullptr;
+    }
+
+    // ★ 停业务 ZmReqLoopPool(join 全部 ZmReqLoop 线程;在飞业务完成,其回复仍可投到存活的循环/doer池/evhttp)
+    if (m_reqLoopPool)
+    {
+        m_reqLoopPool->Shutdown();
+        delete m_reqLoopPool;
+        m_reqLoopPool = nullptr;
     }
 
     // ★ 销毁 doer 对象池（线程池已停，worker 不再引用 doer，安全释放）
@@ -1621,7 +1692,7 @@ void ZmHttpServer::OnConnCloseNotifierCB(struct evhttp_connection* /*conn*/, voi
         return;
 
     if (notifier->closing && notifier->closing->load())
-        return;   // 服务器 Close 中:A 池已销毁,不再投 CLOSE(doer 正在整体拆除)
+        return;   // 服务器 Close 中:ZmReqLoopPool已销毁,不再投 CLOSE(doer 正在整体拆除)
 
     notifier->fired = true;
 
@@ -1659,7 +1730,7 @@ void ZmHttpServer::NotifierAdd(ZmHttpdTask* task)
     if (it == m_closeNotifiers.end())
     {
         n = new ZmConnCloseNotifier();
-        n->closing = &m_closing;   // closecb 门:Close 期间跳过 CLOSE 投递(A 池已先停)
+        n->closing = &m_closing;   // closecb 门:Close 期间跳过 CLOSE 投递(ZmReqLoopPool已先停)
         m_closeNotifiers[conn] = n;
         evhttp_connection_set_closecb(conn, OnConnCloseNotifierCB, n);
     }
@@ -1984,6 +2055,11 @@ ZmJsonRpcServer::ZmJsonRpcServer(struct event_base* evbase, std::string_view roo
 
     std::string poolName = "ZmJsonRpcServer:" + std::to_string(local_port);
     SetPoolName(poolName);
+
+    // 自治业务 ZmReqLoopPool(默认参数:预创建=硬件并发,上限=x4,预算=5000ms)
+    EnableLoopPool();
+    // ★ loop 工厂必须产出 ZmReqLoopJrpc(承载响应信封;OnHttpdRequest 内 static_cast)
+    SetLoopPoolFactory([]() { return new ZmReqLoopJrpc(); });
 }
 
 ZmJsonRpcServer::~ZmJsonRpcServer()
@@ -1994,43 +2070,15 @@ ZMJSON ZmJsonRpcServer::MakeError(int code, std::string_view message)
     return ZMJSON{ {"code", code}, {"message", message} };
 }
 
-void ZmJsonRpcServer::SetJsonRpcCBAsync(OnJsonRpcRequestCBAsync oncall_async)
+void ZmJsonRpcServer::SetRequestReadCB(OnRequestReadCB oncall_async)
 {
-    m_on_jsonrpc_call_async = oncall_async;
-}
-
-bool ZmJsonRpcServer::OnJsonRpcRequestAsync(ZmHttpdTask* task, const ZMJSON& request, ZMJSON& reply)
-{
-    if (m_on_jsonrpc_call_async)
-    {
-        // 异步回调：reply 拷贝到堆上（shared_ptr），确保 OnHttpdRequest 返回后仍然存活
-        // reply 是 ZMJSON& 引用，按值捕获只拷贝引用本身，必须显式拷对象到堆
-        auto replyPtr = std::make_shared<ZMJSON>(reply);
-        m_on_jsonrpc_call_async(task, request,
-            [this, task, replyPtr](const ZMJSON& response) mutable
-            {
-                OnJsonRpcAsyncReply(this, task, *replyPtr, response);
-            });
-
-        return true; // 异步处理中，响应稍后到达
-    }
-
-    return  false;
-}
-
-void ZmJsonRpcServer::OnJsonRpcAsyncReply(ZmJsonRpcServer* server, ZmHttpdTask* task, ZMJSON& reply, const ZMJSON& response)
-{
-    // 通过共用方法构造响应（自动处理 JSONP callback 和 Server 头）
-    server->BuildJsonRpcResponse(task, reply, response);
-    // 投递 REPLY 信号到 HTTP 服务器的 event loop → SendReply → evhttp_send_reply
-    task->TriggerReply();
+    m_on_request_read = oncall_async;
 }
 
 void ZmJsonRpcServer::BuildJsonRpcResponse(ZmHttpdTask* task, ZMJSON& reply, const ZMJSON& response)
 {
     ZMJSON error   = response.value("error",   ZMJSON());
     ZMJSON result  = response.value("result",  ZMJSON());
-    ZMJSON headers = response.value("headers", ZMJSON());
 
     // JSON-RPC 2.0 规范: 响应中 result 和 error 二选一
     if (!error.empty())
@@ -2064,32 +2112,6 @@ void ZmJsonRpcServer::BuildJsonRpcResponse(ZmHttpdTask* task, ZMJSON& reply, con
         content_type = "application/javascript";
     }
 
-    // 业务层传入的自定义响应头（如 Set-Cookie 等）
-    // 支持 string/number/bool 单值 和 array 多值（同名 header 发多次）
-    if (headers.is_object())
-    {
-        auto putValue = [&](const char* key, const ZMJSON& v)
-        {
-            if (v.is_string())
-                task->PutReplyHeader(key, v.get_ref<const std::string&>().c_str());
-            else if (v.is_number() || v.is_boolean())
-                task->PutReplyHeader(key, v.dump().c_str());
-        };
-
-        for (auto& [key, val] : headers.items())
-        {
-            if (val.is_array())
-            {
-                for (auto& item : val)
-                    putValue(key.c_str(), item);
-            }
-            else
-            {
-                putValue(key.c_str(), val);
-            }
-        }
-    }
-
     task->PutReplyHeader("Content-type", content_type.c_str());
     task->SetReply(ZM_HTTP_STATUS_CODE_OK);
     task->SetReplyData((const BYTE*)body.data(), body.size());
@@ -2097,8 +2119,9 @@ void ZmJsonRpcServer::BuildJsonRpcResponse(ZmHttpdTask* task, ZMJSON& reply, con
 
 int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t dlen)
 {
-    // 暂定JRPC请求的rui一律使用完全匹配
-    if (ZmString::IsEmpty(m_root_uri) || !ZmString::Equals(task->Uri(), m_root_uri, true))
+    // 暂定JRPC请求的uri一律使用完全匹配
+    // 用 Path() 而非 Uri():Path() 剥离 query string,支持 GET JSONP(?callback=&jsonbody=)
+    if (ZmString::IsEmpty(m_root_uri) || !ZmString::Equals(task->Path(), m_root_uri, true))
     {
         return ZM_HTTP_STATUS_CODE_NOT_FOUND;
     }
@@ -2160,18 +2183,38 @@ int ZmJsonRpcServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
                 }
                 else
                 {
-                    // 将 task 中存储的请求头添加到 request 中
-                    nlohmann::json::object_t headers;
-                    task->GetRequestHeaders(headers);
-
                     request.clear();
                     request["method"] = method;
                     request["params"] = params;
-                    request["headers"] = headers;
 
-                    // 仅异步回调：未设置则报 PORTAL_NOJRPC
-                    if (OnJsonRpcRequestAsync(task, request, reply))
+                    // 仅异步业务回调：未设置则报 PORTAL_NOJRPC
+                    if (m_on_request_read)
                     {
+                        // ★ 内部 ZmReqLoopPool 分发:Acquire(预算内排队/断连放弃)→ START → 业务回调
+                        ZmReqLoop* loop = AcquireLoop(task);
+                        if (!loop)
+                        {
+                            // 池满/排队超时/断连:回 DROPPED 错误信封(带 id,客户端可匹配请求;
+                            // 显式传信封:此时无 loop,信封无法存 loop 内部)
+                            ZMJSON err = { {"error",
+                                MakeError(ZM_JRPC_ERR_DROPPED, "No worker available")} };
+                            BuildJsonRpcResponse(task, err, reply);
+                            // 投递 REPLY 信号到 HTTP event loop 实际发送(任意线程可调)
+                            task->TriggerReply();
+                            return -1;
+                        }
+
+                        // ★ 响应信封(id/jsonrpc/method)存入 ZmReqLoopJrpc:
+                        //   业务层 Response 时取出组装(与 ZmReqLoopRest per-request 状态同模式)
+                        static_cast<ZmReqLoopJrpc*>(loop)->SetEnvelope(reply);
+
+                        // 请求 JSON 拷贝进闭包(request 是服务器栈上对象,必须拷贝)
+                        std::string reqJson = request.dump();
+                        DispatchLoop(task, loop,
+                            [this, reqJson = std::move(reqJson)](ZmReqLoop* l) {
+                                m_on_request_read(l, reqJson.c_str());
+                            });
+
                         return -1; // 异步处理中，响应稍后到达
                     }
                     else
@@ -2231,14 +2274,17 @@ ZmRESTfulServer::ZmRESTfulServer(struct event_base* evbase, std::string_view roo
 
     std::string poolName = "ZmRESTfulServer:" + std::to_string(local_port);
     SetPoolName(poolName);
+
+    // 自治业务 ZmReqLoopPool(默认参数:预创建=硬件并发,上限=x4,预算=5000ms)
+    EnableLoopPool();
 }
 
 ZmRESTfulServer::~ZmRESTfulServer()
 {}
 
-void ZmRESTfulServer::SetRESTfulCBAsync(OnRESTfulRequestCBAsync oncall)
+void ZmRESTfulServer::SetRequestReadCB(OnRequestReadCB oncall)
 {
-    m_on_restful_async = oncall;
+    m_on_request_read = oncall;
 }
 
 int ZmRESTfulServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t dlen)
@@ -2251,43 +2297,23 @@ int ZmRESTfulServer::OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t 
             return 0;  // 不匹配前缀，返回 404
     }
 
-    // ② 异步分发 — 全部请求投递给异步回调
-    if (m_on_restful_async)
+    // ② 内部 ZmReqLoopPool 分发 — 业务回调在 ZmReqLoop 线程执行
+    if (m_on_request_read)
     {
-        m_on_restful_async(task, data, dlen);
+        // 池满/排队超时/断连:回 503(TriggerReply 驱动 doer 回收)
+        ZmReqLoop* loop = AcquireLoop(task);
+        if (!loop)
+        {
+            task->SetReply(ZM_HTTP_STATUS_CODE_SERVICE_UNAVAILABLE, "Service Unavailable");
+            task->TriggerReply();
+            return -1;
+        }
+        // body 零拷贝:data 指向请求 evbuffer,回复发送前有效(与旧 manager 侧契约一致)
+        DispatchLoop(task, loop,
+            [this, data, dlen](ZmReqLoop* l) {
+                m_on_request_read(l, data, dlen);
+            });
         return -1;
     }
     return 0;  // 没设置任何回调
-}
-
-// ============================================================================
-// 工具方法
-// ============================================================================
-
-void ZmRESTfulServer::ReplyJson(ZmHttpdTask* task, int code, const ZMJSON& data)
-{
-    std::string json = data.dump();
-    task->PutReplyHeader("Content-Type", "application/json; charset=utf-8");
-    task->SetReply(code);
-    task->SetReplyData((const BYTE*)json.c_str(), json.size());
-    task->TriggerReply();
-}
-
-void ZmRESTfulServer::ReplyError(ZmHttpdTask* task, int code, std::string_view msg)
-{
-    ZMJSON err = {{"error", {{"code", code}, {"message", msg}}}};
-    ReplyJson(task, code, err);
-}
-
-void ZmRESTfulServer::ReplyEmpty(ZmHttpdTask* task, int code, const char* reason)
-{
-    task->SetReply(code, reason);
-    task->TriggerReply();
-}
-
-void ZmRESTfulServer::ReplyRedirect(ZmHttpdTask* task, const char* location, int code)
-{
-    task->PutReplyHeader("Location", location);
-    task->SetReply(code);
-    task->TriggerReply();
 }

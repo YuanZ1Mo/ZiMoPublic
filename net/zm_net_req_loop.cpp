@@ -1,10 +1,11 @@
 #include "zm_net_req_loop.h"
 
+#include "zm_net_req_loop_pool.h"   // ZmReqLoopPoolReturn(Release 回池桥声明)
+
 #include "zm_net_http.h"
 #include "zm_logger.h"
 #include "zm_util_libevent.h"
 
-#include <chrono>   // ZmReqLoopPool 排队轮询片(steady_clock)
 #include <windows.h>
 
 namespace {
@@ -54,12 +55,25 @@ void ZmReqLoop::PostToLoop(int signal, void* ctx, std::function<void(void*)> del
         if (deleter) deleter(ctx);   // loop 已退出:同步释放,所有权契约不变
         return;
     }
-    auto* p = new Post{ signal, m_epoch.load(), ctx, std::move(deleter) };
+    auto* p = new Post{ signal, m_epoch.load(), ctx, std::move(deleter), {} };
     {
         std::lock_guard<std::mutex> lockPost(m_mutexPost);
         m_postQueue.push_back(p);
     }
     event_active(m_sigEvent, signal, 0);   // 锁内:Run 不可能同时释放 m_sigEvent
+}
+
+void ZmReqLoop::PostToLoop(std::function<void(ZmReqLoop*)> fn)
+{
+    std::unique_lock<std::mutex> lock(m_mutexLoop);   // 与 Run 退出路径互斥
+    if (!m_looped)
+        return;   // loop 已退出:投递丢弃(fn 及其捕获数据随 Post 未创建而释放)
+    auto* p = new Post{ REQ_LOOP_SIG_EXEC, m_epoch.load(), nullptr, {}, std::move(fn) };
+    {
+        std::lock_guard<std::mutex> lockPost(m_mutexPost);
+        m_postQueue.push_back(p);
+    }
+    event_active(m_sigEvent, REQ_LOOP_SIG_EXEC, 0);   // 锁内:Run 不可能同时释放 m_sigEvent
 }
 
 bool ZmReqLoop::TryReply()
@@ -176,14 +190,32 @@ void ZmReqLoop::DispatchSignals()
             delete p;
             continue;
         }
-        switch (p->signal)
+        // ★ 业务异常隔离:业务回调(onStart/onResponse/onTimeout/onClose/exec)抛出的
+        //   C++ 异常在此捕获(对齐 worker 线程池纪律),按 500 兜底收尾当前请求,
+        //   loop 继续服务下一个请求——单个请求的业务 bug 不拖垮整个服务进程。
+        //   (注意:SEH 级崩溃(访问违例)不转 C++ 异常,由进程级 SCM Recovery 兜底)
+        try
         {
-        case REQ_LOOP_SIG_START:    ProcessStart(*p); break;
-        case REQ_LOOP_SIG_CLOSE:    ProcessClose(*p); break;
-        case REQ_LOOP_SIG_TIMEOUT:  ProcessDeadline(); break;
-        case REQ_LOOP_SIG_RESPONSE: ProcessResponse(*p); break;
-        case REQ_LOOP_SIG_DONE:     ProcessDone(*p);  break;
-        default: break;  // 未定义信号,忽略
+            switch (p->signal)
+            {
+            case REQ_LOOP_SIG_START:    ProcessStart(*p); break;
+            case REQ_LOOP_SIG_CLOSE:    ProcessClose(*p); break;
+            case REQ_LOOP_SIG_TIMEOUT:  ProcessDeadline(); break;
+            case REQ_LOOP_SIG_RESPONSE: ProcessResponse(*p); break;
+            case REQ_LOOP_SIG_DONE:     ProcessDone(*p);  break;
+            case REQ_LOOP_SIG_EXEC:     ProcessExec(*p);  break;
+            default: break;  // 未定义信号,忽略
+            }
+        }
+        catch (const std::exception& e)
+        {
+            PUBLIC_LOG_ERROR("{}: 业务回调异常(已隔离): {}", GetName(), e.what());
+            OnRequestAborted();
+        }
+        catch (...)
+        {
+            PUBLIC_LOG_ERROR("{}: 业务回调未知异常(已隔离)", GetName());
+            OnRequestAborted();
         }
         delete p;
     }
@@ -193,7 +225,7 @@ void ZmReqLoop::ProcessStart(Post& p)
 {
     auto* ctx = static_cast<StartCtx*>(p.ctx);
 
-    // Bind(仅 A 线程触碰 per-request 状态)
+    // Bind(仅 ZmReqLoop 线程触碰 per-request 状态)
     m_task = ctx->task;
     m_handlers = std::move(ctx->handlers);
     m_replied.store(false);
@@ -276,6 +308,25 @@ void ZmReqLoop::ProcessDeadline()
     Release();
 }
 
+void ZmReqLoop::OnRequestAborted()
+{
+    // 业务异常后的兜底收尾(对齐 ProcessClose 默认收尾):
+    // 异常只跳出业务代码,ZmReqLoop 自身状态机(m_task/m_replied/epoch)未破坏,
+    // 业务侧半成品资源由 RAII 清理——可按 500 收尾当前请求并回池,loop 继续服务。
+    // 若门已被业务拿走(异常发生在组装中途),不回复,仅 Release(客户端超时兜底)。
+    if (m_task && TryReply())
+    {
+        if (m_task->IsStreaming())
+            m_task->EndStreamReply();   // 流式已开:结束流,驱动 doer 回收
+        else
+        {
+            m_task->SetReply(ZM_HTTP_STATUS_CODE_INTERNAL_ERROR, "Internal Error");
+            m_task->TriggerReply();
+        }
+    }
+    Release();
+}
+
 void ZmReqLoop::ProcessDone(Post& p)
 {
     if (p.ctx != m_task)   // 陈旧投递:非当前请求的 DONE,丢弃
@@ -283,6 +334,14 @@ void ZmReqLoop::ProcessDone(Post& p)
     // 外部线程已结束流式(EndStreamReply 已驱动 doer 回收),此处只收回复门
     TryReply();
     Release();
+}
+
+void ZmReqLoop::ProcessExec(Post& p)
+{
+    // epoch 校验已在 DispatchSignals 完成:能执行到这里说明请求未收尾(未 Release)
+    if (p.exec)
+        p.exec(this);   // 回复 helper 的组装/发送/收尾(见 zm_net_req_loop_protocol.cpp)
+    // 注意:exec 内通常投 DONE 收尾;exec 返回后不得再触碰 per-request 状态
 }
 
 void ZmReqLoop::ClearRequestState()
@@ -296,127 +355,4 @@ void ZmReqLoop::ClearRequestState()
         event_del(m_deadlineEvent);
     m_epoch.fetch_add(1);
     OnRequestReleased();   // 子类钩子:清理 per-request 私有成员(如 m_reply)
-}
-
-// ============================================================================
-// ZmReqLoopPool
-// ============================================================================
-
-namespace {
-/// 排队轮询片:醒来复查 abort 标志与 deadline
-constexpr auto kPollSlice = std::chrono::milliseconds(50);
-}
-
-ZmReqLoopPool::ZmReqLoopPool()
-    : m_maxCount(0), m_budgetMs(5000), m_shutdown(false)
-{
-}
-
-ZmReqLoopPool::~ZmReqLoopPool()
-{
-    Shutdown();
-}
-
-bool ZmReqLoopPool::Init(int preCreate, int maxCount, uint32_t businessBudgetMs)
-{
-    m_maxCount = maxCount;
-    m_budgetMs = businessBudgetMs;
-
-    for (int i = 0; i < preCreate; ++i)
-    {
-        auto* loop = m_factory ? m_factory() : new ZmReqLoop();
-        loop->SetPool(this);
-        if (!loop->Loop())
-        {
-            PUBLIC_LOG_ERROR("ZmReqLoopPool::Init failed: ZmReqLoop::Loop()");
-            delete loop;   // 本次创建失败的 loop(未入容器)
-            // 失败路径清理:停掉并释放已创建的 loop,复位容器,保证失败后池可重试 Init
-            for (auto* created : m_all)
-            {
-                created->Stop();
-                delete created;
-            }
-            m_all.clear();
-            m_idle.clear();
-            return false;
-        }
-        m_all.push_back(loop);
-        m_idle.push_back(loop);
-    }
-    PUBLIC_LOG_INFO("ZmReqLoopPool::Init: preCreate={}, maxCount={}, budgetMs={}",
-        preCreate, maxCount, businessBudgetMs);
-    return true;
-}
-
-ZmReqLoop* ZmReqLoopPool::Acquire(int timeoutMs, const std::atomic<bool>* abort)
-{
-    std::unique_lock<std::mutex> lock(m_mutex);
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-
-    while (!m_shutdown)
-    {
-        if (!m_idle.empty())
-        {
-            auto* loop = m_idle.back();
-            m_idle.pop_back();
-            return loop;
-        }
-        // deadline/abort 检查先于扩容:请求已过期或客户端已断,不再为其创建线程
-        if (std::chrono::steady_clock::now() >= deadline || (abort && abort->load()))
-            return nullptr;
-        if ((int)m_all.size() < m_maxCount)   // 扩容
-        {
-            // 持锁安全的依据:新线程只触碰自己的 m_mutexLoop/m_cvLoop,不触碰池锁;
-            // Release 在 Loop() 返回后才可能发生(此时本分支已 push 进 m_all/m_idle 完成)。
-            auto* loop = m_factory ? m_factory() : new ZmReqLoop();
-            loop->SetPool(this);
-            if (!loop->Loop())
-            {
-                PUBLIC_LOG_ERROR("ZmReqLoopPool::Acquire: loop start failed");
-                delete loop;
-                return nullptr;
-            }
-            m_all.push_back(loop);
-            return loop;
-        }
-        m_cv.wait_for(lock, kPollSlice);   // 50ms 片,醒来复查 abort
-    }
-    return nullptr;
-}
-
-void ZmReqLoopPool::Release(ZmReqLoop* loop)
-{
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_idle.push_back(loop);
-    }
-    m_cv.notify_one();
-}
-
-void ZmReqLoopPool::Shutdown()
-{
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_shutdown)
-            return;
-        m_shutdown = true;
-    }
-    m_cv.notify_all();
-
-    for (auto* loop : m_all)
-        loop->Stop();          // join 等待 ZmReqLoop 线程退出
-    for (auto* loop : m_all)
-        delete loop;
-    m_all.clear();
-    m_idle.clear();
-}
-
-// ============================================================================
-// ZmReqLoopPoolReturn — 桥接定义(ZmReqLoop::Release 经自由函数回池)
-// 本文件已包含完整 ZmReqLoopPool 定义,函数保持自由函数形态以便头文件仅前向声明。
-// ============================================================================
-
-void ZmReqLoopPoolReturn(ZmReqLoopPool* pool, ZmReqLoop* loop)
-{
-    pool->Release(loop);
 }

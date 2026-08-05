@@ -68,6 +68,7 @@ struct ssl_ctx_st;
 class ZmThreadPool;
 class ZmHttpdDoer;
 class ZmHttpdDoerPool;
+class ZmReqLoopPool;
 struct evbuffer;
 
 
@@ -429,6 +430,15 @@ public:
     ZmReqLoop* BoundLoop() const { return m_boundLoop.load(); }
 
     /**
+     * @brief 暂存请求级用户数据(通用槽位,协议上下文可放这里)
+     *
+     * @note 生命周期同 task:doer 复用(Reset)时自动清空,任意线程可读写
+     *       (业务线程写,回复路径读;读写均不跨请求,无竞态)
+     */
+    void SetUserData(std::shared_ptr<void> data) { m_userData = std::move(data); }
+    std::shared_ptr<void> UserData() const { return m_userData; }
+
+    /**
      * @brief 发送被延迟的 HTTP 响应
      *
      * 通过 event_active 将 REPLY 信号投递到 HTTP 服务器的 event loop 线程，
@@ -494,6 +504,9 @@ protected:
     int64_t m_arriveMs = 0;
     /** @brief 绑定的 A(ZmReqLoop),close 通知器读取投递 CLOSE;原子防跨线程竞态 */
     std::atomic<ZmReqLoop*> m_boundLoop{nullptr};
+
+    /** @brief 请求级用户数据(子类/业务层暂存协议上下文,doer Reset 时清空) */
+    std::shared_ptr<void> m_userData;
 
 public:
     /**
@@ -643,12 +656,39 @@ public:
     void Close();
 
     /** @brief 武装关闭门(m_closing=true):通知器 Add/Remove/closecb 投递全部跳过。
-     *  管理器须在停止 ZmReqLoopPool 之前调用(ZmReqLoopPool 销毁后 closecb 不得再触碰 loop)。幂等。 */
+     *  Close() 内部先调用;ZmReqLoopPool 销毁后 closecb 不得再触碰 loop。幂等。 */
     void BeginClose() { m_closing.store(true); }
 
     /** @brief 排空 HTTP worker 线程池(join):调用后不再有 doer 进入处理流程。
-     *  供管理器在停止 ZmReqLoopPool 前调用,消除 doer 与 ZmReqLoopPool 销毁的竞态。幂等。 */
+     *  Close() 内部先于 ZmReqLoopPool 停止调用,消除 doer 与 ZmReqLoopPool 销毁的竞态。幂等。 */
     void DrainWorkers();
+
+    /**
+     * @brief 启用业务 ZmReqLoopPool(ZmReqLoopPool,按需获取/预算约束/断连放弃)
+     *
+     * 必须在 Init() 之前调用;池的实际创建在 Init() 中完成。
+     * ZmJsonRpcServer / ZmRESTfulServer 派生类构造时自动启用,裸 ZmHttpServer 默认不启用。
+     *
+     * @param prealloc  预创建 loop 线程数,0 = 默认(硬件并发)
+     * @param maxLoops  池容量上限,0 = 默认(预创建 x4)
+     * @param budgetMs  业务预算毫秒(deadline = 请求到达 + 预算),0 = 默认(5000)
+     */
+    void EnableLoopPool(int prealloc = 0, int maxLoops = 0, uint32_t budgetMs = 0);
+
+    /** @brief 查询业务 ZmReqLoopPool是否已启用(Init 成功后生效) */
+    bool LoopPoolEnabled() const { return m_reqLoopPool != nullptr; }
+
+    /**
+     * @brief 设置 ZmReqLoopPool 的 loop 工厂(默认 new ZmReqLoop())
+     *
+     * 派生类需在 loop 上承载 per-request 状态时调用,如
+     * ZmJsonRpcServer → ZmReqLoopJrpc(存储 JRPC 响应信封)。
+     * 必须在 Init() 之前调用(Init 预创建时即用工厂)。
+     *
+     * @note 工厂返回的实例类型必须与派生类中 static_cast 的类型一致,
+     *       否则转换是未定义行为。
+     */
+    void SetLoopPoolFactory(std::function<ZmReqLoop*()> factory);
 
     /** @brief 查询服务器是否已初始化 */
     bool IsOpen() const;
@@ -814,6 +854,25 @@ protected:
      */
     bool BindEventBase(struct event_base* evbase);
 
+protected:
+    /**
+     * @brief 从业务 ZmReqLoopPool取一个 loop(预算内排队,客户端断连提前放弃)
+     * @param task 请求上下文(ArriveMs/ConnClosedFlag 参与排队计算)
+     * @return 可用的 ZmReqLoop,或 nullptr(池未启用/排队超时/断连)
+     */
+    ZmReqLoop* AcquireLoop(ZmHttpdTask* task);
+
+    /**
+     * @brief 绑定 task 并投递 START 到 ZmReqLoop 线程(业务回调在其上执行)
+     *
+     * @param task    请求上下文(内部 BindLoop)
+     * @param loop    AcquireLoop 返回的实例
+     * @param onStart ZmReqLoop 线程执行的续体(闭包捕获业务回调与请求数据;task 内数据
+     *                指针仅回复发送前有效,勿跨请求保存)
+     */
+    void DispatchLoop(ZmHttpdTask* task, ZmReqLoop* loop,
+        std::function<void(ZmReqLoop*)> onStart);
+
 private:
     /** @brief libevent 事件循环对象（外部传入，不由此类释放） */
     struct event_base* m_evbase;
@@ -826,6 +885,16 @@ private:
 
     /** @brief 工作线程池（复用线程处理请求，替代 thread-per-request） */
     ZmThreadPool*      m_threadPool;
+
+    /** @brief 业务 ZmReqLoopPool(EnableLoopPool 启用后由 Init 创建;nullptr = 未启用) */
+    ZmReqLoopPool*     m_reqLoopPool;
+    /** @brief ZmReqLoopPool配置(EnableLoopPool 保存,Init 时生效) */
+    int                m_loopPoolPrealloc;
+    int                m_loopPoolMax;
+    uint32_t           m_loopPoolBudgetMs;
+    bool               m_loopPoolEnabled;
+    /** @brief loop 工厂(SetLoopPoolFactory 设置,Init 创建池时透传;默认 new ZmReqLoop()) */
+    std::function<ZmReqLoop*()> m_loopPoolFactory;
 
     /** @brief 监听端口号 */
     uint16_t           m_local_port;
@@ -928,36 +997,37 @@ private:
  * @example 使用方式
  * @code
  *   ZmJsonRpcServer server("/rpc", 39440);
- *   server.SetJsonRpcCBAsync([](ZmHttpdTask* task, const ZMJSON& request,
- *       std::function<void(const ZMJSON& response)> replyCB) {
+ *   server.SetRequestReadCB([](ZmReqLoop* loop, const char* reqData) {
+ *       // ZmReqLoopPool 线程执行;reqData 为请求 JSON 字符串(method/params)
+ *       std::string err;
+ *       ZMJSON req = zm_json_parse(reqData, err);
  *       ZMJSON rsp;
- *       if (request["method"] == "add")
- *           rsp["result"] = {{"sum", request["params"]["a"].get<int>()
- *               + request["params"]["b"].get<int>()}};
+ *       if (req["method"] == "add")
+ *           rsp["result"] = {{"sum", req["params"]["a"].get<int>()
+ *               + req["params"]["b"].get<int>()}};
  *       else
  *           rsp["error"] = ZmJsonRpcServer::MakeError(-32601, "Method not found");
- *       replyCB(rsp);   // 任意线程可调,框架自动构造响应并发送
+ *       ZmReqLoopJrpc::ResponseJson(loop, rsp);   // 任意线程可调,框架自动构造响应并发送
  *   });
- *   server.Startup();
  * @endcode
  */
 class ZmJsonRpcServer : public ZmHttpServer
 {
 public:
     /**
-     * @brief JSON-RPC 异步请求处理回调
-     * @param task    请求上下文对象
-     * @param reply   响应回调，业务层处理完成后调用 reply(response) 发送响应
+     * @brief JRPC 业务请求回调（在 ZmReqLoop 线程执行，与 ZmReqLoopJrpcRequestCB 同签名）
+     * @param loop    本请求的 ZmReqLoop 实例（回复经 ZmReqLoopJrpc::ResponseJson(loop, rsp)）
+     * @param reqData 请求 JSON 字符串（含 method / params；仅在回调期间有效）
      *
-     * 本回调立即返回（不阻塞 Worker 线程）。业务层在异步处理完成后调用
-     * reply 函数，reply 内部构造 JSON-RPC 2.0 响应并通过 SendDeferredReply
-     * 发送回 HTTP 客户端。
+     * 服务器收到匹配 root_uri 的请求后，解析校验、响应信封(id/jsonrpc/method)存入 ZmReqLoopJrpc，
+     * 经内部 ZmReqLoopPool 分发，在 ZmReqLoop 线程调用本回调。业务层异步处理完成后
+     * 调用 ZmReqLoopJrpc::ResponseJson(loop, rsp) 回复（与 ZmReqLoopRest 同构：
+     * TryReply 门 → 服务器组装信封 → 发送 → DONE 收尾）。
      *
-     * @note reply 可在任意线程调用（内部通过 event_active 安全投递到 HTTP event loop）。
+     * @note 回复可在任意线程调用（内部通过 event_active 安全投递到 HTTP event loop）。
      */
-    typedef std::function<void(ZmHttpdTask* task, const ZMJSON& request,
-        std::function<void(const ZMJSON& response)> replyCB)>
-        OnJsonRpcRequestCBAsync;
+    typedef std::function<void(ZmReqLoop* loop, const char* reqData)>
+        OnRequestReadCB;
 
     /**
      * @brief 构造 JSON-RPC 服务器
@@ -986,26 +1056,32 @@ public:
     static ZMJSON MakeError(int code, std::string_view message);
 
     /**
-     * @brief 设置 JSON-RPC 异步请求回调
-     * @param oncall_async  异步回调函数
+     * @brief 设置 JRPC 业务请求回调（业务层直接调用）
+     * @param oncall_async 业务回调(OnRequestReadCB,在 ZmReqLoopPool 线程执行)
      *
-     * @note 设置后所有匹配 root_uri 的请求走异步路径。
-     *       异步回调中业务层调用 reply(response) 发送响应，框架自动构造
-     *       JSON-RPC 2.0 标准响应信封并通过 task->SendDeferredReply() 发送。
+     * @note 设置后所有匹配 root_uri 的请求经内部 ZmReqLoopPool 分发到本回调;
+     *       未设置时返回 PORTAL_NOJRPC 错误信封。
+     *       业务层经 ZmReqLoopJrpc::ResponseJson(loop, rsp) 回复,
+     *       框架自动构造 JSON-RPC 2.0 标准响应信封并发送。
      */
-    void SetJsonRpcCBAsync(OnJsonRpcRequestCBAsync oncall_async);
+    void SetRequestReadCB(OnRequestReadCB oncall_async);
+
+    /**
+    * @brief 构造 JSON-RPC HTTP 响应并写入 task（异步路径使用）
+    *
+    * 根据请求中是否携带 callback 参数自动选择响应格式：
+    * - 无 callback → 标准 JSON 响应，Content-Type: application/json
+    * - 有 callback → JSONP 格式 callback(json)，Content-Type: application/javascript
+    *
+    * 同时设置 Server 响应头（含服务端版本号）、HTTP 状态码 200 和响应体。
+    * 调用者负责触发实际发送（异步路径需调用 SendDeferredReply）。
+    *
+    * @param task         请求上下文对象（从中读取 callback 参数）
+    * @param rsp_envelope 已填充 jsonrpc/id/method/result/error 的响应 JSON 对象
+    */
+    static void BuildJsonRpcResponse(ZmHttpdTask* task, ZMJSON& reply, const ZMJSON& response);
 
 protected:
-    /**
-    * @brief 分发 JSON-RPC 请求到注册的异步回调（虚函数，子类可重写）
-    * @param task    请求上下文对象
-    * @param reply   输出结果对象
-    * @return        true 表示方法已回调到异步函数，false 表示没设置
-    *
-    * @note 当前仅保留异步回调(OnJsonRpcRequestCBAsync)一条分发路径
-    */
-    virtual bool OnJsonRpcRequestAsync(ZmHttpdTask* task, const ZMJSON& request, ZMJSON& reply);
-
     /**
      * @brief 处理 HTTP 请求，解析 JSON-RPC 协议并构造响应（重写父类虚函数）
      *
@@ -1013,8 +1089,9 @@ protected:
      *   1. URI 不匹配 root_uri 时交给父类处理
      *   2. GET 请求从 query string 读取 Base64 编码的 jsonbody 并解码
      *   3. 解析 JSON 请求体，校验 method/params 字段
-     *   4. 调用 OnJsonRpcRequestAsync 分发到业务异步回调
-     *   5. 按 JSON-RPC 2.0 规范构造响应（result 和 error 二选一）
+     *   4. 响应信封(id/jsonrpc/method)存入 ZmReqLoopJrpc，经内部 ZmReqLoopPool 分发到 m_on_request_read
+     *   5. 业务层经静态 ZmReqLoopJrpc::ResponseJson(loop, rsp) 回复，
+     *      BuildJsonRpcResponse 按 JSON-RPC 2.0 规范组装（result 和 error 二选一）
      *   6. 支持 JSONP 模式（callback 参数非空时包裹为 callback(json)）
      *
      * @param task  请求上下文对象
@@ -1024,34 +1101,9 @@ protected:
      */
     virtual int OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t dlen);
 
-    /**
-     * @brief 构造 JSON-RPC HTTP 响应并写入 task（异步路径使用）
-     *
-     * 根据请求中是否携带 callback 参数自动选择响应格式：
-     * - 无 callback → 标准 JSON 响应，Content-Type: application/json
-     * - 有 callback → JSONP 格式 callback(json)，Content-Type: application/javascript
-     *
-     * 同时设置 Server 响应头（含服务端版本号）、HTTP 状态码 200 和响应体。
-     * 调用者负责触发实际发送（异步路径需调用 SendDeferredReply）。
-     *
-     * @param task         请求上下文对象（从中读取 callback 参数）
-     * @param rsp_envelope 已填充 jsonrpc/id/method/result/error 的响应 JSON 对象
-     */
-    void BuildJsonRpcResponse(ZmHttpdTask* task, ZMJSON& reply, const ZMJSON& response);
-
-    /**
-     * @brief 异步 JRPC 请求的回复回调（静态成员函数，供 OnJsonRpcRequestAsync 中 std::bind 使用）
-     * @param server  ZmJsonRpcServer 实例指针
-     * @param task    请求上下文对象
-     * @param reply   响应信封 JSON 对象引用
-     * @param result  业务层返回的结果对象（is_null() 表示无结果）
-     * @param error   业务层返回的错误对象（is_null() 表示无错误）
-     */
-    static void OnJsonRpcAsyncReply(ZmJsonRpcServer* server, ZmHttpdTask* task, ZMJSON& reply, const ZMJSON& response);
-
 private:
-    /** @brief JSON-RPC 异步请求回调（设置后所有匹配请求走异步路径） */
-    OnJsonRpcRequestCBAsync m_on_jsonrpc_call_async;
+    /** @brief JRPC 业务请求回调(经内部 ZmReqLoopPool 分发到 ZmReqLoop 线程执行) */
+    OnRequestReadCB m_on_request_read;
 
     /** @brief RPC 请求的 URI 前缀，匹配此前缀的请求走 RPC 流程 */
     char                    m_root_uri[128];
@@ -1067,35 +1119,36 @@ private:
  *
  * @example 异步模式
  * @code
- *   server.SetRESTfulCBAsync([](ZmHttpdTask* task, const BYTE* body, size_t len) {
- *       // 异步处理:经 ZmReqLoopPool 投递到业务线程 → ZmReqLoopRest::Response* 回复
+ *   server.SetRequestReadCB([](ZmReqLoop* loop, const BYTE* body, size_t len) {
+ *       // ZmReqLoopPool 线程执行 → ZmReqLoopRest::Response* 回复
  *   });
  * @endcode
  */
 class ZmRESTfulServer : public ZmHttpServer
 {
 public:
-    using OnRESTfulRequestCBAsync = std::function<void(
-        ZmHttpdTask* task, const BYTE* body, size_t body_len)>;
+    /**
+     * @brief RESTful 业务请求回调（在 ZmReqLoopPool 线程执行，与 ZmReqLoopRestfulRequestCB 同签名）
+     * @param loop     本请求的 ZmReqLoop 实例（经 ZmReqLoopRest::Response* 回复）
+     * @param body     请求体字节指针（指向请求 evbuffer，回复发送前有效，勿保存跨请求使用）
+     * @param body_len 请求体长度
+     */
+    using OnRequestReadCB = std::function<void(
+        ZmReqLoop* loop, const BYTE* body, size_t body_len)>;
 
     ZmRESTfulServer(struct event_base* evbase, std::string_view root_uri, uint16_t local_port,
                     const char* certFile = nullptr, const char* keyFile = nullptr,
                     uint32_t sessionCacheSize = 0, const char* sessionContext = nullptr);
     virtual ~ZmRESTfulServer();
 
-    /** @brief 设置异步回调 */
-    void SetRESTfulCBAsync(OnRESTfulRequestCBAsync oncall);
-
-    // ---- 工具方法 ----
-
-    /** @brief 快捷返回 JSON 响应（Content-Type: application/json） */
-    static void ReplyJson(ZmHttpdTask* task, int code, const ZMJSON& data);
-    /** @brief 快捷返回 JSON 错误响应 {"error":{"code":...,"message":...}} */
-    static void ReplyError(ZmHttpdTask* task, int code, std::string_view msg);
-    /** @brief 快捷返回空响应体（用于 204 No Content、201 Created 等） */
-    static void ReplyEmpty(ZmHttpdTask* task, int code, const char* reason = nullptr);
-    /** @brief 快捷返回重定向（301/302，设置 Location 头） */
-    static void ReplyRedirect(ZmHttpdTask* task, const char* location, int code = 302);
+    /**
+     * @brief 设置 RESTful 业务请求回调（业务层直接调用）
+     * @param oncall 业务回调(OnRequestReadCB,在 ZmReqLoopPool 线程执行)
+     *
+     * @note 设置后所有匹配 root_uri 的请求经内部 ZmReqLoopPool 分发到本回调;
+     *       未设置时返回 500,池满/排队超时返回 503。
+     */
+    void SetRequestReadCB(OnRequestReadCB oncall);
 
 protected:
     /**
@@ -1107,8 +1160,8 @@ protected:
     virtual int OnHttpdRequest(ZmHttpdTask* task, const BYTE* data, size_t dlen) override;
 
 private:
-    /** @brief 异步回调 */
-    OnRESTfulRequestCBAsync m_on_restful_async;
+    /** @brief RESTful 业务请求回调(经内部 ZmReqLoopPool 分发到 ZmReqLoop 线程执行) */
+    OnRequestReadCB m_on_request_read;
 
     /** @brief URI 前缀（仅匹配此前缀的请求走 RESTful 流程） */
     char m_root_uri[128];

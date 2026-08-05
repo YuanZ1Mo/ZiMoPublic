@@ -53,6 +53,47 @@ ZmHttpClientRequest& ZmHttpClientRequest::SetBodyJson(const ZMJSON& json)
     return *this;
 }
 
+// URL 编码表单 helper(SetBodyForm):percent-encode(RFC 3986 unreserved 保留;空格 → '+';
+// Go url.Values.Encode / Python quote_plus 同口径)。CR/LF 一并转义 → 键值天然防注入
+static std::string UrlEncodeForm(const std::string& s)
+{
+    static const char* kHex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s)
+    {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '.' || c == '_' || c == '~')
+            out += (char)c;
+        else if (c == ' ')
+            out += '+';
+        else
+        {
+            out += '%';
+            out += kHex[c >> 4];
+            out += kHex[c & 0x0F];
+        }
+    }
+    return out;
+}
+
+ZmHttpClientRequest& ZmHttpClientRequest::SetBodyForm(const std::map<std::string, std::string>& fields)
+{
+    // URL 编码表单:键值 percent-encode,按 key 排序输出(确定性;Go url.Values.Encode 口径)
+    std::string body;
+    for (const auto& kv : fields)
+    {
+        if (!body.empty())
+            body += '&';
+        body += UrlEncodeForm(kv.first);
+        body += '=';
+        body += UrlEncodeForm(kv.second);
+    }
+    SetBody(body.data(), body.size());
+    m_headers["Content-Type"] = "application/x-www-form-urlencoded";
+    return *this;
+}
+
 ZmHttpClientRequest& ZmHttpClientRequest::SetBodyFile(const char* path)
 {
     m_body.clear();
@@ -70,19 +111,34 @@ ZmHttpClientRequest& ZmHttpClientRequest::SetUploadStream(std::function<std::str
 }
 
 ZmHttpClientRequest& ZmHttpClientRequest::SetConnectTimeout(int s) { m_connectTimeout = s; return *this; }
+ZmHttpClientRequest& ZmHttpClientRequest::SetReadWriteTimeout(int s) { m_readWriteTimeout = s; return *this; }
 ZmHttpClientRequest& ZmHttpClientRequest::SetTotalTimeout(int s)   { m_totalTimeout = s;   return *this; }
 ZmHttpClientRequest& ZmHttpClientRequest::SetFollowRedirect(bool on, int max) { m_followRedirect = on; m_redirectMax = max; return *this; }
 ZmHttpClientRequest& ZmHttpClientRequest::SetProxy(const char* host, uint16_t port) { m_proxyHost = host ? host : ""; m_proxyPort = port; return *this; }
 
-ZmHttpClientRequest& ZmHttpClientRequest::SetBasicAuth(const char* user, const char* pass)
+// Basic 认证头值生成(user:pass → base64 → "Basic <b64>";null 参数按空串)—— SetBasicAuth/SetProxyAuth 共用
+static std::string MakeBasicAuthHeaderValue(const char* user, const char* pass)
 {
-    // Basic 认证(C9):user:pass → base64 → "Authorization: Basic <b64>"(null 参数按空串)
     std::string raw = std::string(user ? user : "") + ":" + (pass ? pass : "");
     size_t outLen = ((raw.size() + 2) / 3) * 4;
     std::vector<char> out(outLen + 1);
     int n = EVP_EncodeBlock((unsigned char*)out.data(), (const unsigned char*)raw.data(), (int)raw.size());
     out[n] = 0;
-    m_headers["Authorization"] = std::string("Basic ") + out.data();
+    return std::string("Basic ") + out.data();
+}
+
+ZmHttpClientRequest& ZmHttpClientRequest::SetBasicAuth(const char* user, const char* pass)
+{
+    // Basic 认证(C9):user:pass → base64 → "Authorization: Basic <b64>"(null 参数按空串)
+    m_headers["Authorization"] = MakeBasicAuthHeaderValue(user, pass);
+    return *this;
+}
+
+ZmHttpClientRequest& ZmHttpClientRequest::SetProxyAuth(const char* user, const char* pass)
+{
+    // 代理认证(C19):与 Basic 同款编码,存逐跳头值 —— 仅代理路径挂载(CONNECT 请求行 /
+    // absolute-form 请求头),不进 m_headers(防随重定向/请求带往目标服务器)
+    m_proxyAuthHeader = MakeBasicAuthHeaderValue(user, pass);
     return *this;
 }
 
@@ -99,6 +155,7 @@ ZmHttpClientRequest& ZmHttpClientRequest::SetOnDataChunk(std::function<void(cons
 ZmHttpClientRequest& ZmHttpClientRequest::SetOnSseEvent(std::function<void(const std::string&)> cb) { m_onSseEvent = std::move(cb); return *this; }
 ZmHttpClientRequest& ZmHttpClientRequest::SetProgressCallback(std::function<void(int64_t, int64_t)> cb) { m_progress = std::move(cb); return *this; }
 ZmHttpClientRequest& ZmHttpClientRequest::SetOutputFile(const char* path) { m_outputFile = path ? path : ""; return *this; }
+ZmHttpClientRequest& ZmHttpClientRequest::SetMaxBodySize(uint64_t bytes) { m_maxBodySize = bytes; return *this; }
 ZmHttpClientRequest& ZmHttpClientRequest::SetRange(int64_t offset) { m_range = offset; return *this; }
 ZmHttpClientRequest& ZmHttpClientRequest::SetClientCert(const char* certFile, const char* keyFile)
 {
@@ -319,11 +376,30 @@ struct ZmHttpClientReqState
         return req.OnDataChunk() || req.OnSseEvent() || !req.OutputFile().empty();
     }
 
+    // 响应体上限检查(解压后字节口径;SetMaxBodySize,0 = 不限制):
+    // 按当前已累积/已分发字节 + 本块增量判定,超限置 abortError(TOO_LARGE)并返回 false,
+    // 调用方中止流/按它收口。len == 0 恒通过(不阻断零长调用)。
+    bool CheckBodyLimit(size_t len, uint64_t accumulated)
+    {
+        if (req.MaxBodySize() == 0 || len == 0)
+            return true;
+        if (accumulated + len > req.MaxBodySize())
+        {
+            abortError = ZM_HTTPC_ERR_RESPONSE_TOO_LARGE;
+            abortErrorText = "response body too large";
+            return false;
+        }
+        return true;
+    }
+
     // 数据分发(循环线程):OnDataChunk 逐块回调;OutputFile 逐块写盘;两者可并存(先回调后写盘);
     // 随后更新进度(Progress(已收, total);total = Content-Length,未知为 -1)。
     // 返回 false = 写盘失败(OnDataChunk 回调已触发;调用方收口 ERR_FILE_IO,进度不含本块)
+    // 或超限(CheckBodyLimit 已置 TOO_LARGE;本块未分发,调用方按 abortError 收口)
     bool DispatchData(const BYTE* data, size_t len)
     {
+        if (!CheckBodyLimit(len, bytesReceived))
+            return false;
         if (req.OnDataChunk())
             req.OnDataChunk()(data, len);
         if (!WriteToFile(data, len))
@@ -340,9 +416,21 @@ struct ZmHttpClientReqState
     //   2xx 流式:SSE          → SseFeed 逐事件(SSE_MAX_FRAME 上限作用于解压后,挂载点在解压后);
     //   2xx 流式:OnDataChunk/落盘 → DispatchData(回调+写盘+进度);
     //   2xx 流式:SSE 仅消费    → 计数+进度。
-    // 失败时已置 abortError/abortErrorText(SSE 帧超上限 / 写盘失败),返回 false;调用方取消流按它收口
+    // 失败时已置 abortError/abortErrorText(SSE 帧超上限 / 写盘失败 / 体超上限),返回 false;调用方取消流按它收口
     bool DispatchDecoded(const BYTE* data, size_t len)
     {
+        // 响应体上限检查(按当前分支的累积/分发计数;超限已置 abortError TOO_LARGE)
+        {
+            uint64_t acc = 0;
+            if (!IsStreamingConsumer())
+                acc = gzipFullBody.size();
+            else if (!streamingBody)
+                acc = non2xxBody.size();
+            else
+                acc = bytesReceived;
+            if (!CheckBodyLimit(len, acc))
+                return false;
+        }
         if (!IsStreamingConsumer())
         {
             // 全量模式:解压产出暂存 gzipFullBody(done_cb 全量 gzip 路径移交 m_body;
@@ -1695,14 +1783,17 @@ void ZmHttpClientPrivate::ZmHttpClientOnDoneCB(struct evhttp_request* hreq, void
                 // 307/308 保留方法/体(重放原请求);301 其他方法亦保留
                 st->redirectReq = st->req;
                 st->redirectReq.SetUrl(newUrl.c_str());
-                // 跨主机重定向:剥离 Authorization/Cookie(防凭据泄漏;浏览器/curl/Go 同行为;
-                // origin = scheme+host+port,任一不同即视为跨域,保守剥离)
+                // 跨主机重定向:剥离 Authorization/Cookie/Referer/Origin(防凭据泄漏与
+                // 内部路径/来源泄漏;浏览器/curl/Go 同行为;origin = scheme+host+port,
+                // 任一不同即视为跨域,保守剥离)
                 std::string ns; std::string nh; uint16_t np = 0; std::string npath;
                 if (ParseHttpUrl(newUrl, ns, nh, np, npath) &&
                     (ns != st->scheme || nh != st->host || np != st->port))
                 {
                     st->redirectReq.RemoveHeader("Authorization");
                     st->redirectReq.RemoveHeader("Cookie");
+                    st->redirectReq.RemoveHeader("Referer");
+                    st->redirectReq.RemoveHeader("Origin");
                 }
                 if (((code == 302 || code == 303) && _stricmp(st->redirectReq.Method().c_str(), "HEAD") != 0) ||
                     (code == 301 && _stricmp(st->redirectReq.Method().c_str(), "POST") == 0))
@@ -1780,12 +1871,18 @@ void ZmHttpClientPrivate::ZmHttpClientOnDoneCB(struct evhttp_request* hreq, void
                     evbuffer_remove(in, buf.data(), n);
                     if (!GzipFeed(st, buf.data(), n))
                     {
-                        FinishRequest(st, ZM_HTTPC_ERR_PARSE, "gzip inflate failed");
+                        // 解压失败/分发失败(超上限等):按已置 abortError 收口
+                        FinishRequest(st, st->abortError, st->abortErrorText.c_str());
                         return;
                     }
                 }
                 else
                 {
+                    if (!st->CheckBodyLimit(n, (uint64_t)st->non2xxBody.size()))
+                    {
+                        FinishRequest(st, st->abortError, st->abortErrorText.c_str());
+                        return;
+                    }
                     size_t old = st->non2xxBody.size();
                     st->non2xxBody.resize(old + n);
                     evbuffer_remove(in, st->non2xxBody.data() + old, n);
@@ -1809,14 +1906,16 @@ void ZmHttpClientPrivate::ZmHttpClientOnDoneCB(struct evhttp_request* hreq, void
                 {
                     if (!GzipFeed(st, buf.data(), take))
                     {
-                        FinishRequest(st, ZM_HTTPC_ERR_PARSE, "gzip inflate failed");
+                        // 解压失败/分发失败(超上限等):按已置 abortError 收口
+                        FinishRequest(st, st->abortError, st->abortErrorText.c_str());
                         return;
                     }
                 }
                 else if (!st->DispatchData(buf.data(), take))
                 {
-                    // 写盘失败:中断分发并收口(文件由 FinishRequest 关闭;收口后 st 已释放,不得再访问)
-                    FinishRequest(st, ZM_HTTPC_ERR_FILE_IO, "write output file failed");
+                    // 写盘失败/超上限:中断分发并收口(文件由 FinishRequest 关闭;收口后 st 已释放,不得再访问)
+                    FinishRequest(st, st->abortError != ZM_HTTPC_OK ? st->abortError : ZM_HTTPC_ERR_FILE_IO,
+                                  st->abortError != ZM_HTTPC_OK ? st->abortErrorText.c_str() : "write output file failed");
                     return;
                 }
             }
@@ -1828,7 +1927,7 @@ void ZmHttpClientPrivate::ZmHttpClientOnDoneCB(struct evhttp_request* hreq, void
         {
             // 全量模式 + C13:压缩体 64KB 分块喂入解压流,随喂随 evbuffer_remove 释放压缩拷贝
             // (避免整包 pullup 的第三份驻留;产出经 DispatchDecoded 全量分支暂存 gzipFullBody)。
-            // GzipFeed 失败 = inflate 错误 → 收口 ERR_PARSE
+            // GzipFeed 失败 = inflate 错误 / 分发失败(超上限等)→ 按已置 abortError 收口
             const size_t CHUNK = 64 * 1024;
             while (in && evbuffer_get_length(in) > 0)
             {
@@ -1837,7 +1936,7 @@ void ZmHttpClientPrivate::ZmHttpClientOnDoneCB(struct evhttp_request* hreq, void
                 evbuffer_remove(in, buf.data(), take);
                 if (!GzipFeed(st, buf.data(), take))
                 {
-                    FinishRequest(st, ZM_HTTPC_ERR_PARSE, "gzip inflate failed");
+                    FinishRequest(st, st->abortError, st->abortErrorText.c_str());
                     return;
                 }
             }
@@ -1847,7 +1946,12 @@ void ZmHttpClientPrivate::ZmHttpClientOnDoneCB(struct evhttp_request* hreq, void
         }
         else
         {
-            // 全量模式:现有逻辑不变
+            // 全量模式:响应体超上限 → 不拷贝直接收口(TOO_LARGE,防调用方拿到大块内存)
+            if (!st->CheckBodyLimit(len, 0))
+            {
+                FinishRequest(st, st->abortError, st->abortErrorText.c_str());
+                return;
+            }
             st->result.m_response.m_body.resize(len);
             if (len && in)
                 evbuffer_remove(in, st->result.m_response.m_body.data(), len);
@@ -1937,6 +2041,17 @@ int ZmHttpClientPrivate::ZmHttpClientOnHeaderCB(struct evhttp_request* hreq, voi
         st->contentLengthTotal = -1;
     }
 
+    // 响应体上限早退(SetMaxBodySize):非 gzip 时 Content-Length 即体大小,已知超限提前中止
+    // (gzip 时 CL 为压缩字节数,已置 -1 不可比,由增量分发层按解压后字节检查兜底)。
+    // header_cb 内不可取消(已核对 http.c),与 gzip init 失败同模式:预置 abortError 返回 -1 中止连接
+    if (st->req.MaxBodySize() > 0 && st->contentLengthTotal > 0 &&
+        (uint64_t)st->contentLengthTotal > st->req.MaxBodySize())
+    {
+        st->abortError = ZM_HTTPC_ERR_RESPONSE_TOO_LARGE;
+        st->abortErrorText = "response body too large";
+        return -1;
+    }
+
     if (code >= 200 && code < 300)
     {
         // 2xx:流式接管 —— 取消总超时(响应头到达即接管;与 ZmReqLoop::CancelDeadline 语义对齐)
@@ -1985,6 +2100,13 @@ void ZmHttpClientPrivate::ZmHttpClientOnChunkCB(struct evhttp_request* hreq, voi
         }
         else
         {
+            if (!st->CheckBodyLimit(len, (uint64_t)st->non2xxBody.size()))
+            {
+                // 响应体超上限:中止流(取消 → error_cb(CANCEL) 按 abortError 收口)
+                if (st->hreq)
+                    evhttp_cancel_request(st->hreq);
+                return;
+            }
             st->non2xxBody.insert(st->non2xxBody.end(), p, p + len);
         }
         return;
@@ -2042,6 +2164,13 @@ void ZmHttpClientPrivate::ZmHttpClientOnChunkCB(struct evhttp_request* hreq, voi
     else if (st->req.OnSseEvent())
     {
         // SSE 仅消费(无数据回调/落盘):计数与进度(总超时已取消;total 无 Content-Length 为 -1)
+        if (!st->CheckBodyLimit(len, st->bytesReceived))
+        {
+            // 响应体超上限:中止流(取消 → error_cb(CANCEL) 按 abortError 收口)
+            if (st->hreq)
+                evhttp_cancel_request(st->hreq);
+            return;
+        }
         st->bytesReceived += len;
         if (st->req.Progress())
             st->req.Progress()((int64_t)st->bytesReceived, st->contentLengthTotal);
@@ -2297,13 +2426,26 @@ static void ZmHttpClientTunnelEventCB(struct bufferevent* bev, short what, void*
 
     if (what & BEV_EVENT_CONNECTED)
     {
+        // 连接建立:读写超时接管(SetReadWriteTimeout 独立控制;0 = 跟随连接超时),
+        // 覆盖连接阶段的连接超时 —— CONNECT 请求/响应与后续隧道内读写均按读写超时计
+        int rwTimeout = st->req.ReadWriteTimeout() > 0 ? st->req.ReadWriteTimeout() : st->req.ConnectTimeout();
+        if (rwTimeout > 0)
+        {
+            struct timeval tv = { rwTimeout, 0 };
+            bufferevent_set_timeouts(bev, &tv, &tv);
+        }
         // CONNECT 行恒带端口(RFC 7231 §4.3.6:authority-form = host:port,严格代理
         // 要求;仅此行 —— Host 头省略默认端口合法);IPv6 字面量回括
         std::string target = st->host;
         if (st->host.find(':') != std::string::npos)
             target = "[" + st->host + "]";
         std::string connectReq = "CONNECT " + target + ":" + std::to_string(st->port) +
-                                 " HTTP/1.1\r\nHost: " + HttpTargetHostHeader(st) + "\r\n\r\n";
+                                 " HTTP/1.1\r\nHost: " + HttpTargetHostHeader(st);
+        // 代理认证(C19):Proxy-Authorization 为逐跳头,仅进 CONNECT 请求(隧道建立后
+        // TLS 内为 origin-form,不携带);CONNECT 请求行为手拼,不经 evhttp 头组装
+        if (st->req.HasProxyAuth())
+            connectReq += "\r\nProxy-Authorization: " + st->req.ProxyAuthHeader();
+        connectReq += "\r\n\r\n";
         bufferevent_write(bev, connectReq.data(), connectReq.size());
         bufferevent_enable(bev, EV_READ);
         return;
@@ -2509,10 +2651,12 @@ static void StartViaHttpsProxy(ZmHttpClientReqState* st)
         ZmHttpClientPrivate::FinishRequest(st, ZM_HTTPC_ERR_CONNECT, "proxy socket create failed");
         return;
     }
-    // 连接/读写超时(口径与直连一致:ConnectTimeout 同时作用于连接与读写)。filter
-    // 形态下 evhttp_connection_set_timeout 对 SSL bev 无效(见第 0 步结论 5),故在此
-    // 直设于隧道 bev(底层 socket bev 读写事件携带超时);隧道 bev 超时经 be_ssl_eventcb
-    // 透传回 SSL bev 用户回调 → evhttp_error_cb(EVREQ_HTTP_TIMEOUT),与直连同语义
+    // 连接阶段超时 = 连接超时(bev 的 connect 超时经 write timeout 事件生效,已核对
+    // bufferevent_socket.c:connect 阶段 event_add(ev_connect, timeout_write));
+    // 隧道建立后(CONNECTED 回调)重设为读写超时(SetReadWriteTimeout,默认跟随连接超时)。
+    // filter 形态下 evhttp_connection_set_timeout 对 SSL bev 无效(见第 0 步结论 5),
+    // 故在此直设于隧道 bev(底层 socket bev 读写事件携带超时);隧道 bev 超时经
+    // be_ssl_eventcb 透传回 SSL bev 用户回调 → evhttp_error_cb(EVREQ_HTTP_TIMEOUT),与直连同语义
     if (st->req.ConnectTimeout() > 0)
     {
         struct timeval tv = { st->req.ConnectTimeout(), 0 };
@@ -2544,9 +2688,11 @@ static void DispatchOnConnection(ZmHttpClientReqState* st, struct evhttp_connect
         struct timeval ctv = { st->req.ConnectTimeout(), 0 };
         evhttp_connection_set_connect_timeout_tv(con, &ctv);
     }
-    // 读写超时(0 = 不限制:不设置,用 libevent 默认 50s)
-    if (st->req.ConnectTimeout() > 0)
-        evhttp_connection_set_timeout(con, st->req.ConnectTimeout());
+    // 读写超时(SetReadWriteTimeout 独立控制;0 = 跟随连接超时;连接超时亦为 0 时不设置,用
+    // libevent 默认 50s —— 与改动前语义一致:未显式设置读写超时即沿用连接超时行为)
+    int rwTimeout = st->req.ReadWriteTimeout() > 0 ? st->req.ReadWriteTimeout() : st->req.ConnectTimeout();
+    if (rwTimeout > 0)
+        evhttp_connection_set_timeout(con, rwTimeout);
 
     // 请求总超时(deadline;0 = 不限制;流式请求在响应头到达(header_cb,2xx)时自动取消,见 OnHeaderCB)
     // 重定向链/重试(C15)不重建事件:保持原 deadline 覆盖整条链含重试(重建会覆盖并泄漏在飞
@@ -2603,6 +2749,12 @@ static void DispatchOnConnection(ZmHttpClientReqState* st, struct evhttp_connect
             evhttp_add_header(evhttp_request_get_output_headers(hreq), "Host", hostHdr.c_str());
         }
     }
+
+    // ── 代理认证(C19):hostHeader 非空即代理路径(absolute-form;CONNECT 隧道已在
+    // CONNECT 请求头携带,隧道内 TLS 请求不带逐跳头);直连路径不加 ──
+    if (hostHeader && st->req.HasProxyAuth())
+        evhttp_add_header(evhttp_request_get_output_headers(hreq), "Proxy-Authorization",
+                          st->req.ProxyAuthHeader().c_str());
 
     // ── C13 gzip:请求允许解压(Gzip 默认开)且用户未显式设置 Accept-Encoding 时自动补
     // "Accept-Encoding: gzip, deflate"(用户显式设置时尊重,不覆盖;与 SSE 的 Accept 补全同模式)──
@@ -3102,12 +3254,12 @@ bool ZmHttpClient::IsLooped() const
     return m_priv && m_priv->IsLooped();
 }
 
-ZmHttpClientResult* ZmHttpClient::Send(const ZmHttpClientRequest& req)
+std::unique_ptr<ZmHttpClientResult> ZmHttpClient::Send(const ZmHttpClientRequest& req)
 {
     if (!m_priv)
     {
         // 未启动:返回错误对象(遵守头文件"失败亦返回对象"契约,不返回 nullptr)
-        auto* r = new ZmHttpClientResult();
+        auto r = std::make_unique<ZmHttpClientResult>();
         r->m_error = ZM_HTTPC_ERR_CONNECT;
         r->m_errorText = "client not started";
         return r;
@@ -3142,17 +3294,17 @@ ZmHttpClientResult* ZmHttpClient::Send(const ZmHttpClientRequest& req)
                 std::lock_guard<std::mutex> lock(s_orphanMutex);
                 s_orphans.push_back(std::move(promise));
             }
-            auto* r = new ZmHttpClientResult;
+            auto r = std::make_unique<ZmHttpClientResult>();
             r->m_error = ZM_HTTPC_ERR_TIMEOUT;
             r->m_errorText = "loop unresponsive";
             return r;
         }
-        auto* r = fut.get().release();
+        auto r = fut.get();
         r->m_error = ZM_HTTPC_ERR_TIMEOUT;   // 同步超时对外报 TIMEOUT(而非 CANCELLED)
         r->m_errorText = "total timeout";
         return r;
     }
-    return fut.get().release();   // 调用方 delete
+    return fut.get();   // 所有权交调用方(unique_ptr 自动释放)
 }
 
 void ZmHttpClient::SendAsync(const ZmHttpClientRequest& req, uint64_t id, void* params, ZmHttpClientCallback cb)

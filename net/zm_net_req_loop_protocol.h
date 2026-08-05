@@ -8,31 +8,35 @@
 #include <string_view>
 
 /**
- * @brief JRPC 回复子类:持 per-request 回复函数(服务器侧 replyCB 包装),
- * 业务经静态 Response() 回复,内部走 TryReply 门 + task 直通
+ * @brief JRPC 回复子类:承载 per-request 响应信封(id/jsonrpc/method),
+ * 业务经静态 Response() 回复,与 ZmReqLoopRest 同构
+ * (TryReply 门 → 服务器组装信封 → task 直通 → 投 DONE)。
+ * 信封由服务器分发时经 SetEnvelope 写入,Response 时取出交给服务器组装,
+ * 池复用前经 OnRequestReleased 清理(防旧信封污染下一请求)。
  */
 class ZmReqLoopJrpc : public ZmReqLoop
 {
 public:
-    /** @brief 设置本请求的回复函数(ProcessStart 的 onStart 闭包内调用,仅本线程) */
-    void SetReply(std::function<void(const ZMJSON&)> reply) { m_reply = std::move(reply); }
+    /** @brief 保存本请求的响应信封(服务器分发时调用,仅本线程写入) */
+    void SetEnvelope(ZMJSON envelope) { m_envelope = std::move(envelope); }
 
-    /** @brief JRPC 回复(任意线程可调):TryReply 门 → 回复 → 投 DONE,收尾统一由 A 线程 ProcessDone 执行
-     *  @param rsp 业务构造的完整响应 JSON(含 id/jsonrpc/method/result/error) */
-    static void Response(ZmReqLoop* loop, const ZMJSON& rsp);
+    /** @brief JRPC 回复(任意线程可调):TryReply 门 → 服务器组装信封并发送 → 投 DONE
+     *  @param rsp 业务构造的响应 JSON(含 result 或 error,可选 headers);
+     *             id/jsonrpc/method 信封按请求原样回传 */
+    static void ResponseJson(ZmReqLoop* loop, const ZMJSON& rsp);
 
-    /** @brief 覆写基类钩子:清理 m_reply(防池复用后旧闭包污染下一请求) */
-    void OnRequestReleased() override { m_reply = {}; }
+    /** @brief 覆写基类钩子:清理信封(防池复用后旧信封污染下一请求) */
+    void OnRequestReleased() override { m_envelope = ZMJSON(); }
 
 private:
-    std::function<void(const ZMJSON&)> m_reply;   ///< per-request 回复函数(仅本线程读写)
+    ZMJSON m_envelope;   ///< 本请求的响应信封(id/jsonrpc/method,仅本线程读写)
 };
 
 /**
  * @brief RESTful 回复子类:回复 helper 全部 task 直通;最终回复类 helper 内部 TryReply 门,
- * 回复后投 REQ_LOOP_SIG_DONE,收尾(Release 回池)统一由 A 线程 ProcessDone 执行。
+ * 回复后投 REQ_LOOP_SIG_DONE,收尾(Release 回池)统一由 ZmReqLoop 线程 ProcessDone 执行。
  * ResponseStreamStart/ResponseSSEStart 自动取消 deadline(流式长任务不被 504 误杀)。
- * @note 所有 helper **任意线程可调**(门保证单写者,收尾收敛到 A 线程,无跨线程 Release);
+ * @note 所有 helper **任意线程可调**(门保证单写者,收尾收敛到 ZmReqLoop 线程,无跨线程 Release);
  *       流式场景外部线程亦可沿用 task->EndStreamReply() + PostToLoop(REQ_LOOP_SIG_DONE, task) 模式。
  */
 class ZmReqLoopRest : public ZmReqLoop

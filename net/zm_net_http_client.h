@@ -27,6 +27,7 @@ enum ZmHttpClientError
     ZM_HTTPC_ERR_SSL,             ///< TLS 错误
     ZM_HTTPC_ERR_PROXY,           ///< 代理错误
     ZM_HTTPC_ERR_REDIRECT,        ///< 重定向次数超限
+    ZM_HTTPC_ERR_RESPONSE_TOO_LARGE, ///< 响应体超 SetMaxBodySize 上限
     ZM_HTTPC_ERR_UNSUPPORTED,     ///< 不支持的协议(如非 http/https)
 };
 
@@ -45,11 +46,13 @@ public:
     // ── 请求体(四选一,后设覆盖)──
     ZmHttpClientRequest& SetBody(const void* data, size_t len);
     ZmHttpClientRequest& SetBodyJson(const ZMJSON& json);     ///< Content-Type: application/json
+    ZmHttpClientRequest& SetBodyForm(const std::map<std::string, std::string>& fields); ///< URL 编码表单;Content-Type: application/x-www-form-urlencoded
     ZmHttpClientRequest& SetBodyFile(const char* path);       ///< 文件上传(读取失败在请求错误中体现)
     ZmHttpClientRequest& SetUploadStream(std::function<std::string()> onUploadChunk); ///< chunked 流式上传;返回空串 = 结束
 
     // ── 超时(秒,0 = 不限制)──
-    ZmHttpClientRequest& SetConnectTimeout(int seconds);      ///< 连接超时(秒,0 = 不限制,用 libevent 默认 45s);同时作用于读写超时(0 时读写用 libevent 默认 50s),默认 10;流式请求在响应头到达后由本连接超时(读写)接管空闲保护,SSE 心跳间隔需小于此值
+    ZmHttpClientRequest& SetConnectTimeout(int seconds);      ///< 连接超时(秒,0 = 不限制,用 libevent 默认 45s),默认 10;读写超时由 SetReadWriteTimeout 独立控制,未设置时跟随本值
+    ZmHttpClientRequest& SetReadWriteTimeout(int seconds);    ///< 读写超时(秒,0 = 跟随连接超时;连接超时为 0 时读写用 libevent 默认 50s);流式请求在响应头到达后由本超时接管空闲保护,SSE 心跳间隔需小于此值
     ZmHttpClientRequest& SetTotalTimeout(int seconds);        ///< 默认 30;流式开始后自动取消
 
     // ── 重定向 ──
@@ -57,6 +60,7 @@ public:
 
     // ── 代理 ──
     ZmHttpClientRequest& SetProxy(const char* host, uint16_t port);
+    ZmHttpClientRequest& SetProxyAuth(const char* user, const char* pass); ///< 代理认证(user:pass 经 base64 → Proxy-Authorization: Basic ...;null 按空串);仅发代理(逐跳头),不带入目标请求
 
     // ── 认证 ──
     ZmHttpClientRequest& SetBasicAuth(const char* user, const char* pass);  ///< Basic 认证(user:pass 经 base64 → Authorization: Basic ...;null 按空串)
@@ -71,6 +75,9 @@ public:
     ZmHttpClientRequest& SetOnDataChunk(std::function<void(const BYTE* data, size_t len)> cb); ///< 流式下载
     ZmHttpClientRequest& SetOnSseEvent(std::function<void(const std::string& data)> cb);       ///< SSE 逐事件
     ZmHttpClientRequest& SetProgressCallback(std::function<void(int64_t sent, int64_t total)> cb);
+
+    // ── 响应体上限 ──
+    ZmHttpClientRequest& SetMaxBodySize(uint64_t bytes);      ///< 响应体大小上限(解压后字节口径;0 = 不限制,默认);超限 → ZM_HTTPC_ERR_RESPONSE_TOO_LARGE(流式请求在增量分发时中止,全量在收口时报错)
 
     // ── 消费方式 ──
     // SetOutputFile:路径为调用方责任(建议绝对路径;进程 ACP 编码,中文路径需按系统代码页;
@@ -90,12 +97,15 @@ public:
     const std::string& BodyFile() const { return m_bodyFile; }
     std::function<std::string()> UploadChunk() const { return m_uploadChunk; }
     int ConnectTimeout() const { return m_connectTimeout; }
+    int ReadWriteTimeout() const { return m_readWriteTimeout; }
     int TotalTimeout() const { return m_totalTimeout; }
     bool FollowRedirect() const { return m_followRedirect; }
     int RedirectMax() const { return m_redirectMax; }
     bool HasProxy() const { return !m_proxyHost.empty(); }
     const std::string& ProxyHost() const { return m_proxyHost; }
     uint16_t ProxyPort() const { return m_proxyPort; }
+    bool HasProxyAuth() const { return !m_proxyAuthHeader.empty(); }
+    const std::string& ProxyAuthHeader() const { return m_proxyAuthHeader; }
     bool UseCookieJar() const { return m_useCookieJar; }
     bool Gzip() const { return m_gzip; }
     int RetryCount() const { return m_retryCount; }
@@ -104,6 +114,7 @@ public:
     const std::function<void(const std::string&)>& OnSseEvent() const { return m_onSseEvent; }
     const std::function<void(int64_t, int64_t)>& Progress() const { return m_progress; }
     const std::string& OutputFile() const { return m_outputFile; }
+    uint64_t MaxBodySize() const { return m_maxBodySize; }
     int64_t Range() const { return m_range; }
     const std::string& ClientCertFile() const { return m_clientCertFile; }
     const std::string& ClientKeyFile() const { return m_clientKeyFile; }
@@ -121,14 +132,17 @@ private:
     int  m_redirectMax = 5;
     std::string m_proxyHost;
     uint16_t m_proxyPort = 0;
+    std::string m_proxyAuthHeader;   ///< Proxy-Authorization 头值(SetProxyAuth 生成;空 = 无认证)
     bool m_useCookieJar = true;
     bool m_gzip = true;
+    int  m_readWriteTimeout = 0;   ///< 读写超时(0 = 跟随连接超时)
     int  m_retryCount = 0;         ///< 0 = 不重试
     int  m_retryBaseDelayMs = 500;
     std::function<void(const BYTE*, size_t)> m_onDataChunk;
     std::function<void(const std::string&)>  m_onSseEvent;
     std::function<void(int64_t, int64_t)>  m_progress;
     std::string m_outputFile;
+    uint64_t m_maxBodySize = 0;   ///< 响应体大小上限(解压后字节;0 = 不限制)
     int64_t m_range = -1;
     std::string m_clientCertFile;
     std::string m_clientKeyFile;
@@ -195,8 +209,9 @@ public:
     bool SetClientCert(const char* certFile, const char* keyFile);   ///< mTLS 客户端证书
     void SetVerifyMode(bool verifyPeer, const char* caFile = nullptr); ///< CA 校验;false = 跳过(测试用)
 
-    // 同步:阻塞直到完成/超时;返回结果对象(调用方 delete;未启动/失败/超时亦返回错误对象,不返回 nullptr)
-    ZmHttpClientResult* Send(const ZmHttpClientRequest& req);
+    // 同步:阻塞直到完成/超时;返回结果对象(所有权归调用方,std::unique_ptr 自动释放;
+    // 未启动/失败/超时亦返回错误对象,不返回 nullptr)
+    std::unique_ptr<ZmHttpClientResult> Send(const ZmHttpClientRequest& req);
     // 异步:立即返回;回调在客户端循环线程执行,保证恰好触发一次;
     // id 由调用方自选(请用低 63 位,建议单调;高位区间 0x8000... 保留给同步请求
     // 内部使用 —— Cancel 按 id 匹配,两区间隔离防误杀)

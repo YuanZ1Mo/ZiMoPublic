@@ -11,7 +11,6 @@
 #include <functional>
 #include <mutex>
 #include <string>
-#include <vector>
 
 // 前向声明(头文件中仅通过指针使用)
 struct event_base;
@@ -19,7 +18,7 @@ class ZmReqLoopPool;
 class ZmHttpdTask;
 
 /** @brief JRPC 业务回调(loop 为本请求的 ZmReqLoop 实例)
- *  @param loop    本请求的 ZmReqLoop 实例(经 ZmReqLoopJrpc::Response 回复)
+ *  @param loop    本请求的 ZmReqLoop 实例(回复经 ZmReqLoopJrpc::ResponseJson(loop, rsp))
  *  @param reqData 请求 JSON 字符串(仅在回调期间有效) */
 using ZmReqLoopJrpcRequestCB = std::function<void(class ZmReqLoop*, const char* reqData)>;
 
@@ -49,6 +48,7 @@ public:
         REQ_LOOP_SIG_TIMEOUT  = 0x0004,   ///< deadline 到期(定时器投递,同线程)
         REQ_LOOP_SIG_RESPONSE = 0x0008,   ///< 外部请求响应到达(PostToLoop 投递,ctx=回传数据,onResponse 续体消费)
         REQ_LOOP_SIG_DONE     = 0x0010,   ///< 业务收尾(外部线程完成流式后投递,见音频模块;投递时 ctx 必须为请求的 ZmHttpdTask*)
+        REQ_LOOP_SIG_EXEC     = 0x0020,   ///< 通用执行投递(PostToLoop(fn),fn 在 ZmReqLoop 线程执行;回复 helper 收敛用)
     };
 
     /** @brief per-request 业务回调 */
@@ -82,6 +82,12 @@ public:
      *  @param deleter ctx 的释放函数;本线程消费或 epoch 丢弃时都会调用 */
     void PostToLoop(int signal, void* ctx = nullptr, std::function<void(void*)> deleter = {});
 
+    /** @brief 任意线程:投递执行函数到本 loop 线程(回复 helper 收敛用)
+     *  @param fn 在 ZmReqLoop 线程执行;投递到执行之间请求已收尾(epoch 变化)则静默丢弃
+     *  @note loop 已退出时静默丢弃(fn 及捕获数据随 Post 未创建而释放);
+     *        fn 内可安全触碰 task/per-request 状态(关闭时 join 保证执行先于销毁) */
+    void PostToLoop(std::function<void(ZmReqLoop*)> fn);
+
     // ── 仅本线程(业务回调内调用)──
     /** @brief 是否已取消(超时/断连置位;续体回调先查此标志,置位则立即退出) */
     bool          IsCancelled() const { return m_cancelled.load(); }
@@ -91,6 +97,13 @@ public:
      *  @note 原子跨线程可调用(音频/SSE 外部线程收尾先取门),但调用方须确保 loop 仍属本请求
      *        (断连后 loop 可能已被回收复用——微窗口内抢门后果为单请求静默无响应(客户端侧超时兜底),非损坏) */
     bool          TryReply();
+
+    /** @brief 服务器关闭中标志:ZmReqLoopPool::Shutdown 置位后,回复 helper 先查此门
+     *  @note 缩窄外部线程在关闭窗口内调 Response* 的 UAF 窗口(门只拦"关闭已开始"的调用;
+     *        关闭完成后调用任何 helper 仍属契约外,须业务层 gone 标志兜底) */
+    bool          IsClosing() const { return m_closing.load(); }
+    /** @brief 置位关闭标志(仅 ZmReqLoopPool::Shutdown 调用,join 前置位) */
+    void          MarkClosing() { m_closing.store(true); }
     /** @brief 取消 deadline 定时器(流式开始后自动调用,见 ZmReqLoopRest) */
     void          CancelDeadline();
     /** @brief 注册客户端断开清理回调(仅本线程,业务入口内调用)
@@ -121,7 +134,7 @@ protected:
     virtual void OnStopping() override;
 
     /** @brief 请求状态清空钩子(ClearRequestState 末尾调用,仅本线程);
-     *  子类覆写以清理 per-request 私有成员(如 ZmReqLoopJrpc::m_reply) */
+     *  子类覆写以清理 per-request 私有成员(如 ZmReqLoopRest 流式状态) */
     virtual void OnRequestReleased() {}
 
 private:
@@ -131,6 +144,7 @@ private:
         uint64_t                  epoch;    ///< 投递时 ZmReqLoop 的代际
         void*                     ctx;
         std::function<void(void*)> deleter;
+        std::function<void(ZmReqLoop*)> exec;   ///< REQ_LOOP_SIG_EXEC 执行函数(捕获回复参数数据)
         ~Post() { if (deleter) deleter(ctx); }   ///< 丢弃/消费统一释放
     };
 
@@ -144,6 +158,8 @@ private:
     void ProcessResponse(Post& p);   ///< 外部响应续体(onResponse;ctx 经 GetResponseCtx 取)
     void ProcessDeadline();          ///< onTimeout(可选)→ 缺省 504
     void ProcessDone(Post& p);       ///< 外部线程流式收尾:TryReply + Release
+    void ProcessExec(Post& p);       ///< 通用执行投递:执行 p.exec(this)
+    void OnRequestAborted();         ///< 业务异常隔离兜底:当前请求 500 收尾 + Release(loop 继续服务)
     void ClearRequestState();        ///< 清 task/handlers、del deadline、epoch++
 
     struct event_base* m_evbase;      ///< 本线程的事件循环
@@ -161,68 +177,16 @@ private:
     // ── per-request(本线程独占;ProcessStart 写入,Release 清空)──
     ZmHttpdTask*       m_task;
     Handlers           m_handlers;
-    void*              m_responseCtx = nullptr;  ///< onResponse 续体的 ctx(仅 A 线程)
+    void*              m_responseCtx = nullptr;  ///< onResponse 续体的 ctx(仅 ZmReqLoop 线程)
     std::atomic<uint64_t> m_epoch;    ///< 代际:Release 时 ++;投递包携带投递时快照
     std::atomic<bool>  m_replied;
     std::atomic<bool>  m_cancelled;
+    std::atomic<bool>  m_closing{false};   ///< 服务器关闭标志(Shutdown 置位,回复门)
 
     ZmReqLoopPool*     m_pool;
 };
 
-/** @brief 池回收桥:ZmReqLoop::Release 经此回池。
- *  本头仅前向声明 ZmReqLoopPool(成员调用需完整类型),故经自由函数间接调用;
- *  定义位于 zm_net_req_loop.cpp(ZmReqLoopPoolReturn 内 pool->Release(loop)) */
-void ZmReqLoopPoolReturn(class ZmReqLoopPool* pool, class ZmReqLoop* loop);
-
-/**
- * @brief ZmReqLoop 池:预创建 + 扩容(上限) + 排队(doer 线程等待,不阻塞 HTTP 事件循环)
- *
- * 每台 HTTP 服务器各自持有一个实例。排队等待以 50ms 片轮询,谓词 =
- * (有空闲 ZmReqLoop || abort 标志置位(客户端已断));带超时,超时返回 nullptr(调用方回 503)。
- */
-class ZmReqLoopPool
-{
-public:
-    ZmReqLoopPool();
-    ~ZmReqLoopPool();
-
-    /** @brief 初始化:预创建 + 扩容上限 + 业务预算
-     *  @param preCreate     预创建数(建议 hardware_concurrency,低并发可调小)
-     *  @param maxCount      扩容上限(= 并发业务上限)
-     *  @param businessBudgetMs 业务预算毫秒(deadline = 请求到达 + 预算) */
-    bool Init(int preCreate, int maxCount, uint32_t businessBudgetMs);
-
-    /** @brief 获取空闲 ZmReqLoop;无空闲且未达上限则扩容;达上限排队
-     *  @param timeoutMs  排队等待上限(剩余预算)
-     *  @param abort      可空;非空时该原子标志置位则提前放弃(客户端已断)
-     *  @return 空闲 ZmReqLoop,失败(超时/中止/关闭)返回 nullptr */
-    ZmReqLoop* Acquire(int timeoutMs, const std::atomic<bool>* abort);
-
-    /** @brief 归还空闲 ZmReqLoop(ZmReqLoop::Release 内部调用) */
-    void Release(ZmReqLoop* loop);
-
-    /** @brief 关闭:停止全部 ZmReqLoop 线程(join)并释放(在飞业务受 deadline 约束,可 join 完成)
-     *  @warning 调用方须保证无在飞 Acquire 结果仍被使用(先停请求入口,再 Shutdown;
-     *           在飞业务受 deadline 约束可 join 完成) */
-    void Shutdown();
-
-    /** @brief 业务预算毫秒 */
-    uint32_t BudgetMs() const { return m_budgetMs; }
-
-    /** @brief 设置 loop 工厂(默认 new ZmReqLoop();JRPC 池需产出 ZmReqLoopJrpc 以承载 per-request 回复函数)
-     *  @note 必须在 Init() 之前调用,否则预创建出的仍是基类实例
-     *  @note 工厂必须返回非空实例(返回 nullptr 将导致 SetPool 空解引用) */
-    void SetLoopFactory(std::function<ZmReqLoop*()> factory) { m_factory = std::move(factory); }
-
-private:
-    std::vector<ZmReqLoop*> m_all;    ///< 全部实例(含 busy)
-    std::vector<ZmReqLoop*> m_idle;   ///< 空闲栈
-    std::function<ZmReqLoop*()> m_factory;   ///< loop 工厂(未设置时创建基类 ZmReqLoop)
-    std::mutex              m_mutex;
-    std::condition_variable m_cv;
-    int                     m_maxCount;
-    uint32_t                m_budgetMs;
-    bool                    m_shutdown;
-};
+// ZmReqLoop::Release 经自由函数 ZmReqLoopPoolReturn 回池;声明与 ZmReqLoopPool
+// 同位于 zm_net_req_loop_pool.h(zm_net_req_loop.cpp include 之)。
 
 #endif // ZM_NET_REQ_LOOP_H
