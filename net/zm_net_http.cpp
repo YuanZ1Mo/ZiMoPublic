@@ -485,6 +485,25 @@ ev_uint16_t ZmHttpdTask::Port()
     return port;
 }
 
+bool ZmHttpdTask::IsHttps()
+{
+    // 请求可能为 nullptr（对象池预创建场景，见构造器注释）
+    if (!m_request)
+        return false;
+
+    struct evhttp_connection* con = evhttp_request_get_connection(m_request);
+    if (!con)
+        return false;
+
+    struct bufferevent* bev = evhttp_connection_get_bufferevent(con);
+    if (!bev)
+        return false;
+
+    // 非 SSL bufferevent 返回 nullptr（libevent 源码 bufferevent_openssl.c:
+    // bufferevent_openssl_get_ssl → bufferevent_ssl_upcast 失败即 NULL）
+    return bufferevent_openssl_get_ssl(bev) != nullptr;
+}
+
 uint64_t ZmHttpdTask::Id()
 {
     return m_id;

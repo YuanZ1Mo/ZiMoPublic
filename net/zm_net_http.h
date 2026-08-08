@@ -243,6 +243,14 @@ public:
     const char* Ip();
     ev_uint16_t Port();
 
+    /**
+     * @brief 查询当前请求连接是否为 HTTPS(TLS)
+     * @return true 该请求经由 TLS 连接到达(底层为 SSL bufferevent)
+     * @note 遍历 evhttp_connection → bufferevent 判定,与 Ip()/Port() 同模式;
+     *       纯 HTTP 服务器实例(如 HTTPS 模式下的 80 端口重定向服务器)恒为 false
+     */
+    bool IsHttps();
+
     /** @brief 获取请求的唯一追踪 ID（自增序号，从 1 开始，进程内唯一） */
     uint64_t Id();
 
