@@ -17,6 +17,7 @@
 #include <../libevent/include/event2/util.h>
 
 #include <algorithm>
+#include <chrono>
 #include <thread>
 
 // ============================================================================
@@ -269,6 +270,22 @@ void ZmBroadcastServer::DoStart()
 // ============================================================================
 
 void ZmBroadcastServer::Stop()
+{
+    AsyncStop();
+
+    // 同步等待事件循环线程完成 DoStop(仅非 loop 线程需要;
+    // loop 线程内 ScheduleTask 已同步执行,状态即刻为 STOPPED)
+    if (std::this_thread::get_id() != m_loopThreadId)
+    {
+        for (int i = 0; i < 100 && m_state.load() != ZM_BC_STATE_STOPPED; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (m_state.load() != ZM_BC_STATE_STOPPED)
+            DEFAULT_LOG_WARN("[BcServer] Stop sync wait timeout, state={}",
+                (int)m_state.load());
+    }
+}
+
+void ZmBroadcastServer::AsyncStop()
 {
     ZM_BROADCAST_STATE expected = ZM_BC_STATE_LISTENING;
     if (!m_state.compare_exchange_strong(expected, ZM_BC_STATE_STOPPING))

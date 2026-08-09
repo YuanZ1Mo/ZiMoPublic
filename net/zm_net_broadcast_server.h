@@ -147,8 +147,19 @@ public:
      */
     bool Start();
 
-    /** @brief 停止服务端，直接断开所有客户端连接并释放资源 */
+    /**
+     * @brief 同步停止服务端:投递停止任务并等待事件循环线程完成(断开客户端/释放资源)
+     * @note 内部 = AsyncStop() + 等待状态回到 STOPPED(超时 1s 兜底);
+     *       在事件循环线程内调用时等同于 AsyncStop(任务已同步执行,无需等待)
+     */
     void Stop();
+
+    /**
+     * @brief 异步停止服务端:仅投递停止任务后立即返回,停止动作由事件循环线程稍后执行
+     * @note 停止完成标志 = GetState() == ZM_BC_STATE_STOPPED;
+     *       需要同步等待的调用方请使用 Stop()
+     */
+    void AsyncStop();
 
     // --- 状态查询（线程安全） ---
 
