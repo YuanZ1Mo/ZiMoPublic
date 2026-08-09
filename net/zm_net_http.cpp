@@ -859,9 +859,33 @@ public:
     /** @brief 将默认响应头和业务层自定义响应头写入 libevent 请求（SendReply / SendReplyStart 共用） */
     void WriteResponseHeaders()
     {
-        PutReplyHeader("Access-Control-Allow-Origin", "*");
+        // CORS:浏览器带 Origin 时回显精确值并允许凭据(cookie 跨端口同站场景,
+        // 如页面 443 → REST 39441);无 Origin(非浏览器/curl)保持通配 * 兼容。
+        // 注:Allow-Origin 通配 * 与 Allow-Credentials 同时出现会被浏览器拒绝,故二选一。
+        const char* reqOrigin = m_request
+            ? evhttp_find_header(evhttp_request_get_input_headers(m_request), "Origin")
+            : nullptr;
+        if (reqOrigin && *reqOrigin)
+        {
+            PutReplyHeader("Access-Control-Allow-Origin", reqOrigin);
+            PutReplyHeader("Access-Control-Allow-Credentials", "true");
+            // 凭据模式下 Allow-Headers 通配符 * 不生效(Fetch 规范),须显式列出;
+            // 优先回显预检请求声明的头列表,兜底 Content-Type(前端仅用此头)
+            const char* reqHeaders = m_request
+                ? evhttp_find_header(evhttp_request_get_input_headers(m_request),
+                    "Access-Control-Request-Headers")
+                : nullptr;
+            if (reqHeaders && *reqHeaders)
+                PutReplyHeader("Access-Control-Allow-Headers", reqHeaders);
+            else
+                PutReplyHeader("Access-Control-Allow-Headers", "Content-Type");
+        }
+        else
+        {
+            PutReplyHeader("Access-Control-Allow-Origin", "*");
+            PutReplyHeader("Access-Control-Allow-Headers", "*");
+        }
         PutReplyHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-        PutReplyHeader("Access-Control-Allow-Headers", "*");
         PutReplyHeader("ZmHttpServer-Version", ZIMO_SERVER_VERSION);
 
         // ★ HSTS：仅在 HTTPS 模式下启用，告知浏览器"永远用 HTTPS 访问本站"
