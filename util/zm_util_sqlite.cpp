@@ -62,6 +62,21 @@ bool ZmSqliteConn::Exec(const char* sql)
     return true;
 }
 
+bool ZmSqliteConn::Begin()
+{
+    return m_db && sqlite3_exec(m_db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) == SQLITE_OK;
+}
+
+bool ZmSqliteConn::Commit()
+{
+    return m_db && sqlite3_exec(m_db, "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK;
+}
+
+bool ZmSqliteConn::Rollback()
+{
+    return m_db && sqlite3_exec(m_db, "ROLLBACK", nullptr, nullptr, nullptr) == SQLITE_OK;
+}
+
 int64_t ZmSqliteConn::LastInsertRowId() const
 {
     return m_db ? sqlite3_last_insert_rowid(m_db) : 0;

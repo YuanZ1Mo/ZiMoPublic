@@ -47,6 +47,15 @@ public:
     /** @brief sqlite3_exec 执行;失败记 "[tag] exec failed: sql err=" 日志并返回 false */
     bool Exec(const char* sql);
 
+    /**
+     * @brief 事务辅助:BEGIN IMMEDIATE / COMMIT / ROLLBACK
+     *        仅允许在调用方已持 Mutex() 的语句序列内配对使用(单连接串行,无并发代价);
+     *        任一语句失败 → 调用方 Rollback 后返回错误,避免多语句中间态(崩溃自动回滚)
+     */
+    bool Begin();
+    bool Commit();
+    bool Rollback();
+
     /** @brief 替代裸调用 sqlite3_last_insert_rowid / sqlite3_changes / sqlite3_extended_errcode */
     int64_t LastInsertRowId() const;
     int     Changes() const;
