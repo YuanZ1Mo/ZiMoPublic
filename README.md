@@ -1,6 +1,6 @@
 # ZiMoPublic
 
-ZiMo 生态的 C++ 公共基础库，为 ZiMoService 及其他上层项目提供网络通信、Windows 服务框架、SSL/TLS 安全、日志、JSON 处理、线程工具等通用能力。
+ZiMo 生态的 C++ 公共基础库，为 ZiMoService 及其他上层项目提供网络通信、Windows 服务框架、SSL/TLS 安全、日志、JSON 处理、SQLite、线程工具等通用能力。
 
 ## 模块总览
 
@@ -9,13 +9,15 @@ ZiMoPublic/
 ├── define/          # 通用宏定义、版本号
 ├── json/            # nlohmann/json 封装（类型安全的读写辅助）
 ├── libevent/        # 预编译 libevent 头文件及静态库（事件驱动网络库）
-├── net/             # 网络通信模块（TCP/HTTP 服务端与客户端/RESTful/DNS/ZmReqLoop 请求调度/路由中间件/消息广播/SSE）
+├── libopus/         # 预编译 Opus 头文件及静态库（音频编码）
+├── net/             # 网络通信模块（TCP/HTTP 服务端与客户端/RESTful/DNS/事件循环线程/请求调度/路由中间件/消息广播/SSE）
 ├── openssl/         # 预编译 OpenSSL 头文件及静态库
 ├── service/         # Windows 服务基类（SCM 集成、安装/卸载）
 ├── spdlog/          # 定制版 spdlog 日志库 + zm_logger 封装
-├── ssl/             # SSL/TLS 上下文管理、证书指纹校验
-├── util/            # 通用工具（线程、字符串、文件、容器、加密、系统）
-├── zlib/            # zlib 1.3.1 头文件及静态库（gzip/deflate 解压，HTTP 客户端自动解压用）
+├── sqllite/         # SQLite amalgamation 源码（sqlite3.c/h，编译时引入）
+├── ssl/             # SSL/TLS 上下文管理、证书指纹校验、session ticket
+├── util/            # 通用工具（线程、字符串、文件、容器、SQLite、zip、系统）
+├── zlib/            # zlib 1.3.1 头文件及静态库（gzip/deflate 解压、zip 写入）
 ```
 
 ## 各模块详解
@@ -50,6 +52,14 @@ ZiMoPublic/
 类型别名：`using ZMJSON = nlohmann::ordered_json;`
 
 ### net — 网络通信
+
+#### zm_net_runloop — 事件循环线程
+
+| 类 | 说明 |
+|----|------|
+| `ZmEvBaseRunLoop` | 自带 libevent 事件循环的线程（`ZmThread` 子类）：`Loop()` 启动并等待就绪、`Control()` 投递控制事件（含 EXIT）、`GetEventBase()`/`GetEventDnsBase()`；内置 60 秒心跳定时器 |
+
+为广播服务端、HTTP 客户端等自持事件循环的模块提供基础线程骨架。
 
 #### zm_net_ip — IP 地址与协议头
 
@@ -92,18 +102,24 @@ ZiMoPublic/
 | 类 | 说明 |
 |----|------|
 | `ZmHttpUtil` | HTTP 工具：动词解析、请求解析、URI 解析、Query 参数提取 |
-| `ZmHttpdTask` | HTTP 请求上下文：读取 URI/方法/请求头，写入响应状态码/头/体，支持流式分块回复 |
+| `ZmHttpdTask` | HTTP 请求上下文：读取 URI/方法/请求头，写入响应状态码/头/体，支持流式分块回复；`IsHttps()` 判断连接是否 TLS；`SetRateLimit`/`JoinRateLimitGroup` 单连接/分组限速；连接关闭通知 |
 | `ZmHttpHead` | HTTP 头部封装：解析、构建、键值查询 |
-| `ZmHttpServer` | 多线程 HTTP 服务器：每个请求分配独立 Worker 线程处理，不阻塞事件循环 |
+| `ZmHttpServer` | HTTP/HTTPS 服务器：构造传入证书即启用 TLS（可选 HTTP→HTTPS 301 重定向端口、TLS 会话缓存）；多线程 Worker + doer 池化；证书热加载、HSTS、session ticket 密钥注入/轮换；可选集成 `ZmReqLoopPool`（`EnableLoopPool`） |
 | `ZmJsonRpcServer` | JSON-RPC 2.0 服务器：协议解析与分发，支持 GET（Base64）/POST、JSONP 回调 |
 | `ZmRESTfulServer` | ★ RESTful HTTP 服务器：继承 ZmHttpServer，支持异步回调 + `TriggerReply()` 直通响应 |
 
 关键设计：
 - **线程模型**：事件循环线程接收请求 → Worker 线程处理 → event_active 通知事件循环线程发送响应
-- **CORS 支持**：自动添加跨域响应头
-- **即时释放**：Worker 资源即时释放（池化复用），减少内存占用
+- **HTTPS/TLS**：构造参数 `certFile`/`keyFile` 非空即启用；`redirect_from_port` 自动把 HTTP 请求 301 到 HTTPS；`sessionCacheSize`/`sessionContext` 启用 TLS 会话缓存；HTTPS 模式自动发送 HSTS 头
+- **证书热加载**：`ReloadCertificate()` 原子替换 SSL_CTX（事件循环线程内操作），旧 ctx 延时 5 分钟释放，现有 TLS 连接不受影响；热加载后自动补设 session cache 与 ticket 密钥
+- **Session Ticket**：`SetTicketKeys()`/`PostSetTicketKeys()`（80 字节，投递到事件循环线程执行，避免与并发握手竞争）
+- **限速**：`ZmHttpdTask::SetRateLimit()` 单连接独立限速（收发独立 bps，动态可调）；`JoinRateLimitGroup()` 多连接共享带宽池，可与单连接限速叠加取最小值
+- **连接关闭通知**：closecb 广播到该连接所有在飞 doer（流式断连检测）
+- **CORS 支持**：自动添加跨域响应头；浏览器带 `Origin` 时回显精确值并允许凭据
+- **即时释放**：Worker 资源即时释放（doer 池化复用），减少内存占用
 - **SSE 推送**：支持 `StartStreamReply`/`SendReplyChunk`/`EndStreamReply` 流式分块响应（text/event-stream）
 - **请求头透传**：Worker 线程可通过 `ZmHttpdTask` 读写请求头/响应头，支持业务侧自定义头部
+- **业务事件循环池**：`EnableLoopPool()` 启用 `ZmReqLoopPool`（预创建/扩容/预算 deadline/断连放弃），`SetLoopPoolFactory()` 供派生类注入 per-request 状态（JRPC→`ZmReqLoopJrpc`）；`BeginClose()`/`DrainWorkers()` 消除关闭期 doer 与池销毁竞态
 
 #### zm_net_http_router — HTTP 路由中间件
 
@@ -117,7 +133,7 @@ ZiMoPublic/
 
 #### zm_net_http_client — HTTP/S 客户端（自带事件循环线程）
 
-基于 libevent evhttp + OpenSSL + zlib 的完整 HTTP/HTTPS 客户端。每个 `ZmHttpClient` 实例持有独立事件循环线程（event_base + evdns_base），任意线程可安全调用；单实例并发请求由连接池承载，`ZmHttpClientPool` 提供实例级池化（预创建 + 扩容 + 排队）。
+基于 libevent evhttp + OpenSSL + zlib 的完整 HTTP/HTTPS 客户端。每个 `ZmHttpClient` 实例持有独立事件循环线程（event_base + evdns_base，由 `ZmHttpClientLoop` 承载），任意线程可安全调用；单实例并发请求由连接池承载，`ZmHttpClientPool` 提供实例级池化（预创建 + 扩容 + 排队）。
 
 | 类 | 说明 |
 |----|------|
@@ -143,6 +159,12 @@ ZiMoPublic/
 错误码：`ZM_HTTPC_ERR_CONNECT` / `CONNECT_TIMEOUT` / `TIMEOUT` / `CANCELLED` / `PARSE` / `FILE_IO` / `STREAM_BROKEN` / `SSL` / `PROXY` / `REDIRECT` / `RESPONSE_TOO_LARGE` / `UNSUPPORTED`。
 
 **线程模型**：单循环线程内零锁；任意线程经 `event_base_once` 投递；回调（SSE/数据块/进度/异步完成）全部在循环线程执行，回调内勿做重活、勿同步重入本客户端。
+
+#### zm_net_http_client_loop — 客户端事件循环线程
+
+| 类 | 说明 |
+|----|------|
+| `ZmHttpClientLoop` | `ZmHttpClient` 的自带事件循环线程（仿 `ZmEvBaseRunLoop`，定制为无心跳定时器）：`Start()` 启动并等待 event_base 就绪、`Stop()` 退出循环（join），event_base/evdns_base 线程内创建与释放 |
 
 #### zm_net_req_loop — per-request 事件循环线程 + ZmReqLoopPool 池（事件驱动，池随基类同文件）
 
@@ -180,6 +202,7 @@ ZiMoPublic/
 
 **服务端特性：**
 - 端口绑定失败无限重试、6 状态流转（IDLE→STARTING→LISTENING→STOPPING→STOPPED + ERROR）
+- 同步停止 `Stop()`（投递停止任务并等待事件循环完成，1s 超时兜底）/ 异步停止 `AsyncStop()`（完成标志 = `GetState() == STOPPED`）
 - 客户端握手：settings → confirm_settings → 分配 client_id（握手超时可配）
 - 双向活动检测心跳（服务端主导 ping/pong，活跃通信时零心跳开销）
 - Tag 过滤订阅/取消（subscribe/unsubscribe），仅推送给匹配客户端
@@ -231,8 +254,10 @@ ZiMoPublic/
 | 结构体/类 | 说明 |
 |-----------|------|
 | `ZM_X509_INFO` | X509 证书信息结构体（版本/有效期/序列号/颁发者/主题） |
-| `ZmSSLContext` | SSL 上下文管理器：证书/密钥加载、PKCS12 解析、X509 解析、客户端 SSL_CTX 创建 |
+| `ZmSSLContext` | SSL 上下文管理器：证书/密钥加载、PKCS12 解析、X509 解析、客户端 SSL_CTX 创建、ticket appdata 回调注册（预留能力） |
 | `ZmMemoryBIO` | OpenSSL 内存 BIO 的 RAII 封装 |
+| `ZmSessionTicketManager` | Session Ticket 密钥管理：加载/生成密钥文件、`Key()` 供服务器注入 |
+| `ZmTicketKeyRotator` | Ticket 密钥定时轮换器：内部持有独立 `ZmEvBaseRunLoop` 线程，按间隔自动轮换（如 12 小时）并回调通知；多个 HTTPS 服务器可共享同一实例统一密钥 |
 
 支持：
 - PEM / PKCS12（PFX）格式证书加载
@@ -241,6 +266,7 @@ ZiMoPublic/
 - 国密 SM2 证书兼容
 - 证书信息提取与日志输出
 - SSL 指纹校验
+- Session ticket 密钥注入/轮换（`ZmTicketKeyRotator::Init(ticketFile)` + `Start(interval, onRotate)`，旋转后调用 `ZmHttpServer::SetTicketKeys`）
 
 #### zm_ssl_fingerprint — 证书指纹白名单
 
@@ -284,13 +310,28 @@ PUBLIC_LOG_ERROR(...)    PUBLIC_LOG_CRITICAL(...)
 | 文件 | 说明 |
 |------|------|
 | `zm_util_thread.h` | `ZmThread` — 基于 C++20 `std::jthread` 的线程封装（同步启停、状态管理、协作停止、AutoDelete）；`ZmThreadPool` — 线程池（立即/延迟执行、自动增长、任务取消） |
-| `zm_util_str.h` | 字符串工具：Unicode/ANSI 适配（`String` typedef）、编码转换（UTF8_To_Unicode/Unicode_To_UTF8 含 std::string/std::wstring 重载）、URL 编解码（URLDecode 含 std::string 重载）、`zm_strndup`、`zm_strsep` |
-| `zm_util_container.h` | 容器工具：动态数组（`ZmArrayList`）、字节缓冲区（`ZmByteBuffer`）、字符串列表（`ZmStringList`） |
-| `zm_util_crypto.h` | 加密工具 |
-| `zm_util_file.h` | 文件 I/O 工具：`Read`/`Write`/`ReadString`/`ReadEx`、`Copy`/`Rename`/`Delete`/`DeleteDir`、`Exists`/`IsDirectory`/`GetSize`、`MakeDirs`、`MD5HashHex` |
-| `zm_util_libevent.h` | libevent 辅助函数 |
-| `zm_util_sys.h` | 系统工具 |
-| `zm_util_win_os.h` | Windows 操作系统相关工具 |
+| `zm_util_str.h` | 字符串工具：`String` typedef（Unicode/ANSI 适配）、`ZmString` 工具类（编码转换、格式化、查找替换、Base64/Base32、URL 编解码、Hex 等）、`ZmStringList` 字符串列表、`zm_strndup`、`zm_strsep` |
+| `zm_util_container.h` | 容器工具：动态数组（`ZmArrayList`）、字节缓冲区（`ZmByteBuffer`）、对象池（`ZmObjectPool`）、二进制表（`ZmBinaryTable`） |
+| `zm_util_file.h` | `ZmFile` 文件 I/O 静态工具：读取（全量/分块回调/文本）、写入（覆盖/追加）、复制/重命名/删除/递归删目录、存在/目录判断/大小、路径解析（文件名/扩展名/目录/exe 目录）、`MD5HashHex` |
+| `zm_util_libevent.h` | libevent 辅助：`ZmEventBuffer`/`ZmEventLine`（事件缓冲区读写）、`ZmSocketReuseType` 等 |
+| `zm_util_sqlite.h` | SQLite 轻量封装：`ZmSqliteConn`（RAII 连接/事务辅助/错误日志）、`ZmSqliteStmt`（RAII 预处理语句）、`BindText`/`BindInt` bind 便捷 |
+| `zm_util_sys.h` | 系统工具：`ZmSystem`（时间/错误信息/系统信息/路径/环境变量/进程）、`ZmSystemLoad`、`ZmSingleInstance`（命名互斥体单实例守卫）、DLL 动态加载 |
+| `zm_util_win_os.h` | Windows 系统工具：`OS_VERSION`/`OSVersion()` 版本查询与系统版本判断、`POWER_OPTIONS` 电源操作 |
+| `zm_util_zlib.h` | `ZipWriter` — 流式 zip 写入器（仅写入不解压）：raw deflate + CRC-32，按条目生成、`Drain()` 取走字节（内存 O(单条目)），`Finish()` 写 central directory + EOCD |
+
+#### zm_util_sqlite — SQLite 轻量封装（zm 命名空间）
+
+| 类 | 说明 |
+|----|------|
+| `ZmSqliteConn` | RAII 连接包装：`Open(path, logTag)`（READWRITE \| CREATE \| FULLMUTEX）、`Close`（幂等）、`Exec`（失败记日志）、`Begin`/`Commit`/`Rollback` 事务辅助（BEGIN IMMEDIATE）、`LastInsertRowId`/`Changes`/`ExtendedErrorCode`、`Raw()`、`Mutex()` |
+| `ZmSqliteStmt` | RAII 预处理语句：`prepare_v2`，失败时 `p == nullptr` 由调用方判空 |
+| `BindText`/`BindInt` | bind 便捷（SQLITE_TRANSIENT / sqlite3_bind_int64） |
+
+线程安全契约（重要）：
+- 每连接一个 `std::mutex`，经 `Mutex()` 暴露给调用方
+- 类内方法一律不加锁，由调用方在多语句序列外持锁（`std::lock_guard lk(conn.Mutex())`）；MSVC 对非递归互斥量重复加锁抛异常，禁止类内加锁后调用方再加锁
+- 不做行/列读取包装：业务代码直接经 `ZmSqliteStmt::p` 调用 `sqlite3_step`/`sqlite3_column_*`/`sqlite3_bind_*`，与裸 SQLite 等价
+- 保持 SQLite 默认行为（不做 journal/WAL/busy_timeout 设置）
 
 #### ZmThread 状态流转
 
@@ -309,18 +350,43 @@ STOPPED →(Start) STARTING → RUNNING →(Stop) STOPPING → STOPPED
 - `InvokeLater` / `InvokeCancel` 全局接口
 - Worker 自动增长（上限 128）
 
-### libevent / openssl / zlib — 第三方预编译库
+#### ZipWriter — 流式 zip 写入
+
+```cpp
+ZipWriter w;
+w.BeginEntry("a.txt", false);
+w.Write(data, len); ...        // 可分块调用，内部边压边积
+w.EndEntry();
+w.BeginEntry("empty/", true);  // 空目录条目
+w.EndEntry();
+w.Finish();                    // 写 central directory + EOCD
+// Data() / Drain(out) 取走字节（流式发送，内存 O(单条目)）
+```
+
+格式按 APPNOTE（Local File Header + raw deflate + Central Directory + EOCD），压缩用 zlib raw deflate（deflateInit2 windowBits=-15）+ crc32()，零新增第三方库。
+
+### sqllite — SQLite 数据库
+
+SQLite amalgamation 单文件源码（sqlite3.c / sqlite3.h / sqlite3ext.h / shell.c），由上层项目直接编译进工程，无需单独链接外部库。
+
+使用方式：
+- 编译时引入 `sqlite3.c`（可定义 `SQLITE_THREADSAFE=1` 等编译宏）
+- 业务侧经 `util/zm_util_sqlite.h` 的 `ZmSqliteConn`/`ZmSqliteStmt` 封装使用
+- ZiMoService 中的 `DbInitializer` 以声明式建表/补列，模块注入连接，见 Service 仓库
+
+### libevent / openssl / zlib / libopus — 第三方预编译库
 
 - **libevent**：事件驱动网络库，提供 `event_base`、`evhttp`、`evdns`、`bufferevent` 等
 - **openssl**：SSL/TLS 加密库，提供 `SSL_CTX`、`BIO`、`X509` 等
-- **zlib**：gzip/deflate 数据压缩库（zlib 1.3.1，`zlibstatic.lib`），HTTP 客户端响应自动解压用
+- **zlib**：gzip/deflate 数据压缩库（zlib 1.3.1，`zlibstatic.lib`），HTTP 客户端响应自动解压、`ZipWriter` 压缩用
+- **libopus**：Opus 音频编解码库，`opus.lib` 静态库，音频模块（如 ZiMoService 语音通话）使用
 
-三个库均以预编译头文件 + 静态库形式引入，无需单独编译。目录布局与 libevent/openssl 一致：
+各库均以预编译头文件 + 静态库形式引入，无需单独编译。目录布局一致：
 
 ```
-zlib/
-├── include/          # zlib.h + zconf.h
-└── lib/VC/x64/MT/    # zlibstatic.lib
+<lib>/
+├── include/          # 头文件
+└── lib/VC/x64/MT/    # 静态库（libopus 为 opus.lib，zlib 为 zlibstatic.lib）
 ```
 
 注意：`zconf.h` 由 CMake 构建时生成（不在 zlib 源码包内），重新编译 zlib 后需同步复制 `zconf.h` 与 `Release\zlibstatic.lib` 到本目录。
@@ -334,25 +400,31 @@ net ────────→ libevent
 net ────────→ zlib          (HTTP 客户端 gzip/deflate 自动解压)
 ssl ────────→ openssl
 service ────→ util
+util ────────→ sqllite      (zm_util_sqlite → sqlite3.c)
+util ────────→ zlib         (ZipWriter → raw deflate)
 define ───── (无依赖)
+libopus ───── (预编译库，无源码依赖)
 ```
 
 net 模块内部依赖：
 ```
-zm_net_req_loop          → zm_net_runloop + util（ZmThread）
+zm_net_runloop           → util（ZmThread）
+zm_net_req_loop          → util（ZmThread），事件循环结构类似 ZmEvBaseRunLoop 但独立实现
 zm_net_req_loop_protocol → zm_net_req_loop + json
-zm_net_http         → zm_net_runloop + zm_net_http_router
-zm_net_http_client  → zm_net_runloop + ssl(ZmSSLContext) + zlib + openssl + libevent
+zm_net_http              → zm_net_http_router + ssl（ticket 密钥）
+zm_net_http_client       → zm_net_http_client_loop + ssl(ZmSSLContext) + zlib + openssl + libevent
+zm_net_broadcast         → zm_net_runloop
 ```
 
 ## 构建与集成
 
-ZiMoPublic 作为源码级公共库，由上层项目（如 ZiMoService）直接引用其头文件并链接预编译的 libevent/openssl/zlib 静态库。
+ZiMoPublic 作为源码级公共库，由上层项目（如 ZiMoService）直接引用其头文件并链接预编译的 libevent/openssl/zlib/libopus 静态库。
 
 上层项目的 vcxproj 中应配置：
 - **附加包含目录**：`$(ProjectDir)..\ZiMoPublic\` 及其子目录
-- **库目录**：`libevent`、`openssl`、`zlib` 的预编译 `.lib` 路径
+- **库目录**：`libevent`、`openssl`、`zlib`、`libopus` 的预编译 `.lib` 路径
 - **强制包含**：`stdafx.h`（或对应的预编译头）
+- **SQLite**：将 `sqllite\sqlite3.c` 加入编译（或预编译后链接 `sqlite3.lib`）
 
 OpenSSL 以静态库（`libcrypto_static.lib` / `libssl_static.lib`）链接时：
 - 需定义 `OPENSSL_STATIC` 预处理器宏（头文件声明改为非 dllimport）
@@ -364,9 +436,10 @@ OpenSSL 以静态库（`libcrypto_static.lib` / `libssl_static.lib`）链接时�
 - **成员变量命名**：`m_` 前缀（结构体除外），全局变量 `g_` 前缀
 - **注释规范**：按 `@brief @param @return @example` 格式，中文注释，UTF-8 编码，LF 换行
 - **代码组织**：public → protected → private，函数与成员变量分开
-- **RAII 资源管理**：如 `ZmMemoryBIO`、`ZmWinSockHelper`、`RotatingLoggerBase`
+- **RAII 资源管理**：如 `ZmMemoryBIO`、`ZmWinSockHelper`、`ZmSqliteConn`、`RotatingLoggerBase`
 - **单例模式**：全局服务（如 `ZmSSLFingerprint::instance()`、`DefaultLogger`）
-- **回调模式**：`std::function` + 模板成员函数绑定（如 `ZmMessageServer::SetBindDoneCallback`）
+- **回调模式**：`std::function` + 事件循环线程投递（如 `ZmReqLoop` 入口/续体回调、`ZmBroadcastClient` 消息回调、`ZmHttpServer` 的 `OnHttpdRequestCB`）
+- **单事件循环线程内零锁**：跨线程操作一律经 `event_active`/`event_base_once` 投递到循环线程执行（如 `ZmHttpServer` 的 reply 控制事件、`PostSetTicketKeys`、`ZmReqLoopPool` 的 `PostToLoop`）
 
 ## 提交规范
 
