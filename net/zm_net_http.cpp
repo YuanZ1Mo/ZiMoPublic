@@ -903,6 +903,13 @@ public:
     /** @brief 发送完整 HTTP 响应（一次性），由 ZM_HTTPD_CONTROL_REPLY 触发 */
     void SendReply()
     {
+        // ★ 防御 doer 生命周期竞态(实测 _free_base/WriteResponseHeaders 崩溃):
+        //   - m_connClosed:连接已关闭(closecb 置位),evhttp 已释放 request
+        //   - m_recycled:doer 已回收入池后的残留 REPLY 信号(keep-alive 下 evhttp
+        //     已释放 request 但连接还开着,m_connClosed=false 挡不住)
+        //   两种情况都跳过发送,doer 回收由调用方 OnEventControl 的 RecycleDoer 完成。
+        if (m_connClosed.load() || m_recycled)
+            return;
         WriteResponseHeaders();
         evhttp_send_reply(m_request, m_status_code,
             m_reason.empty() ? nullptr : m_reason.c_str(), m_reply_buf);
