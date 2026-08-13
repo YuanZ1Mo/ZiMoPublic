@@ -1,7 +1,7 @@
 #include "zm_util_file.h"
 
 #include "zm_util_sys.h"
-#include "../spdlog/zm_logger.h"
+#include "zm_util_logger.h"
 
 #include <../openssl/include/openssl/evp.h>
 

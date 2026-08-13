@@ -1,10 +1,9 @@
 #include "zm_net_req_loop.h"
 
 #include "zm_net_req_loop_pool.h"   // ZmReqLoopPoolReturn(Release 回池桥声明)
-
 #include "zm_net_http.h"
-#include "zm_logger.h"
-#include "zm_util_libevent.h"
+#include "../util/zm_util_logger.h"
+#include "../util/zm_util_libevent.h"
 
 #include <windows.h>
 

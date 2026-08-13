@@ -1,7 +1,7 @@
 #include "zm_net_req_loop_protocol.h"
 
 #include "zm_net_http.h"
-#include "zm_logger.h"
+#include "../util/zm_util_logger.h"
 
 #include <io.h>   // _close(ResponseFile 失败分支依赖,显式包含避免隐性头链依赖)
 #include <vector>  // ResponseStreamStart 的 headers 打包

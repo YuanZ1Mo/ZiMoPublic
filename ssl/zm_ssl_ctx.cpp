@@ -6,7 +6,7 @@
 #include "zm_ssl_ctx.h"
 
 #include "zm_ssl_fingerprint.h"
-#include "../spdlog/zm_logger.h"
+#include "../util/zm_util_logger.h"
 #include "../util/zm_util_file.h"
 #include "../net/zm_net_runloop.h"
 

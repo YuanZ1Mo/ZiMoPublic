@@ -12,9 +12,9 @@
 #include "zm_net_ip.h"
 #include "../util/zm_util_thread.h"
 #include "../util/zm_util_libevent.h"
+#include "../util/zm_util_logger.h"
 #include "../ssl/zm_ssl_ctx.h"
 #include "../define/zm_version_define.h"
-#include "../spdlog/zm_logger.h"
 
 #include <../libevent/include/event2/bufferevent.h>
 #include <../libevent/include/event2/bufferevent_ssl.h>

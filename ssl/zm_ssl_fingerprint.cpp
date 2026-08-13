@@ -2,7 +2,7 @@
 
 #include "../net/zm_net_dns.h"
 #include "../util/zm_util_str.h"
-#include "../spdlog/zm_logger.h"
+#include "../util/zm_util_logger.h"
 
 #include <../openssl/include/openssl/ssl.h>
 

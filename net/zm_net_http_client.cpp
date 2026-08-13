@@ -176,9 +176,9 @@ const std::string& ZmHttpClientResponse::Header(const char* name) const
 }
 
 #include "zm_net_http_client_loop.h"
-#include "zm_logger.h"
-
+#include "../util/zm_util_logger.h"
 #include "../util/zm_util_str.h"     // C18:zm_strsep(SetDnsServers 手动 DNS 列表解析)
+#include "../ssl/zm_ssl_ctx.h"          // TLS(C8):ZmSSLContext::MakeClientCTX
 
 #include <../libevent/include/event2/dns.h>   // C18:evdns_base_clear_nameservers_and_suspend/nameserver_ip_add/resume
 #include <../libevent/include/event2/event.h>
@@ -188,8 +188,6 @@ const std::string& ZmHttpClientResponse::Header(const char* name) const
 #include <../libevent/include/event2/http.h>
 #include <../libevent/include/event2/keyvalq_struct.h>   // evkeyvalq 完整定义(头遍历)
 #include <../libevent/include/event2/util.h>
-
-#include "../ssl/zm_ssl_ctx.h"          // TLS(C8):ZmSSLContext::MakeClientCTX
 #include <../openssl/include/openssl/ssl.h>   // TLS(C8):SSL_new/SSL_CTX_*
 
 #include <algorithm>

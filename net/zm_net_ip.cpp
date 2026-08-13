@@ -1,7 +1,7 @@
 #include "zm_net_ip.h"
 
 #include "../util/zm_util_str.h"
-#include "../spdlog/zm_logger.h"
+#include "../util/zm_util_logger.h"
 
 #include <Iphlpapi.h>
 #pragma comment(lib, "Iphlpapi")

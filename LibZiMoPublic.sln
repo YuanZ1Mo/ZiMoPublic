@@ -1,0 +1,22 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.37314.3
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "LibZiMoPublic", "LibZiMoPublic.vcxproj", "{7ED28AD9-6CCD-40E9-A1CB-41F9350626AA}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{7ED28AD9-6CCD-40E9-A1CB-41F9350626AA}.Release|x64.ActiveCfg = Release|x64
+		{7ED28AD9-6CCD-40E9-A1CB-41F9350626AA}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {BE19EDAD-C5B4-46A5-87F9-282A5D0B7DDC}
+	EndGlobalSection
+EndGlobal

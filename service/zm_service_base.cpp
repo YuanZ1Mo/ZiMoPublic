@@ -1,6 +1,6 @@
 #include "zm_service_base.h"
 
-#include "../spdlog/zm_logger.h"
+#include "../util/zm_util_logger.h"
 
 #include <cassert>
 #include <algorithm>

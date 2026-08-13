@@ -1,6 +1,6 @@
 #include "zm_util_libevent.h"
 
-#include "../spdlog/zm_logger.h"
+#include "zm_util_logger.h"
 
 #include <../openssl/include/openssl/ssl.h>
 #include <../libevent/include/event2/event.h>

@@ -1,8 +1,8 @@
-#ifndef ZM_LOGGER_H
-#define ZM_LOGGER_H
+#ifndef ZM_UTIL_LOGGER_H
+#define ZM_UTIL_LOGGER_H
 
-#include <spdlog.h>
-#include <sinks/rotating_file_sink.h>
+#include <../spdlog/spdlog.h>
+#include <../spdlog/sinks/rotating_file_sink.h>
 
 #include <filesystem>
 #include <string>
@@ -92,4 +92,4 @@ public:
 #define PUBLIC_LOG_ERROR(...)    do { if (!g_public_logger) PublicLogger::Ensure(); SPDLOG_LOGGER_ERROR(g_public_logger, __VA_ARGS__); } while(0)
 #define PUBLIC_LOG_CRITICAL(...) do { if (!g_public_logger) PublicLogger::Ensure(); SPDLOG_LOGGER_CRITICAL(g_public_logger, __VA_ARGS__); } while(0)
 
-#endif // ZM_LOGGER_H
+#endif // ZM_UTIL_LOGGER_H

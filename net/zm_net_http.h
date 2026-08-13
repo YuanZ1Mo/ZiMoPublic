@@ -15,7 +15,7 @@
 #ifndef ZM_NET_HTTP_H
 #define ZM_NET_HTTP_H
 
-#include "../json/zm_json.h"
+#include "../util/zm_util_json.h"
 #include "../util/zm_util_str.h"
 // 需要 ZM_TICKET_KEYS_LEN(ticket 密钥长度宏),仅引入 evp.h 等轻量头,不含 openssl/ssl.h
 #include "../ssl/zm_ssl_ctx.h"

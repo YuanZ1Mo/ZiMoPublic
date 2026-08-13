@@ -7,8 +7,8 @@
 
 #include "zm_net_runloop.h"
 #include "../util/zm_util_sys.h"
-#include "../json/zm_json.h"
-#include "../spdlog/zm_logger.h"
+#include "../util/zm_util_json.h"
+#include "../util/zm_util_logger.h"
 
 #include <../libevent/include/event2/listener.h>
 #include <../libevent/include/event2/bufferevent.h>

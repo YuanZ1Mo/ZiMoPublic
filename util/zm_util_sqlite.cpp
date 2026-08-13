@@ -1,6 +1,6 @@
 #include "zm_util_sqlite.h"
 
-#include "../spdlog/zm_logger.h"
+#include "zm_util_logger.h"
 
 namespace zm {
 

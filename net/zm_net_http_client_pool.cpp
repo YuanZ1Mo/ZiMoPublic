@@ -1,7 +1,7 @@
 #include "zm_net_http_client_pool.h"
 
 #include "zm_net_http_client.h"
-#include "zm_logger.h"
+#include "../util/zm_util_logger.h"
 
 #include <chrono>
 

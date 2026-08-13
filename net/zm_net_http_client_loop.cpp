@@ -1,9 +1,9 @@
 #include "zm_net_http_client_loop.h"
 
-#include "zm_logger.h"
 #include "zm_net_dns.h"
-#include "zm_util_libevent.h"
-#include "zm_util_str.h"
+#include "../util/zm_util_libevent.h"
+#include "../util/zm_util_logger.h"
+#include "../util/zm_util_str.h"
 
 #include <../libevent/include/event2/dns.h>
 

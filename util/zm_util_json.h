@@ -1,5 +1,5 @@
 /**
- * @file zm_json.h
+ * @file zm_util_json.h
  * @brief JSON 辅助工具函数库
  *
  * 基于 nlohmann::json 封装的 JSON 读写辅助函数，提供：
@@ -12,15 +12,15 @@
  *   - 数组读取、元素计数
  */
 
-#ifndef ZM_JSON_H
-#define ZM_JSON_H
+#ifndef ZM_UTIL_JSON_H
+#define ZM_UTIL_JSON_H
 
 #include <string>
 #include <string_view>
 #include <vector>
 #include <sstream>
 
-#include <json.hpp>
+#include <../json/json.hpp>
 
 using ZMJSON = nlohmann::ordered_json;
 
@@ -229,4 +229,4 @@ inline void zm_json_set(ZMJSON& obj, std::string_view kname, const T& value)
     obj[kname] = value;
 }
 
-#endif  // ZM_JSON_H
+#endif  // ZM_UTIL_JSON_H

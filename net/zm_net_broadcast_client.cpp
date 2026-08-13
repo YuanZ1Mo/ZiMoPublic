@@ -5,8 +5,8 @@
 
 #include "zm_net_broadcast_client.h"
 
-#include "../spdlog/zm_logger.h"
-#include "../json/zm_json.h"
+#include "../util/zm_util_logger.h"
+#include "../util/zm_util_json.h"
 #include "../util/zm_util_thread.h"
 
 #include <../libevent/include/event2/bufferevent.h>

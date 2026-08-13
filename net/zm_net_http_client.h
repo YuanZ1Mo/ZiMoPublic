@@ -1,7 +1,7 @@
 #ifndef ZM_NET_HTTP_CLIENT_H
 #define ZM_NET_HTTP_CLIENT_H
 
-#include "../json/zm_json.h"
+#include "../util/zm_util_json.h"
 #include "../util/zm_util_str.h"   // BYTE
 
 #include <cstdint>
