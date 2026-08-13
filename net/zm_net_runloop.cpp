@@ -144,10 +144,8 @@ void ZmEvBaseRunLoop::Run()
             }
         }
 
-        // EV_PERSIST保证定时器循环触发
-        _eventTimer = event_new(_evbase, -1, EV_TIMEOUT | EV_PERSIST, ZmEvBaseRunLoop::OnTimerCB, this);
-        timeval timer_second = { ZM_DOCK_HEARTBEAT_SEC, 0 };
-        event_add(_eventTimer, &timer_second);
+        // 周期定时器不再随 Run 自动启动:由 StartTimer() 手动触发
+        // (EV_PERSIST 保证定时器循环触发,自动重臂,见 event_persist_closure)
 
         // #define EVLOOP_ONCE              0x01
         // #define EVLOOP_NONBLOCK          0x02
@@ -160,11 +158,15 @@ void ZmEvBaseRunLoop::Run()
             std::lock_guard<std::mutex> lock(_mutex_loop);
             _b_looped = false;
             _b_run_finished = true;
+            _cv_loop.notify_one();
         }
-        _cv_loop.notify_one();
 
         // 等待者已收到通知，安全释放资源
-        freeEventObjects();
+        // (持锁:与 StartTimer/StopTimer/Control 的成员访问互斥,防退出窗口内 event 被并发触碰)
+        {
+            std::lock_guard<std::mutex> lock(_mutex_loop);
+            freeEventObjects();
+        }
     }
     else
     {
@@ -210,10 +212,60 @@ void ZmEvBaseRunLoop::OnEventCtrlCB(evutil_socket_t fd, short what, void* arg)
     }
 }
 
-void ZmEvBaseRunLoop::OnTimerCB(evutil_socket_t fd, short what, void* arg)
+bool ZmEvBaseRunLoop::StartTimer(int64_t intervalSec)
 {
-    ZmEvBaseRunLoop* self = (ZmEvBaseRunLoop*)arg;
+    std::lock_guard<std::mutex> lock(_mutex_loop);
+    if (!_b_looped)
+        return false;   // 未启动/已退出
+    if (intervalSec <= 0)
+        return false;
+
+    if (_eventTimer == nullptr)
+    {
+        // EV_PERSIST 保证定时器循环触发,自动重臂(见 event_persist_closure)
+        // 无捕获 lambda 可转 C 函数指针,arg=this 中转:
+        // 分发顺序:SetTimerCallback 设置的回调优先,否则虚函数 OnTimerCB(缺省心跳)
+        _eventTimer = event_new(_evbase, -1, EV_TIMEOUT | EV_PERSIST,
+            [](evutil_socket_t, short, void* arg) {
+                auto* self = static_cast<ZmEvBaseRunLoop*>(arg);
+                // 锁内拷贝(与 SetTimerCallback 互斥),锁外调用
+                // (用户回调可能重入 StartTimer/StopTimer,持锁调用会死锁)
+                std::function<void()> cb;
+                {
+                    std::lock_guard<std::mutex> lock(self->_mutex_loop);
+                    cb = self->_timerCb;
+                }
+                if (cb)
+                    cb();                   // SetTimerCallback 优先
+                else
+                    self->OnTimerCB();      // 缺省:虚函数(心跳)
+            }, this);
+        if (_eventTimer == nullptr)
+            return false;
+    }
+    timeval timer_second = { (long)intervalSec, 0 };
+    event_del(_eventTimer);            // 幂等(未挂起则空操作);已运行时调用 = 改间隔重臂
+    event_add(_eventTimer, &timer_second);
+    return true;
+}
+
+void ZmEvBaseRunLoop::StopTimer()
+{
+    std::lock_guard<std::mutex> lock(_mutex_loop);
+    if (_eventTimer)
+        event_del(_eventTimer);
+}
+
+void ZmEvBaseRunLoop::SetTimerCallback(std::function<void()> cb)
+{
+    std::lock_guard<std::mutex> lock(_mutex_loop);
+    _timerCb = std::move(cb);
+}
+
+void ZmEvBaseRunLoop::OnTimerCB()
+{
+    // 缺省实现:原心跳行为(仅诊断用;SetTimerCallback 未设置时生效)
     char buf[32];
     ZmSystem::CurrentTimeStr(buf, sizeof(buf));
-    PUBLIC_LOG_INFO("{}:{} HeartbeatTime:{}", self->GetName(), arg, buf);
+    PUBLIC_LOG_INFO("{}:{} HeartbeatTime:{}", GetName(), (void*)this, buf);
 }

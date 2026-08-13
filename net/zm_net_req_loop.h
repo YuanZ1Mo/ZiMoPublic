@@ -106,6 +106,12 @@ public:
     void          MarkClosing() { m_closing.store(true); }
     /** @brief 取消 deadline 定时器(流式开始后自动调用,见 ZmReqLoopRest) */
     void          CancelDeadline();
+    /** @brief 重设 deadline 定时器(约定:仅本线程,业务回调/续体/超时处理内调用):
+     *  从当前时刻重新计时,并撤销已置位的超时取消标志
+     *  @param timeoutMs 新超时毫秒(>0);<=0 忽略(原 deadline 保持不动)
+     *  @note 在超时处理(SetTimeoutHandler 回调)内调用可"到期后延长继续":
+     *        返回后请求不再走缺省 504 收尾,续体经 IsCancelled() 判假继续推进 */
+    void          SetDeadline(int64_t timeoutMs);
     /** @brief 注册客户端断开清理回调(仅本线程,业务入口内调用)
      *  @param cb 连接关闭时于本线程同步调用的清理函数(如取消外部请求、关闭句柄);
      *            调用后仍执行默认收尾(回复门 + Release 驱动回收),回调内勿调 Release() */

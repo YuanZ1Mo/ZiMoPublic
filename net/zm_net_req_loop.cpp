@@ -87,6 +87,19 @@ void ZmReqLoop::CancelDeadline()
         event_del(m_deadlineEvent);
 }
 
+void ZmReqLoop::SetDeadline(int64_t timeoutMs)
+{
+    // event_del/event_add 内部持 base 锁(evthread_use_windows_threads 开启后),堆层面跨线程安全;
+    // 但 m_task/m_deadlineEvent 的生命周期仅本线程可保证(请求释放/loop 退出窗口),故仍约定
+    // 仅本线程调用;外部线程请用 PostToLoop 桥接。请求已释放(m_task 空)或参数非法时保持原状。
+    if (m_deadlineEvent == nullptr || m_task == nullptr || timeoutMs <= 0)
+        return;
+    m_cancelled.store(false);   // 重设即撤销本次超时取消(超时处理内延长后续体不再提前退出)
+    timeval tv = { (long)(timeoutMs / 1000), (int)((timeoutMs % 1000) * 1000) };
+    event_del(m_deadlineEvent);
+    event_add(m_deadlineEvent, &tv);
+}
+
 void ZmReqLoop::Release()
 {
     if (m_task == nullptr)   // 本请求已释放或从未绑定:幂等返回
@@ -295,7 +308,7 @@ void ZmReqLoop::ProcessDeadline()
     Handlers h = m_handlers;
     if (h.onTimeout)
     {
-        h.onTimeout(this);   // 业务自定义超时(须自行 TryReply + Release)
+        h.onTimeout(this);   // 业务自定义超时:须自行收尾(TryReply + Release)或 SetDeadline 延长继续
         return;
     }
 
