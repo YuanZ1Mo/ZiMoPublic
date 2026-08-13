@@ -5,6 +5,7 @@
 
 #include "zm_net_http.h"
 
+#include "zm_net_websocket_server.h"   // m_wsServer 成员完整定义(new/Close/delete)
 #include "zm_net_req_loop.h"   // close 通知器投递 CLOSE 需要 ZmReqLoop 完整定义
 #include "zm_net_req_loop_pool.h"   // m_reqLoopPool 完整定义(new/Init/Acquire/Shutdown)
 #include "zm_net_req_loop_protocol.h"   // ZmReqLoopJrpc(信封存储/static_cast 依赖)
@@ -1335,6 +1336,10 @@ ZmHttpServer::ZmHttpServer(struct event_base* evbase, uint16_t local_port,
 {
     memset(m_ticketKeys, 0, sizeof(m_ticketKeys));
 
+    // ★ WebSocket 组件在构造时创建(而非 Init):业务回调须在 Init() 之前注册,
+    //    GetWebSocketServer() 构造后即有效;m_wsServer->Init()(心跳定时器)仍由服务器 Init 托管
+    m_wsServer = new ZmWebSocketServer(this);
+
     if (certFile && certFile[0] && keyFile && keyFile[0])
     {
         m_ssl_ctx = ZmSSLContext::MakeServerCTX(certFile, keyFile,
@@ -1347,6 +1352,18 @@ ZmHttpServer::ZmHttpServer(struct event_base* evbase, uint16_t local_port,
 ZmHttpServer::~ZmHttpServer()
 {
     Close();
+    // 防御:Close() 未调用(如 Init 失败路径)时,成员仍在 —— 析构兜底释放
+    if (m_wsServer)
+    {
+        delete m_wsServer;
+        m_wsServer = nullptr;
+    }
+}
+
+void ZmHttpServer::SetWebSocketCallbacks(const ZmWebSocketCallbacks& cbs)
+{
+    if (m_wsServer)
+        m_wsServer->SetCallbacks(cbs);
 }
 
 bool ZmHttpServer::Init()
@@ -1395,6 +1412,14 @@ bool ZmHttpServer::Init()
     // 创建 doer 对象池（预创建 = CPU 核数，与线程池规模匹配，免去首批请求的分配延迟）
     if (!m_httpdDoerPool)
         m_httpdDoerPool = new ZmHttpdDoerPool(this, std::thread::hardware_concurrency());
+
+    // 初始化 WebSocket 组件(对象已在构造函数创建;此处仅建心跳定时器等)
+    if (m_wsServer)
+        m_wsServer->Init();
+
+    // WS 回包投递事件(event_new/event_add 线程安全;回调在事件循环线程执行,ctx=this)
+    m_wsReplyEvent = event_new(m_evbase, -1, 0, ZmHttpServer::OnEventControl, this);
+    event_add(m_wsReplyEvent, nullptr);
 
     return true;
 }
@@ -1463,6 +1488,11 @@ void ZmHttpServer::Close()
         m_reqLoopPool = nullptr;
     }
 
+    // ★ 关闭 WebSocket 组件:置 closing 标志 + 断开全部会话 + 清活跃表
+    //    (会话包装对象与回包事件的释放放在 evhttp_free 之后,见下)
+    if (m_wsServer)
+        m_wsServer->Close();
+
     // ★ 销毁 doer 对象池（线程池已停，worker 不再引用 doer，安全释放）
     if (m_httpdDoerPool)
     {
@@ -1477,11 +1507,30 @@ void ZmHttpServer::Close()
         m_redirectEvhttp = nullptr;
     }
 
-    // 释放 evhttp（停止接受新连接）
+    // 释放 evhttp（停止接受新连接；同时物理释放 evws 连接,其 closecb 命中
+    // ZmWebSocketServer 的 closing 分支,仅置位原子标志,不触碰会话对象）
     if (m_evhttpd)
     {
         evhttp_free(m_evhttpd);
         m_evhttpd = nullptr;
+    }
+
+    // ★ 销毁 WebSocket 组件(顺序约束):
+    //   m_wsReplyEvent 先释放 → 此后 PostWsReply 直接丢弃,不再产生引用会话的闭包;
+    //   再排空残留闭包(可能引用会话)→ 析构释放会话包装对象(僵尸表),无 use-after-free
+    if (m_wsReplyEvent)
+    {
+        event_free(m_wsReplyEvent);
+        m_wsReplyEvent = nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_wsReplyMutex);
+        m_wsReplyQueue.clear();
+    }
+    if (m_wsServer)
+    {
+        delete m_wsServer;
+        m_wsServer = nullptr;
     }
 
     // m_evbase 由外部管理生命周期，不在此释放
@@ -1823,6 +1872,13 @@ void ZmHttpServer::NotifierClearAll()
 
 void ZmHttpServer::OnHttpRequestCB(struct evhttp_request* request, void* arg)
 {
+    ZmHttpServer* server = (ZmHttpServer*)arg;
+    // ★ WebSocket 升级分流(必须在 AcquireDoer 之前,事件循环线程):
+    // TryUpgrade 内部:Upgrade 头识别 → 回调注册检查 → 路径/鉴权 → evws_new_session;
+    // 成功接管返回 true(request 已释放,不得再进入 doer 流程)
+    if (server->m_wsServer && server->m_wsServer->TryUpgrade(request))
+        return;
+
     const char* uri = evhttp_request_get_uri(request);
     if (uri && arg)
     {
@@ -1880,6 +1936,37 @@ void ZmHttpServer::OnEventControl(evutil_socket_t fd, short what, void* ctx)
             // ★ 流式响应结束，回收至对象池
             doer->HttpServer()->RecycleDoer(doer);
         }
+        if (ZmHttpServer::ZM_HTTPD_CONTROL_WS_REPLY & what)
+        {
+            // WS 回包闭包(服务器级事件,ctx = ZmHttpServer,区别于 doer 级控制信号)
+            ZmHttpServer* server = (ZmHttpServer*)ctx;
+            server->RunWsReplies();
+        }
+    }
+}
+
+void ZmHttpServer::PostWsReply(std::function<void()> fn)
+{
+    if (!m_wsReplyEvent || !fn)
+        return;
+    {
+        std::lock_guard<std::mutex> lock(m_wsReplyMutex);
+        m_wsReplyQueue.push_back(std::move(fn));
+    }
+    event_active(m_wsReplyEvent, ZmHttpServer::ZM_HTTPD_CONTROL_WS_REPLY, 0);
+}
+
+void ZmHttpServer::RunWsReplies()
+{
+    std::deque<std::function<void()>> queue;
+    {
+        std::lock_guard<std::mutex> lock(m_wsReplyMutex);
+        queue.swap(m_wsReplyQueue);
+    }
+    for (auto& fn : queue)
+    {
+        if (fn)
+            fn();
     }
 }
 

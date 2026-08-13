@@ -26,6 +26,8 @@
 
 #include <stdint.h>
 #include <atomic>
+#include <deque>
+#include <mutex>
 #include <string_view>
 #include <unordered_map>
 
@@ -66,6 +68,8 @@ struct ssl_ctx_st;
 
 // 前向声明（头文件中仅通过指针使用）
 class ZmThreadPool;
+class ZmWebSocketServer;   // WebSocket 组件(内部成员,实现见 zm_net_websocket_server.h)
+struct ZmWebSocketCallbacks;   // WebSocket 业务回调(SetWebSocketCallbacks 形参,完整定义在 cpp)
 class ZmHttpdDoer;
 class ZmHttpdDoerPool;
 class ZmReqLoopPool;
@@ -623,6 +627,7 @@ public:
         ZM_HTTPD_CONTROL_STREAM_START = 0x0400,   ///< 工作线程请求开始流式响应（发响应头）
         ZM_HTTPD_CONTROL_STREAM_CHUNK = 0x0800,   ///< 工作线程请求发送流式数据块
         ZM_HTTPD_CONTROL_STREAM_END   = 0x1000,   ///< 工作线程请求结束流式响应
+        ZM_HTTPD_CONTROL_WS_REPLY     = 0x2000,   ///< 任意线程投递 WS 回包闭包(事件循环线程执行)
     };
 
     /**
@@ -700,6 +705,21 @@ public:
 
     /** @brief 查询服务器是否已初始化 */
     bool IsOpen() const;
+
+    /**
+     * @brief 获取本服务器的 WebSocket 组件(Init 后有效,始终非空)
+     * @note 业务回调注册须在服务器 Init() 之前:
+     *       GetWebSocketServer()->SetCallbacks({...}) → 服务器 Init()。
+     *       未注册 onMessage 的服务器不接受 WebSocket 升级(走现有流程)。
+     */
+    ZmWebSocketServer* GetWebSocketServer() { return m_wsServer; }
+
+    /**
+     * @brief 设置 WebSocket 业务回调(转发内部组件,等价 GetWebSocketServer()->SetCallbacks)
+     * @param cbs 业务回调(onMessage 为空 = 不接受升级);须在服务器 Init() 之前调用
+     * @note 仿 SetRequestReadCB 直连接口:派生类(ZmRESTfulServer 等)直接可用
+     */
+    void SetWebSocketCallbacks(const ZmWebSocketCallbacks& cbs);
 
     /** @brief 查询是否已启用 HTTPS（m_ssl_ctx 非空） */
     bool IsHttps() const { return m_ssl_ctx != nullptr; }
@@ -882,6 +902,11 @@ protected:
         std::function<void(ZmReqLoop*)> onStart);
 
 private:
+    /** @brief WebSocket 组件(ZmWebSocketServer 直访本类私有成员,如 m_reqLoopPool/m_threadPool/PostWsReply) */
+    friend class ZmWebSocketServer;
+    /** @brief WebSocket 会话(PostSendText 内部直调 PostWsReply 投递回包,友元不传递故单独声明) */
+    friend class ZmWebSocketSession;
+
     /** @brief libevent 事件循环对象（外部传入，不由此类释放） */
     struct event_base* m_evbase;
 
@@ -963,6 +988,14 @@ private:
     /** @brief Close 进行中:通知器 Add/Remove 跳过 map 操作(Close 由非循环线程调用) */
     std::atomic<bool> m_closing {false};
 
+    /** @brief WebSocket 组件(Init 创建,Close 销毁;生命周期由本类托管) */
+    ZmWebSocketServer* m_wsServer = nullptr;
+
+    /** @brief WS 回包投递队列(任意线程 push,事件循环线程 RunWsReplies 排空) */
+    std::deque<std::function<void()>> m_wsReplyQueue;
+    std::mutex                        m_wsReplyMutex;
+    struct event*                     m_wsReplyEvent = nullptr;
+
     /** @brief 连接关闭回调(closecb):广播到该连接所有在飞 doer */
     static void OnConnCloseNotifierCB(struct evhttp_connection* conn, void* arg);
     /** @brief 将 doer 登记进连接的通知器(请求到达时调用,循环线程) */
@@ -971,6 +1004,15 @@ private:
     void NotifierRemove(ZmHttpdTask* task);
     /** @brief 清理全部通知器(服务器 Close/析构时调用) */
     void NotifierClearAll();
+
+    /**
+     * @brief 投递回包闭包到本服务器事件循环线程执行(任意线程调用,线程安全)
+     * @note 仅用于 evws 收发(evws_send_text 等,严格在循环线程执行);
+     *       由 ZmWebSocketServer(友元)使用,不对外公开。
+     */
+    void PostWsReply(std::function<void()> fn);
+    /** @brief 事件循环线程执行所有待处理回包闭包(ZM_HTTPD_CONTROL_WS_REPLY 触发) */
+    void RunWsReplies();
 };
 
 

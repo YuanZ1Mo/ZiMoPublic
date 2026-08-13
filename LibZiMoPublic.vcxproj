@@ -117,6 +117,7 @@
     <ClInclude Include="net\zm_net_req_loop_protocol.h" />
     <ClInclude Include="net\zm_net_runloop.h" />
     <ClInclude Include="net\zm_net_socket.h" />
+    <ClInclude Include="net\zm_net_websocket_server.h" />
     <ClInclude Include="openssl\include\openssl\aes.h" />
     <ClInclude Include="openssl\include\openssl\asn1.h" />
     <ClInclude Include="openssl\include\openssl\asn1err.h" />
@@ -402,6 +403,7 @@
     <ClCompile Include="net\zm_net_req_loop_protocol.cpp" />
     <ClCompile Include="net\zm_net_runloop.cpp" />
     <ClCompile Include="net\zm_net_socket.cpp" />
+    <ClCompile Include="net\zm_net_websocket_server.cpp" />
     <ClCompile Include="service\zm_service_base.cpp" />
     <ClCompile Include="sqllite\sqlite3.c" />
     <ClCompile Include="ssl\zm_ssl_ctx.cpp" />
