@@ -152,13 +152,17 @@ bool ZipWriter::EndEntry()
     }
 
     // 回填 local header:CRC(14)/csize(18)/usize(22)
+    // 注意:m_curHeaderPos 是当前 m_out 段内偏移(Patch 目标),条目跨段时 seg rel 不变;
+    // EndEntry 与 BeginEntry 之间不会发生 Drain,此时 m_drained 即本条目的绝对分段基准
     size_t p = m_curHeaderPos;
     PatchU32(m_out, p + 14, m_curCrc);
     PatchU32(m_out, p + 18, (uint32_t)m_curCompressed);
     PatchU32(m_out, p + 22, (uint32_t)m_curUncompressed);
 
+    // ★ 中央目录需要绝对偏移:已 Drain 字节 + 段内起点。
+    //   只记段内偏移会把第二个条目起全部指回错误位置(内容重复/CRC 损坏)
     m_entries.push_back({m_curName, m_curCrc, m_curCompressed, m_curUncompressed,
-                         m_curDir, m_curHeaderPos});
+                         m_curDir, m_drained + m_curHeaderPos});
     m_curActive = false;
     return true;
 }
@@ -189,7 +193,7 @@ bool ZipWriter::Finish()
         PutU16(m_out, 0);                       // disk
         PutU16(m_out, 0);                       // internal attr
         PutU32(m_out, e.isDir ? 0x10 : 0);      // external attr(目录位)
-        PutU32(m_out, (uint32_t)e.headerPos);   // local header 偏移
+        PutU32(m_out, (uint32_t)e.headerPos);   // local header 偏移(EndEntry 已换算为绝对)
         m_out.insert(m_out.end(), e.name.begin(), e.name.end());
     }
     size_t cdSize = m_out.size() - cdStart;

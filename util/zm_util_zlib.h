@@ -58,7 +58,7 @@ private:
         uint64_t    compressed   = 0;
         uint64_t    uncompressed = 0;
         bool        isDir = false;
-        uint64_t    headerPos = 0;   // m_out 中 local header 起点(回填用)
+        uint64_t    headerPos = 0;   // local header 绝对偏移(EndEntry 记录;Finish 写中央目录)
     };
 
     bool DeflateChunk(const unsigned char* data, size_t len, bool final);
