@@ -384,6 +384,7 @@
     <ClInclude Include="util\zm_util_thread.h" />
     <ClInclude Include="util\zm_util_win_os.h" />
     <ClInclude Include="util\zm_util_zlib.h" />
+    <ClInclude Include="util\zm_util_zipfile.h" />
     <ClInclude Include="zlib\include\zconf.h" />
     <ClInclude Include="zlib\include\zlib.h" />
   </ItemGroup>
@@ -419,6 +420,7 @@
     <ClCompile Include="util\zm_util_thread.cpp" />
     <ClCompile Include="util\zm_util_win_os.cpp" />
     <ClCompile Include="util\zm_util_zlib.cpp" />
+    <ClCompile Include="util\zm_util_zipfile.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

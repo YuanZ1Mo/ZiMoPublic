@@ -329,10 +329,13 @@ public:
      * @brief 零拷贝方式向响应缓冲区添加文件内容
      *
      * 使用 evbuffer_file_segment 替代已废弃的 evbuffer_add_file，
-     * 支持 mmap/sendfile 零拷贝。函数接管 fd 所有权，
-     * 传输完成后由 libevent 自动关闭 fd。
+     * 支持 mmap/sendfile 零拷贝。**保留字符串分段零拷贝**:内部按 ≤2GB
+     * 分段多个映射视图拼接,>4GB 文件同样可用(Windows MapViewOfFile
+     * 单视图长度受 32 位上限,整段映射 >4GB 会失败)。
+     * 函数接管 fd 所有权,传输完成后由 libevent 自动关闭 fd。
      *
-     * @param fd      文件描述符（函数接管所有权，成功后调用者不应再操作 fd）
+     * @param fd      文件描述符（函数接管所有权，成功后调用者不应再操作 fd；
+     *                失败路径不接管,调用者需自行 close(fd))
      * @param offset  文件读取起始偏移量（字节）
      * @param length  读取长度（字节数）
      * @return 0 成功，-1 失败（调用者需自行 close(fd)）

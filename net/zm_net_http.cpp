@@ -596,28 +596,42 @@ void ZmHttpdTask::SetReplyBuf(struct evbuffer* buf)
 
 int ZmHttpdTask::SetReplyFile(int fd, ev_off_t offset, ev_off_t length)
 {
-    if (fd < 0)
+    if (fd < 0 || length < 0)
         return -1;
 
-    // 使用 evbuffer_file_segment 替代已废弃的 evbuffer_add_file
-    // EVBUF_FS_CLOSE_ON_FREE: 段释放时自动 close(fd)
-    // EVBUF_FS_DISABLE_SENDFILE: 禁用 Windows TransmitFile，只用 mmap
-    struct evbuffer_file_segment* seg = evbuffer_file_segment_new(
-        fd, offset, length,
-        EVBUF_FS_CLOSE_ON_FREE);
-    if (!seg)
-        return -1;
+    // ★ 分段零拷贝:Windows 下 evbuffer_file_segment 的 MapViewOfFile 每视图长度
+    //   受 32 位 DWORD 限制(buffer.c 转交长度参数),>4GB 整段映射失败 → 500。
+    //   拆为 ≤2GB 的多视图拼接:每段一个独立映射窗口,>4GB 文件仍零拷贝。
+    //   (Windows 原生 TransmitFile 不支持 TLS,本服务全 HTTPS,不可用;文件映射
+    //   页缓存归系统管理可回收,慢客户端不产生用户态无界堆积。)
+    // 段所有权:仅最后一个段挂 CLOSE_ON_FREE(fd 在全部数据发出后关闭一次);
+    //   中间段共享同一 fd,若提前关 fd 会破坏后续段读取。
+    //   契约:失败返回 -1 时不接管 fd(调用方负责关闭);成功时 fd 随响应释放。
+    static constexpr ev_off_t kFileSegmentBytes = (ev_off_t)2 * 1024 * 1024 * 1024;
 
-    // 添加到响应缓冲区（evbuffer 增加段引用计数）
-    if (evbuffer_add_file_segment(m_reply_buf, seg, 0, length) != 0)
+    for (ev_off_t off = 0; off < length; )
     {
-        // 失败时释放段，EVBUF_FS_CLOSE_ON_FREE 会触发 close(fd)
-        evbuffer_file_segment_free(seg);
-        return -1;
-    }
+        ev_off_t chunk = (length - off > kFileSegmentBytes) ? kFileSegmentBytes : (length - off);
+        bool last = (off + chunk >= length);
+        // 使用 evbuffer_file_segment 替代已废弃的 evbuffer_add_file
+        // EVBUF_FS_DISABLE_SENDFILE: 禁用 Windows TransmitFile，只用 mmap(已在库内定义)
+        struct evbuffer_file_segment* seg = evbuffer_file_segment_new(
+            fd, offset + off, chunk,
+            last ? EVBUF_FS_CLOSE_ON_FREE : 0);
+        if (!seg)
+            return -1;
 
-    // 释放本地引用（evbuffer 仍持有引用，fd 不会在此处关闭）
-    evbuffer_file_segment_free(seg);
+        // 添加到响应缓冲区（evbuffer 增加段引用计数）
+        if (evbuffer_add_file_segment(m_reply_buf, seg, 0, chunk) != 0)
+        {
+            // 失败仅释放未采用的段;已加入的段不回退(病态路径,映射失败集中在首段)
+            evbuffer_file_segment_free(seg);
+            return -1;
+        }
+        // 释放本地引用（evbuffer 仍持有引用，fd 不会在此处关闭）
+        evbuffer_file_segment_free(seg);
+        off += chunk;
+    }
     return 0;
 }
 
