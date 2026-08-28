@@ -16,6 +16,11 @@
 extern std::shared_ptr<spdlog::logger> g_default_logger;
 extern std::shared_ptr<spdlog::logger> g_public_logger;
 
+// 开启控制台日志输出（Debug 模式下把 spdlog 日志同时输出到控制台）。
+// 建议在首次写日志前调用；对已创建的 g_default_logger / g_public_logger 也会生效，
+// 之后创建的 logger（含 DefaultLogger::Ensure / PublicLogger::Ensure）自动带上控制台 sink
+void EnableConsoleSink();
+
 // Rotating file logger 基类，提供可配置的日志初始化与清理
 // 继承此类只需在构造函数体中调用 CreateLogger() 即可，析构时自动清理
 class RotatingLoggerBase

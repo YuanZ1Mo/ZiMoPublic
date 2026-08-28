@@ -3,6 +3,8 @@
 #include "../util/zm_util_logger.h"
 
 #include <cassert>
+#include <conio.h>
+#include <cstdio>
 #include <algorithm>
 #include <strsafe.h>
 
@@ -66,10 +68,71 @@ bool ZmServiceBase::Run()
     return ::StartServiceCtrlDispatcher(tableEntry) == TRUE;
 }
 
+// 调试模式：Ctrl+C / Ctrl+Break 触发优雅停止
+static HANDLE g_debugStopEvent = nullptr;
+
+static BOOL WINAPI DebugConsoleCtrlHandler(DWORD /*ctrlType*/)
+{
+    if (g_debugStopEvent)
+        ::SetEvent(g_debugStopEvent);
+    return TRUE; // 已处理，阻止系统默认的强杀行为
+}
+
 void ZmServiceBase::RunDebugMode(DWORD argc, TCHAR* argv[])
 {
     m_service = this;
+    m_debugMode = true;
+
+    // 1) 确保有控制台窗口：从 cmd 运行时直接复用；双击等无控制台场景则分配一个新的
+    bool consoleAllocated = false;
+    HANDLE hOut = ::GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut == nullptr || hOut == INVALID_HANDLE_VALUE)
+    {
+        if (::AllocConsole())
+        {
+            FILE* fp = nullptr;
+            freopen_s(&fp, "CONIN$",  "r", stdin);
+            freopen_s(&fp, "CONOUT$", "w", stdout);
+            freopen_s(&fp, "CONOUT$", "w", stderr);
+            consoleAllocated = true;
+        }
+    }
+
+    // 2) spdlog 日志同时输出到控制台（文件 sink 保留）
+    EnableConsoleSink();
+
+    // 3) 直接走 SvcMain（跳过 SCM；SvcMain 在调试模式下允许控制句柄注册失败）
     SvcMain(argc, argv);
+
+    // 4) 保持前台运行，等待 Ctrl+C 优雅停止（回车仅输出空行，方便调试时按空行分隔新日志）
+    DEFAULT_LOG_INFO("==================== 调试模式运行中, 按 Ctrl+C 停止服务(回车输出空行) ====================");
+
+    HANDLE hStopEvent = ::CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    g_debugStopEvent = hStopEvent;
+    ::SetConsoleCtrlHandler(DebugConsoleCtrlHandler, TRUE);
+    while (::WaitForSingleObject(hStopEvent, 0) != WAIT_OBJECT_0)
+    {
+        if (_kbhit())
+        {
+            int ch = _getch();
+            if (ch == '\r' || ch == '\n')
+            {
+                // 仅消费回车并打印一个空行，不停止服务
+                std::printf("\n");
+                std::fflush(stdout);
+            }
+        }
+        ::Sleep(100);
+    }
+    ::SetConsoleCtrlHandler(DebugConsoleCtrlHandler, FALSE);
+    ::CloseHandle(hStopEvent);
+    g_debugStopEvent = nullptr;
+
+    DEFAULT_LOG_INFO("收到停止信号, 正在优雅停止服务...");
+    m_service->Stop();
+
+    if (consoleAllocated)
+        ::FreeConsole();
 }
 
 // --- 状态管理 ---
@@ -115,9 +178,18 @@ void WINAPI ZmServiceBase::SvcMain(DWORD argc, TCHAR* argv[])
 
     if (!m_service->m_svcStatusHandle)
     {
-        m_service->WriteToEventLog(_T("Can't set service control handler"), EVENTLOG_ERROR_TYPE);
-        PUBLIC_LOG_ERROR("无法设置服务控制句柄");
-        return;
+        // 调试模式（非 SCM 环境）下注册失败属预期，忽略并继续；
+        // 正常服务模式下注册失败属于致命错误，直接退出
+        if (m_service->m_debugMode)
+        {
+            PUBLIC_LOG_WARN("调试模式: 服务控制句柄注册失败(非 SCM 环境), 跳过, 继续启动");
+        }
+        else
+        {
+            m_service->WriteToEventLog(_T("Can't set service control handler"), EVENTLOG_ERROR_TYPE);
+            PUBLIC_LOG_ERROR("无法设置服务控制句柄");
+            return;
+        }
     }
 
     m_service->Start(argc, argv);
@@ -165,7 +237,9 @@ void ZmServiceBase::Start(DWORD argc, TCHAR* argv[])
 {
     SetStatus(SERVICE_START_PENDING);
     OnStart(argc, argv);
-    registerPowerNotifications();
+    // 调试模式无 SCM 句柄，电源通知注册无意义且会误报错误，跳过
+    if (!m_debugMode)
+        registerPowerNotifications();
     SetStatus(SERVICE_RUNNING);
 }
 

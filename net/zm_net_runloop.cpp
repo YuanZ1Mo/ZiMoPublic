@@ -1,6 +1,5 @@
 #include "zm_net_runloop.h"
 
-#include "zm_net_dns.h"
 #include "../util/zm_util_libevent.h"
 #include "../util/zm_util_logger.h"
 #include "../util/zm_util_str.h"
@@ -14,7 +13,6 @@ enum { CONTROL_LOOP_SUCCESS = 0x0200, };
 ZmEvBaseRunLoop::ZmEvBaseRunLoop(const std::string& name): ZmThread(name)
 {
     _evbase     = nullptr;
-    _evdnsbase = nullptr;
     _eventCtrl  = nullptr;
     _eventTimer = nullptr;
     _b_looped = false;
@@ -33,12 +31,6 @@ void ZmEvBaseRunLoop::freeEventObjects()
     {
         event_free(_eventCtrl);
         _eventCtrl = nullptr;
-    }
-
-    if (_evdnsbase)
-    {
-        evdns_base_free(_evdnsbase, 0);
-        _evdnsbase = nullptr;
     }
 
     if (_eventTimer)
@@ -93,11 +85,6 @@ event_base* ZmEvBaseRunLoop::GetEventBase()
     return _evbase;
 }
 
-evdns_base* ZmEvBaseRunLoop::GetEventDnsBase()
-{
-    std::unique_lock<std::mutex> lock(_mutex_loop);
-    return _evdnsbase;
-}
 
 void ZmEvBaseRunLoop::Run()
 {
@@ -116,33 +103,6 @@ void ZmEvBaseRunLoop::Run()
         _eventCtrl = event_new(_evbase, -1, EV_PERSIST | EV_READ, ZmEvBaseRunLoop::OnEventCtrlCB, (void*)this);
         event_add(_eventCtrl, 0);
         event_active(_eventCtrl, CONTROL_LOOP_SUCCESS, 0);
-
-        _evdnsbase = evdns_base_new(_evbase, 0);
-
-        // 从系统获取 DNS 服务器并配置到 evdns_base，不然 evdns_getaddrinfo 无法正常工作
-        {
-            std::string dns_addrs = ZmNetDNS::GetDNSAddresses();
-            if (!dns_addrs.empty())
-            {
-                char* addrs_buf = _strdup(dns_addrs.c_str());
-                if (addrs_buf)
-                {
-                    char* cursor = addrs_buf;
-                    char* token = zm_strsep(&cursor, ",");
-                    while (token)
-                    {
-                        while (*token == ' ') token++;
-                        if (*token)
-                        {
-                            evdns_base_nameserver_ip_add(_evdnsbase, token);
-                            PUBLIC_LOG_INFO("Add DNS nameserver to evdns_base: {}", token);
-                        }
-                        token = zm_strsep(&cursor, ",");
-                    }
-                    free(addrs_buf);
-                }
-            }
-        }
 
         // 周期定时器不再随 Run 自动启动:由 StartTimer() 手动触发
         // (EV_PERSIST 保证定时器循环触发,自动重臂,见 event_persist_closure)

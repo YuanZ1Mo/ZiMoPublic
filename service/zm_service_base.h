@@ -102,6 +102,9 @@ private:
     SERVICE_STATUS m_svcStatus;
     SERVICE_STATUS_HANDLE m_svcStatusHandle;
 
+    // 调试模式标记：RunDebugMode 置位，SvcMain 等据此兼容非 SCM 环境
+    bool m_debugMode = false;
+
     // 电源通知注册（当 SERVICE_ACCEPT_POWEREVENT 时自动管理）
     std::vector<HPOWERNOTIFY> m_powerNotifyHandles;
     void registerPowerNotifications();

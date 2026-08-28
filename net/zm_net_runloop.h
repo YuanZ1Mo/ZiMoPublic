@@ -71,7 +71,6 @@ private:
     void            freeEventObjects();
 
     event_base*  _evbase;
-    evdns_base* _evdnsbase;
     event*       _eventTimer;
     event*       _eventCtrl;
     std::function<void()> _timerCb;   ///< 定时器回调(SetTimerCallback 设置;空 = 走虚函数 OnTimerCB)
