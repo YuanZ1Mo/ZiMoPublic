@@ -393,9 +393,6 @@
     <ClInclude Include="net\zm_net_ip.h">
       <Filter>头文件\net</Filter>
     </ClInclude>
-    <ClInclude Include="net\zm_net_runloop.h">
-      <Filter>头文件\net</Filter>
-    </ClInclude>
     <ClInclude Include="service\zm_service_base.h">
       <Filter>头文件\service</Filter>
     </ClInclude>
@@ -4353,6 +4350,9 @@
     <ClInclude Include="net\zm_net_http_frontend_server.h">
       <Filter>头文件\net</Filter>
     </ClInclude>
+    <ClInclude Include="util\zm_util_evbase_runloop.h">
+      <Filter>头文件\util</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="net\zm_net_broadcast_base.cpp">
@@ -4367,9 +4367,6 @@
     <ClCompile Include="net\zm_net_ip.cpp">
       <Filter>源文件\net</Filter>
     </ClCompile>
-    <ClCompile Include="net\zm_net_runloop.cpp">
-      <Filter>源文件\net</Filter>
-    </ClCompile>
     <ClCompile Include="service\zm_service_base.cpp">
       <Filter>源文件\service</Filter>
     </ClCompile>
@@ -4377,9 +4374,6 @@
       <Filter>源文件\util</Filter>
     </ClCompile>
     <ClCompile Include="util\zm_util_logger.cpp">
-      <Filter>源文件\util</Filter>
-    </ClCompile>
-    <ClCompile Include="util\zm_util_container.cpp">
       <Filter>源文件\util</Filter>
     </ClCompile>
     <ClCompile Include="util\zm_util_file.cpp">
@@ -4414,6 +4408,12 @@
     </ClCompile>
     <ClCompile Include="net\zm_net_http_server.cpp">
       <Filter>源文件\net</Filter>
+    </ClCompile>
+    <ClCompile Include="util\zm_util_evbase_runloop.cpp">
+      <Filter>源文件\util</Filter>
+    </ClCompile>
+    <ClCompile Include="util\zm_util_container.cpp">
+      <Filter>源文件\util</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

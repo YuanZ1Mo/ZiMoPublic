@@ -1,5 +1,5 @@
-#ifndef DOCK_RUNLOOP_H
-#define DOCK_RUNLOOP_H
+#ifndef ZM_UTIL_EVBASE_RUNLOOP_H
+#define ZM_UTIL_EVBASE_RUNLOOP_H
 
 #include "../util/zm_util_thread.h"
 
@@ -81,4 +81,4 @@ private:
     bool _b_run_finished;
 };
 
-#endif /* DOCK_RUNLOOP_H */
+#endif /* ZM_UTIL_EVBASE_RUNLOOP_H */

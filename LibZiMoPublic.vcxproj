@@ -1310,7 +1310,6 @@
     <ClInclude Include="net\zm_net_http_restful_server.h" />
     <ClInclude Include="net\zm_net_http_server.h" />
     <ClInclude Include="net\zm_net_ip.h" />
-    <ClInclude Include="net\zm_net_runloop.h" />
     <ClInclude Include="service\zm_service_base.h" />
     <ClInclude Include="spdlog\async.h" />
     <ClInclude Include="spdlog\async_logger-inl.h" />
@@ -1417,6 +1416,7 @@
     <ClInclude Include="spdlog\tweakme.h" />
     <ClInclude Include="spdlog\version.h" />
     <ClInclude Include="util\zm_util_container.h" />
+    <ClInclude Include="util\zm_util_evbase_runloop.h" />
     <ClInclude Include="util\zm_util_file.h" />
     <ClInclude Include="util\zm_util_json.h" />
     <ClInclude Include="util\zm_util_libevent.h" />
@@ -1436,9 +1436,9 @@
     <ClCompile Include="net\zm_net_http_jsonrpc_server.cpp" />
     <ClCompile Include="net\zm_net_http_restful_server.cpp" />
     <ClCompile Include="net\zm_net_http_server.cpp" />
-    <ClCompile Include="net\zm_net_runloop.cpp" />
     <ClCompile Include="service\zm_service_base.cpp" />
     <ClCompile Include="util\zm_util_container.cpp" />
+    <ClCompile Include="util\zm_util_evbase_runloop.cpp" />
     <ClCompile Include="util\zm_util_file.cpp" />
     <ClCompile Include="util\zm_util_json.cpp" />
     <ClCompile Include="util\zm_util_libevent.cpp" />
