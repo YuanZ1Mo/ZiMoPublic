@@ -597,13 +597,8 @@ void ZmHttpServer::Close()
 
 bool ZmHttpServer::IsHttps() const
 {
-    // 语义:本面监听含 443(即 HTTPS 模式;有证书时前端面 443+80 同时监听)
-    for (uint16_t p : m_listeners)
-    {
-        if (p == 443)
-            return true;
-    }
-    return false;
+    // 一对象一端口(v2.5):本面监听启用 useSSL 即 HTTPS 模式
+    return m_listenerSet && m_listener.useSSL;
 }
 
 // ============================================================================
@@ -624,15 +619,31 @@ void ZmHttpServer::AddListener(uint16_t port, bool useSSL, const string& ip,
                                    bool useOldTLS,
                                    const vector<pair<string, string>>& sslConfCmds)
 {
-    // certFile/keyFile 传空 → 使用全局 setSSLFiles 配置(头文件契约,保证热加载)
+    // 一对象一端口(v2.5):仅允许设置一次;重复设置报错并忽略(多端口面用多个实例)
+    if (m_listenerSet)
+    {
+        PUBLIC_LOG_ERROR("AddListener 重复设置已忽略(一对象一端口): 已有 port={}, 忽略 port={}",
+                         m_listener.port, port);
+        return;
+    }
+    if (port == 0)
+    {
+        PUBLIC_LOG_ERROR("AddListener 端口非法(port=0),忽略");
+        return;
+    }
     if (IsOpened())
     {
         PUBLIC_LOG_ERROR("AddListener 已跳过(run 后不可再添加监听): port={}", port);
         return;
     }
+    // certFile/keyFile 传空 → 使用全局 setSSLFiles 配置(头文件契约,保证热加载)
     app().addListener(ip, port, useSSL, "", "", useOldTLS, sslConfCmds);
-    m_listeners.push_back(port);
-    m_bindIps.push_back(ip);
+    m_listener.port = port;
+    m_listener.useSSL = useSSL;
+    m_listener.ip = ip;
+    m_listener.useOldTLS = useOldTLS;
+    m_listener.sslConfCmds = sslConfCmds;
+    m_listenerSet = true;
     s_hasListener.store(true, std::memory_order_relaxed);
 }
 

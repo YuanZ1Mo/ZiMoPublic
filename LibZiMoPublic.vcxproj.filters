@@ -4403,17 +4403,17 @@
     <ClCompile Include="util\zm_util_zipfile.cpp">
       <Filter>源文件\util</Filter>
     </ClCompile>
-    <ClCompile Include="net\zm_net_http_server.cpp">
-      <Filter>头文件\net</Filter>
-    </ClCompile>
-    <ClCompile Include="net\zm_net_http_restful_server.cpp">
-      <Filter>头文件\net</Filter>
+    <ClCompile Include="net\zm_net_http_frontend_server.cpp">
+      <Filter>源文件\net</Filter>
     </ClCompile>
     <ClCompile Include="net\zm_net_http_jsonrpc_server.cpp">
-      <Filter>头文件\net</Filter>
+      <Filter>源文件\net</Filter>
     </ClCompile>
-    <ClCompile Include="net\zm_net_http_frontend_server.cpp">
-      <Filter>头文件\net</Filter>
+    <ClCompile Include="net\zm_net_http_restful_server.cpp">
+      <Filter>源文件\net</Filter>
+    </ClCompile>
+    <ClCompile Include="net\zm_net_http_server.cpp">
+      <Filter>源文件\net</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

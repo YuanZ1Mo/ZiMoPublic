@@ -140,10 +140,11 @@ public:
     static bool IsInitialized();
     static bool IsOpened();
 
-    virtual bool IsHttps() const;            // 本面任一监听 useSSL
-    virtual std::vector<uint16_t> GetPorts() const { return m_listeners; }
-    /// 本面绑定的监听地址(与 GetPorts 同序;0.0.0.0/:: = 通配监听)
-    virtual std::vector<std::string> GetBindIps() const { return m_bindIps; }
+    virtual bool IsHttps() const;            // 本面监听是否启用 TLS(一对象一端口,v2.5)
+    /// 本面监听端口(未设置 = 0;一对象仅管理一个端口)
+    virtual uint16_t GetPort() const { return m_listenerSet ? m_listener.port : 0; }
+    /// 本面绑定地址(0.0.0.0/:: = 通配监听;未设置 = 空串)
+    virtual std::string GetBindIp() const { return m_listenerSet ? m_listener.ip : ""; }
 
     // ── 结构路由注册(幂等;派生面注册内置路由/advice;须在 Open 前调用) ──
     virtual void Setup();
@@ -267,15 +268,25 @@ public:
 
 protected:
     virtual void RegisterRoutes() = 0;   // 派生面实现:注册自己路径前缀的路由
-    std::vector<uint16_t> m_listeners;   // 本面监听端口
-    std::vector<std::string> m_bindIps;  // 本面监听地址(与 m_listeners 同序;AddListener 时记录)
+
+    // ── 一对象一端口(v2.5):本面唯一监听(未设置时 m_listenerSet=false) ──
+    struct ZmHttpListener
+    {
+        uint16_t port = 0;
+        bool useSSL = false;
+        std::string ip;
+        bool useOldTLS = false;
+        std::vector<std::pair<std::string, std::string>> sslConfCmds;
+    };
+    ZmHttpListener m_listener;
+    bool m_listenerSet = false;
     bool m_setupDone = false;
     std::string m_rootPath;              // 本面业务根路径(自定义;空 = 按"面自身"规则失能门禁)
 
     // ── per-port 辅助(共享路由表下恢复"端口隔离",设计 §4.4) ──
     bool IsLocalPortIn(const drogon::HttpRequestPtr& req) const
     {
-        return ZmHttpLocalPortIn(req, m_listeners);
+        return m_listenerSet && ZmHttpLocalPort(req) == m_listener.port;
     }
 
 private:

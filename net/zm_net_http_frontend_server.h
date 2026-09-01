@@ -26,14 +26,22 @@
 class ZmHttpFrontendServer : public ZmHttpServer
 {
 public:
-    ZmHttpFrontendServer() = default;
+    /// @param redirectOnly true = 仅 80→443 重定向专用实例(HTTPS 模式的 80 监听);
+    ///                      false = 完整前端实例(443 HTTPS 或 80 HTTP)。
+    ///                      一对象一端口(v2.5):前端面在 HTTPS 模式由两个实例组成。
+    explicit ZmHttpFrontendServer(bool redirectOnly = false);
 
-    /// 监听配置(前端端口固定由协议模式决定,故不需 port 参数;签名与 JRPC/RESTful 面形态一致)
-    /// @param useSSL  HTTPS 模式 → 挂 443(HTTPS)+80(HTTP 重定向);false → 仅 80(HTTP)
-    /// @param rootPath 业务根路径(前端为静态服务,传空 = 关闭门禁)
+    /// 监听配置(前端口固定由协议模式 + redirectOnly 决定,故不需 port 参数;
+    /// 签名与 JRPC/RESTful 面形态一致)
+    /// @param useSSL   完整面:true → 443(HTTPS),false → 80(HTTP);
+    ///                 重定向面:恒 80(HTTP)
+    /// @param rootPath 业务根路径(前端为静态服务,传空 = 关闭门禁;重定向面忽略)
     void SetupListeners(const std::string& ip = "0.0.0.0",
                         bool useSSL = false,
                         const std::string& rootPath = "");
+
+    /// 是否为重定向专用实例
+    bool IsRedirectOnly() const { return m_redirectOnly; }
 
     // ── 前端面可配置结构(业务层在 Open 前调用;平台层只给机制,不含具体路径) ──
     /// 注册 SPA 回落:请求命中 prefix(含子路径)时返回 file(相对文档根的页面)。
@@ -57,8 +65,9 @@ public:
     }
 
 protected:
-    void RegisterRoutes() override;   // 结构 advice:重定向/门禁 + 遍历可配置的 SPA 回落与封禁
+    void RegisterRoutes() override;   // 结构 advice:重定向(仅重定向实例)/门禁 + SPA 回落与封禁
 private:
+    bool m_redirectOnly = false;                          // 重定向专用实例标记
     std::vector<std::pair<std::string, std::string>> m_spaFallbacks;  // {prefix, file}
     std::vector<std::string> m_deniedPaths;                           // 封禁前缀
     std::string m_docRoot;               // SetDocumentRoot 缓存(构造页面绝对路径用)
