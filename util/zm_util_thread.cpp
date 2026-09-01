@@ -295,6 +295,13 @@ ZmThreadPool::ZmThreadPool(uint16_t threadCount, const std::string& poolName)
     : m_poolName(poolName)
     , m_initSize(threadCount)
 {
+    // 特殊值 0 = 自动 = CPU 核数(hardware_concurrency;无信息时兜底 4)
+    if (threadCount == 0)
+    {
+        unsigned cpus = std::thread::hardware_concurrency();
+        threadCount = (cpus == 0) ? 4 : static_cast<uint16_t>(cpus);
+        m_initSize = threadCount;
+    }
     for (uint16_t i = 0; i < threadCount; i++)
     {
         int idx = i;

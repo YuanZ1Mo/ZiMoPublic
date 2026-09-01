@@ -80,7 +80,7 @@ void ZmHttpJsonRpcServer::RegisterRoutes()
     });
 
     // ── JRPC 协议 handler(平台内建校验 + 信封,参考旧版 JrpcRequestReadCB) ──
-    // Dispatch 直接产出 ZMJSON 信封(jsonrpc→id→result|error 构造序),HTTP 恒 200
+    // Dispatch 直接产出 ZMJSON 信封(id→jsonrpc→result|error 构造序),HTTP 恒 200
     RegisterCoro(m_rootPath, HttpMethod::Post,
         [this](HttpRequestPtr req) -> Task<HttpResponsePtr> {
             ZMJSON rsp = Dispatch(ParseRequest(req));
@@ -119,14 +119,15 @@ ZMJSON ZmHttpJsonRpcServer::ParseRequest(const HttpRequestPtr& req)
 // ============================================================================
 ZMJSON ZmHttpJsonRpcServer::Dispatch(const ZMJSON& req)
 {
-    // 信封 ZMJSON 直构:字段顺序 jsonrpc → id → (result|error) 为构造序
+    // 信封 ZMJSON 直构:构造序 id → jsonrpc → (result|error)
+    // id 先占位 null,后续校验分支按需改值(改值不调整键序);jsonrpc 恒 "2.0"
     ZMJSON rsp;
+    rsp["id"] = nullptr;
     rsp["jsonrpc"] = "2.0";
 
     // -32700 Parse error
     if (req.is_null())
     {
-        rsp["id"] = nullptr;
         rsp["error"] = MakeJsonrpcError(-32700, "Parse error");
         return rsp;
     }
@@ -134,17 +135,7 @@ ZMJSON ZmHttpJsonRpcServer::Dispatch(const ZMJSON& req)
     // 必须是对象
     if (!req.is_object())
     {
-        rsp["id"] = nullptr;
         rsp["error"] = MakeJsonrpcError(-32600, "Invalid Request");
-        return rsp;
-    }
-
-    // -32600 jsonrpc 版本
-    if (!req.contains("jsonrpc") || !req["jsonrpc"].is_string() ||
-        req["jsonrpc"].get<string>() != "2.0")
-    {
-        rsp["id"] = req.contains("id") ? req["id"] : ZMJSON(nullptr);
-        rsp["error"] = MakeJsonrpcError(-32600, "Invalid Request, Missing jrpc Parameter");
         return rsp;
     }
 
@@ -152,11 +143,18 @@ ZMJSON ZmHttpJsonRpcServer::Dispatch(const ZMJSON& req)
     if (!req.contains("id") ||
         !(req["id"].is_number_integer() || req["id"].is_string() || req["id"].is_null()))
     {
-        rsp["id"] = nullptr;
         rsp["error"] = MakeJsonrpcError(-32600, "Invalid Request, Missing id Parameter");
         return rsp;
     }
     rsp["id"] = req["id"];
+
+    // -32600 jsonrpc 版本
+    if (!req.contains("jsonrpc") || !req["jsonrpc"].is_string() ||
+        req["jsonrpc"].get<string>() != "2.0")
+    {
+        rsp["error"] = MakeJsonrpcError(-32600, "Invalid Request, Missing jrpc Parameter");
+        return rsp;
+    }
 
     // -32600 method
     if (!req.contains("method") || !req["method"].is_string())

@@ -62,7 +62,7 @@ using ZmHttpCoroHandler = std::function<
 struct ZmHttpSendFileOptions
 {
     size_t chunkSize      = 1 * 1024 * 1024;   ///< 分块粒度
-    size_t interBlockMs   = 50;                ///< 块间定时器间隔(定时器链节流,内存有界)
+    size_t interBlockMs   = 50;                ///< 块间定时器间隔(定时器链节流,内存有界);interBlockMs == 0 → 发完即调度(自适应,吞吐=排水速率,快客户端不设限)
     size_t watermarkBytes = 8 * 1024 * 1024;   ///< 严格水位目标(可选增强,默认不启用)
     int64_t stallAbortMs  = 120 * 1000;        ///< 对端停滞放弃阈值
 

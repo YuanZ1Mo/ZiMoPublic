@@ -356,10 +356,11 @@ public:
 
     /**
      * @brief 构造线程池并启动 worker 线程和 timer 线程
-     * @param threadCount  初始 worker 线程数量, 默认 4
+     * @param threadCount  初始 worker 线程数量, 默认 0;**特殊值 0 = 自动 = CPU 核数**
+     *                    (hardware_concurrency 无信息时兜底 4;自动增长仍受 ZM_POOL_MAX_THREADS 限制)
      * @param poolName     线程池名称, worker 线程命名为 "PoolName-W#N", 默认 "ZmThreadPool"
      */
-    explicit ZmThreadPool(uint16_t threadCount = 4, const std::string& poolName = "ZmThreadPool");
+    explicit ZmThreadPool(uint16_t threadCount = 0, const std::string& poolName = "ZmThreadPool");
 
     /**
      * @brief 析构时停止所有线程 (request_stop + notify + join)

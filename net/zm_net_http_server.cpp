@@ -119,6 +119,7 @@ static int64_t NowMs()
         .count();
 }
 
+// ── Run:打开文件句柄并驱动第一块(事件循环线程;收到流对象时立即调用) ──
 void ZmStreamLoopState::Run()
 {
     // 路径为内部构造的 ASCII 路径;File 已按 UTF-8(A:\ZiMo\...)
@@ -136,6 +137,8 @@ void ZmStreamLoopState::Run()
     Next();
 }
 
+// ── Next:调度一次异步读(块粒度 chunkSize,预读窗口=1 块) ──
+//    在途计数 m_inFlight 保护:读回执到达前不再叠加下一块;所有状态只在事件循环线程变更。
 void ZmStreamLoopState::Next()
 {
     if (m_fini)
@@ -176,6 +179,7 @@ void ZmStreamLoopState::Next()
         "ZmHttpRead");
 }
 
+// ── OnReadDone:读回执(事件循环线程) → 发送 + 进度 + 决定继续/收尾 ──
 void ZmStreamLoopState::OnReadDone(std::shared_ptr<std::string> buf, bool ok)
 {
     // 统一在事件循环线程执行(读线程仅回执,不碰 stream)
@@ -215,6 +219,7 @@ void ZmStreamLoopState::OnReadDone(std::shared_ptr<std::string> buf, bool ok)
                                       [st = shared_from_this()]() { st->Next(); });
 }
 
+// ── Finish:请求收尾(幂等)——有待在途读时延迟关句柄,由最后一笔回执补关(防竞态) ──
 void ZmStreamLoopState::Finish()
 {
     if (m_fini)
@@ -225,6 +230,7 @@ void ZmStreamLoopState::Finish()
         DoClose();
 }
 
+// ── DoClose:真正释放(句柄 + 流)——在途计数为 0 才执行,与 I/O 线程无竞态 ──
 void ZmStreamLoopState::DoClose()
 {
     if (m_closed)
@@ -323,6 +329,9 @@ std::map<string, std::function<bool(const drogon::HttpRequestPtr&,
 static std::atomic<size_t> s_workPoolSize{8};
 std::atomic<bool> ZmHttpServer::s_autoJsonp{true};   // 自动 JSONP 默认开(对齐主流)
 
+/// 三面共享的静态阻塞工作池(FR-19):RunOnPool 的唯一目的地。
+/// 容量为进程级全局(SetWorkPoolSize 注入),首次使用即定型;
+/// 同一进程内所有 HTTP 面共用,不与业务自建线程池混用。
 ZmThreadPool& ZmHttpServer::WorkPool()
 {
     static ZmThreadPool pool(static_cast<uint16_t>(s_workPoolSize.load()),
@@ -378,16 +387,22 @@ std::unique_ptr<std::promise<void>> s_startPromise;
 std::atomic<bool> s_startReady{false};
 }  // namespace
 
+/// 进程级状态查询:是否已完成 Init(当前可登记监听/路由,启动与否均可)
 bool ZmHttpServer::IsInitialized()
 {
     return s_state.load() >= ZmRuntimeState::Initialized;
 }
 
+/// 进程级状态查询:事件循环是否运行中(运行期只能 Close/证书热重载)
 bool ZmHttpServer::IsOpened()
 {
     return s_state.load() == ZmRuntimeState::Opened;
 }
 
+/// 进程级一次性初始化(FR-01/03/10,设计 §2.2):应用全局运行参数 + 证书 +
+/// 全局 advice(/ping、访问日志、自动 JSONP)。只允许 Uninit → Initialized 一次;
+/// 之后到 Open 前可自由 AddListener/Setup/RegisterCoro(Phase1)。
+/// @return false = 状态非法(重复 Init/已启动)或参数校验失败。
 bool ZmHttpServer::Init(const Options& opts)
 {
     ZmRuntimeState cur = s_state.load();
@@ -490,6 +505,10 @@ bool ZmHttpServer::Init(const Options& opts)
     return true;
 }
 
+/// 启动服务器(FR-01/04,设计 §2.2 Phase2):后台线程跑 app().run()。
+/// 前置:已 Init 且已登记至少一个监听;启动成功以"事件循环就绪信号"
+/// (registerBeginningAdvice)为准,绑定失败(端口占用等)经 run 线程异常
+/// fail-fast 返回 false。
 bool ZmHttpServer::Open()
 {
     ZmRuntimeState cur = s_state.load();
@@ -571,6 +590,11 @@ bool ZmHttpServer::Open()
     return true;
 }
 
+/// 全局唯一关闭(FR-04,设计 §2.2 Phase3):quit() + join run 线程;幂等。
+/// 状态分支:未启动/已关闭 → 直接返回;Initialized 未 Open → 仅回退状态;
+/// Opened → 先 app().quit() 停事件循环,再 Stop(join)。
+/// ⚠ 在飞 HTTP 语义(v2.7):quit 后挂起协程不再调度,业务层自保障
+///    (守护线程 join/断点),本函数不等待在飞业务。
 void ZmHttpServer::Close()
 {
     ZmRuntimeState cur = s_state.load();
@@ -595,6 +619,8 @@ void ZmHttpServer::Close()
     PUBLIC_LOG_INFO("ZmHttpServer::Close 完成(已 quit+Stop,终态)");
 }
 
+/// 本面是否 HTTPS(一对象一端口:监听 useSSL 即 HTTPS 模式;
+/// 证书为进程级全局,各面判定结果一致)
 bool ZmHttpServer::IsHttps() const
 {
     // 一对象一端口(v2.5):本面监听启用 useSSL 即 HTTPS 模式
@@ -667,6 +693,8 @@ namespace
 {
 /// 上传落盘状态机:网络块经有界队列交专用写线程顺序落盘,
 /// 事件循环只入队与收结果回执(写盘绝不占用事件循环线程 — NFR)
+/// 流式上游(FR-15)写入执行器:事件循环接收数据块(fifo 入队)→ 专用写线程落盘;
+/// 处理 停写(超限/用户取消/网络中断)、进度节流、结束/失败回执,半成品一致性。
 class ZmUploadSink : public std::enable_shared_from_this<ZmUploadSink>
 {
 public:
@@ -985,6 +1013,10 @@ struct ZmSinkAwaiter : drogon::CallbackAwaiter<bool>
 
 }  // namespace
 
+/// 流式接收落盘助手(FR-15):把 RequestStream(块到达即回调)写入 destPath,
+/// 全程经 ZmUploadSink(事件循环入队 + 专用写线程,磁盘 I/O 不占事件循环)。
+/// 失败(网络中断/写盘错误/超限)会清理半成品并置 *tooLarge(超限语义)。
+/// @return true=完整落盘成功;false=失败(经 tooLarge 区分超限/其他)。
 drogon::Task<bool> ZmHttpServer::SaveStreamToFile(drogon::RequestStreamPtr stream,
                                                   const std::string& destPath,
                                                   const ZmHttpUploadFileOptions& opts,
@@ -998,6 +1030,11 @@ drogon::Task<bool> ZmHttpServer::SaveStreamToFile(drogon::RequestStreamPtr strea
     co_return co_await a;
 }
 
+/// 注册"流式接收"路由(FR-15 路径 B):handler 形参带 RequestStreamPtr,
+/// drogon FunctionTraits 判定为 stream-handler,框架注入流对象并逐块回调。
+/// @param maxBytes 路由级上传上限(0=不限):X-File-Size 声明超限 → 丢剩余并
+///                 413(newNullReader),并把上限写 req attributes("ZmStreamMaxBytes")
+///                 供业务 SaveStreamToFile 兜底取用。
 void ZmHttpServer::RegisterStreamCoro(const string& path, drogon::HttpMethod m,
                                       ZmHttpStreamHandler h, const vector<string>& filters,
                                       uint64_t maxBytes)
@@ -1158,6 +1195,9 @@ string ZmHttpServer::PathPatternToRegex(const string& path)
     return out;
 }
 
+/// 注册带业务级 deadline 的协程路由(FR-14):到期由事件循环定时器发 504,
+/// 原子门(TryReply)保证只回一次;业务晚到结果经"弱引用 + connected()"安全丢弃。
+/// 定时器注册在连接所属 loop;流式/下载端点不要用本接口。
 void ZmHttpServer::RegisterCoroWithDeadline(const string& path, drogon::HttpMethod m,
                                                 ZmHttpCoroHandler h, size_t deadlineMs,
                                                 const vector<string>& filters)
@@ -1261,6 +1301,14 @@ void ZmHttpServer::RegisterPreSending(std::function<void(const HttpRequestPtr&,
 // ============================================================================
 // 文件传输(FR-12):Range 解析 + 方案甲/乙 + Hybrid
 // ============================================================================
+// ----------------------------------------------------------------------------
+// ParseRange —— 请求 Range 头解析(方案甲/乙共用)
+//   支持:bytes=a-b(闭区间)、bytes=a-(开终点,到文件尾)、bytes=-N(后缀 N 字节)
+//   规则:仅单段;多段/非数字/起点越界/终点小于起点 → valid=false
+//        (present=true 且 !valid 时调用方按 RFC 7233 返回 416);
+//        无 Range 头 → present=false(调用方走全文件 200);
+//   注:drogon 的 newFileResponse 不解析 Range 头,故所有范围语义在此统一实现。
+// ----------------------------------------------------------------------------
 ZmHttpServer::RangeInfo ZmHttpServer::ParseRange(const HttpRequestPtr& req,
                                                          size_t fileSize)
 {
@@ -1403,34 +1451,53 @@ const string& ZmHttpServer::MimeForExt(const string& path)
     return it == m.end() ? noMime : it->second;
 }
 
+// ============================================================================
+// SendFileCoro —— 文件下载"方案甲":(FR-12)
+//   直接使用 drogon::HttpResponse::newFileResponse(内部为 trantor sendFile,
+//   零拷贝分段读盘入发送缓冲),Range/206/Content-Length/Accept-Ranges 语义由框架兜底。
+//   适用:常规文件(< Hybrid 阈值);要求简洁、带宽内无额外延迟。
+//   边界:无字节级水位(慢客户端背压依赖 trantor 输出缓冲,见设计 §6.1 O1 待实测)。
+// ============================================================================
 drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileCoro(const HttpRequestPtr& req,
                                                              const string& path,
                                                              const string& attachmentName)
 {
+    // ① 文件存在性/可读性校验(stat;失败 → 404)
     std::error_code ec;
     if (!std::filesystem::exists(path, ec) || ec)
     {
         co_return ErrorResponse(404, "file not found");
     }
+    // ② 取文件大小:Range 解析与 206 Content-Range 都需要它;失败 → 500
     size_t fileSize = static_cast<size_t>(std::filesystem::file_size(path, ec));
     if (ec)
     {
         co_return ErrorResponse(500, "file stat failed");
     }
 
+    // ③ 解析 Range 头(共用解析器):present=带 Range;valid=单段合法(多段/非法 → 无效)
     RangeInfo r = ParseRange(req, fileSize);
     if (r.present && !r.valid)
     {
+        // Range 头存在但不可满足 → 413/416 语义:416 + Content-Range: bytes */size
         co_return Range416Response(true, fileSize);
     }
+    // ④ "bytes=a-" 这类开放终点:length=0 表示"到文件尾",这里把语义具体化
     if (r.partial && r.length == 0)
         r.length = fileSize - r.offset;
 
+    // ⑤ 构造文件响应:
+    //    partial(有合法 Range)→ offset/length 只发区间,setContentRange 由下面手动加头;
+    //    全文件 → offset=0,length=fileSize;
+    //    attachmentName 非空 → 框架自动写 Content-Disposition: attachment。
+    //    ⚠ setContentRange 传 false:统一由本函数显式写 Content-Range,避免框架/手动双写
     HttpResponsePtr resp = HttpResponse::newFileResponse(
         path, r.offset, r.partial ? r.length : fileSize,
         /*setContentRange=*/false, attachmentName, CT_NONE, "", req);
 
+    // ⑥ 告知客户端支持断点续传(Range 请求有效依据)
     resp->addHeader("Accept-Ranges", "bytes");
+    // ⑦ 部分内容:206 + Content-Range: bytes {offset}-{offset+length-1}/{fileSize}
     if (r.partial)
     {
         resp->setStatusCode(k206PartialContent);
@@ -1442,11 +1509,20 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileCoro(const HttpRequestPtr& r
     co_return resp;
 }
 
+// ============================================================================
+// SendFileStreamCoro —— 文件下载"方案乙":(FR-12)
+//   newAsyncStreamResponse 分块流式(Transfer-Encoding: chunked,不设 Content-Length),
+//   块间定时器节流:预读窗口 = 1 块 → 内存有界(慢客户端缓冲不随时长线性涨)。
+//   读盘走专用 I/O 线程池(HttpIoPool),事件循环线程绝不阻塞(NFR);
+//   支持停滞放弃(stallAbortMs,客户端 Range 续传)与进度回调(onProgress)。
+//   适用:≥Hybrid 阈值的大文件、需要进度回调/长连接稳定性控制的场景。
+// ============================================================================
 drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoro(const HttpRequestPtr& req,
                                                                    const string& path,
                                                                    const string& attachmentName,
                                                                    const ZmHttpSendFileOptions& opts)
 {
+    // ① 文件存在性/大小校验(同方案甲;失败 → 404/500)
     std::error_code ec;
     if (!std::filesystem::exists(path, ec) || ec)
     {
@@ -1458,6 +1534,7 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoro(const HttpRequest
         co_return ErrorResponse(500, "file stat failed");
     }
 
+    // ② Range 解析(同方案甲共用):合法单段 → partial 区间;非法 → 416
     RangeInfo r = ParseRange(req, fileSize);
     if (r.present && !r.valid)
     {
@@ -1466,21 +1543,26 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoro(const HttpRequest
     if (r.partial && r.length == 0)
         r.length = fileSize - r.offset;
 
+    // ③ 流式响应工厂:回调在发送启动时(事件循环线程)被框架调用,
+    //    在此把 文件路径/区间/行为参数 注入发送状态机,并立即 Run() 驱动第一块;
+    //    true = disableKickoffTimeout:禁用 trantor 默认启动超时(大文件/长流不被误杀)
     HttpResponsePtr resp = HttpResponse::newAsyncStreamResponse(
         [path, fileSize, r, opts, attachmentName](ResponseStreamPtr stream) mutable {
-            auto st = std::make_shared<ZmStreamLoopState>();
+            auto st = std::make_shared<ZmStreamLoopState>();   // 状态机对象(持所有权)
             st->path = path;
-            st->total = r.partial ? r.length : fileSize;
-            st->remaining = st->total;
-            st->abortMs = opts.stallAbortMs;
+            st->total = r.partial ? r.length : fileSize;       // 本次发送总量(区间或全文件)
+            st->remaining = st->total;                          // 剩余待发字节
+            st->abortMs = opts.stallAbortMs;                    // 停滞放弃阈值(默认 120s)
             st->opts = opts;
-            st->stream = std::move(stream);
-            st->Run();
+            st->stream = std::move(stream);                     // 排他持有流(close 由状态机负责)
+            st->Run();                                          // 打开文件句柄并调度第一块
         },
         true);
 
+    // ④ 响应头:断点续传声明 + MIME(方案乙无 Content-Length,chunked 编码)
     resp->addHeader("Accept-Ranges", "bytes");
     resp->addHeader("Content-Type", MimeForExt(path));
+    // ⑤ 部分内容 → 206 + Content-Range(格式同方案甲;长度由 chunked 流承载)
     if (r.partial)
     {
         resp->setStatusCode(k206PartialContent);
@@ -1489,6 +1571,7 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoro(const HttpRequest
                             std::to_string(r.offset + r.length - 1) + "/" +
                             std::to_string(fileSize));
     }
+    // ⑥ 下载文件名(浏览器另存为)
     if (!attachmentName.empty())
     {
         resp->addHeader("Content-Disposition",
@@ -1497,18 +1580,27 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoro(const HttpRequest
     co_return resp;
 }
 
+// ============================================================================
+// SendFileHybridCoro —— 文件下载"便捷入口":(FR-12)
+//   按文件大小自动路由:fileSize < threshold → 方案甲 SendFileCoro(常规,零拷贝)
+//                        fileSize ≥ threshold → 方案乙 SendFileStreamCoro(流式,内存有界)
+//   阈值默认 2GB(调用方可覆盖;0 = 恒乙);不关心细节的业务层直接用本入口。
+// ============================================================================
 drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileHybridCoro(const HttpRequestPtr& req,
                                                                    const string& path,
                                                                    const string& attachmentName,
                                                                    size_t threshold,
                                                                    const ZmHttpSendFileOptions& streamOpts)
 {
+    // ① 文件存在性校验(失败 → 404)
     std::error_code ec;
     if (!std::filesystem::exists(path, ec) || ec)
     {
         co_return ErrorResponse(404, "file not found");
     }
+    // ② 取文件大小用于路由抉择
     size_t fileSize = static_cast<size_t>(std::filesystem::file_size(path, ec));
+    // ③ 路由:小文件(含 stat 失败情形)走方案甲;≥ 阈值走方案乙并携带行为参数
     if (fileSize < threshold)
         co_return co_await SendFileCoro(req, path, attachmentName);
     co_return co_await SendFileStreamCoro(req, path, attachmentName, streamOpts);
@@ -1517,6 +1609,8 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileHybridCoro(const HttpRequest
 // ============================================================================
 // 流式工厂(FR-13)
 // ============================================================================
+/// 流式响应工厂(FR-13):返回 newAsyncStreamResponse 响应,调用方自行设头;
+/// disableKickoff=true 关闭 trantor 默认启动超时(长流/业务线程先启动场景必备)。
 HttpResponsePtr ZmHttpServer::MakeStreamResponse(StreamCb cb, bool disableKickoff)
 {
     return HttpResponse::newAsyncStreamResponse(std::move(cb), disableKickoff);
@@ -1525,6 +1619,8 @@ HttpResponsePtr ZmHttpServer::MakeStreamResponse(StreamCb cb, bool disableKickof
 // ============================================================================
 // WebSocket(FR-16;设计 §9)
 // ============================================================================
+/// 注册 WebSocket 路由(FR-16):每个 path 生成唯一注册名,经 DrClassMap 工厂
+/// 实例化通用 ZmWsController,回调按注册名存入全局表(onAuth 拒绝语义见 §9)。
 void ZmHttpServer::RegisterWebSocket(const string& path, const WsCallbacks& cb)
 {
     string regName = BuildWsRegName();
@@ -1542,6 +1638,8 @@ void ZmHttpServer::RegisterWebSocket(const string& path, const WsCallbacks& cb)
 // 响应助手(FR-08/09/24;业务层使用 ZMJSON,输出为构造序)
 // ============================================================================
 
+/// drogon(Json::Value)→ 业务 ZMJSON(递归)。⚠ 对象键序按 Json::Value 内部
+/// map 字典序;需要构造序时请业务侧直接用 ZMJSON 构造,勿经本转换。
 ZMJSON ZmHttpServer::FromDrogonJson(const Json::Value& v)
 {
     switch (v.type())
@@ -1573,6 +1671,8 @@ ZMJSON ZmHttpServer::FromDrogonJson(const Json::Value& v)
     }
 }
 
+/// 业务 ZMJSON → drogon(Json::Value)(递归)。仅 drogon API 要求处使用
+/// (如 loadConfigJson 等价场景);业务链路无需接触 jsoncpp。
 Json::Value ZmHttpServer::ToDrogonJson(const ZMJSON& v)
 {
     if (v.is_null())
@@ -1604,6 +1704,8 @@ Json::Value ZmHttpServer::ToDrogonJson(const ZMJSON& v)
     return Json::Value(Json::nullValue);
 }
 
+/// 统一 JSON 响应(FR-09):裸 JSON 体(业务语义),状态码由参数指定;
+/// ZMJSON 直序列化 → 输出为构造序(键序可控)。
 HttpResponsePtr ZmHttpServer::JsonResponse(int status, const ZMJSON& data)
 {
     auto resp = HttpResponse::newHttpResponse();
@@ -1613,6 +1715,7 @@ HttpResponsePtr ZmHttpServer::JsonResponse(int status, const ZMJSON& data)
     return resp;
 }
 
+/// 统一错误响应(FR-08):{error:{code,message}} 错误包(与前端 auth.js 约定一致)
 HttpResponsePtr ZmHttpServer::ErrorResponse(int status, const string& msg)
 {
     ZMJSON error;
@@ -1631,6 +1734,9 @@ bool ZmHttpServer::IsValidJsonpCallback(const std::string& cb)
     });
 }
 
+/// 显式 JSONP 响应(FR-24):有合法 callback → cb(json);(application/javascript);
+/// 无 callback → 常规 JSON;非法 callback 名 → 400。
+/// (自动 JSONP 为全局开关 SetAutoJsonp,经 PreSending advice 兜底包装)
 HttpResponsePtr ZmHttpServer::JsonpResponse(const HttpRequestPtr& req, const ZMJSON& data)
 {
     string cb = req->getParameter("callback");
