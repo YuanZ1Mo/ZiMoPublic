@@ -91,6 +91,7 @@ class ZmStreamLoopState : public std::enable_shared_from_this<ZmStreamLoopState>
 {
 public:
     string path;
+    uint64_t offset = 0;      // 发送起点(Range 续传定位;全文件 = 0)
     uint64_t remaining = 0;
     uint64_t total = 0;
     uint64_t sent = 0;
@@ -132,6 +133,18 @@ void ZmStreamLoopState::Run()
         PUBLIC_LOG_ERROR("SendFileStreamCoro 打不开文件: {}", path);
         Finish();
         return;
+    }
+    // Range 续传定位:从 offset 起读(全文件 offset=0);定位失败按错误收尾
+    if (offset > 0)
+    {
+        LARGE_INTEGER li;
+        li.QuadPart = static_cast<LONGLONG>(offset);
+        if (!SetFilePointerEx(m_handle, li, nullptr, FILE_BEGIN))
+        {
+            PUBLIC_LOG_ERROR("SendFileStreamCoro 定位失败(offset={}): {}", offset, path);
+            Finish();
+            return;
+        }
     }
     lastSentMs = NowMs();
     Next();
@@ -1550,6 +1563,7 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoro(const HttpRequest
         [path, fileSize, r, opts, attachmentName](ResponseStreamPtr stream) mutable {
             auto st = std::make_shared<ZmStreamLoopState>();   // 状态机对象(持所有权)
             st->path = path;
+            st->offset = r.offset;                              // Range 起点(续传定位)
             st->total = r.partial ? r.length : fileSize;       // 本次发送总量(区间或全文件)
             st->remaining = st->total;                          // 剩余待发字节
             st->abortMs = opts.stallAbortMs;                    // 停滞放弃阈值(默认 120s)
