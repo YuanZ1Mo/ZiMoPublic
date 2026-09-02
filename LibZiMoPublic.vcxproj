@@ -1309,6 +1309,8 @@
     <ClInclude Include="net\zm_net_http_jsonrpc_server.h" />
     <ClInclude Include="net\zm_net_http_restful_server.h" />
     <ClInclude Include="net\zm_net_http_server.h" />
+    <ClInclude Include="net\zm_net_http_client.h" />
+    <ClInclude Include="net\zm_net_http_client_download.h" />
     <ClInclude Include="net\zm_net_ip.h" />
     <ClInclude Include="service\zm_service_base.h" />
     <ClInclude Include="spdlog\async.h" />
@@ -1436,6 +1438,8 @@
     <ClCompile Include="net\zm_net_http_jsonrpc_server.cpp" />
     <ClCompile Include="net\zm_net_http_restful_server.cpp" />
     <ClCompile Include="net\zm_net_http_server.cpp" />
+    <ClCompile Include="net\zm_net_http_client.cpp" />
+    <ClCompile Include="net\zm_net_http_client_download.cpp" />
     <ClCompile Include="service\zm_service_base.cpp" />
     <ClCompile Include="util\zm_util_container.cpp" />
     <ClCompile Include="util\zm_util_evbase_runloop.cpp" />

@@ -4341,6 +4341,12 @@
     <ClInclude Include="net\zm_net_http_server.h">
       <Filter>头文件\net</Filter>
     </ClInclude>
+    <ClInclude Include="net\zm_net_http_client.h">
+      <Filter>头文件\net</Filter>
+    </ClInclude>
+    <ClInclude Include="net\zm_net_http_client_download.h">
+      <Filter>头文件\net</Filter>
+    </ClInclude>
     <ClInclude Include="net\zm_net_http_restful_server.h">
       <Filter>头文件\net</Filter>
     </ClInclude>
@@ -4407,6 +4413,12 @@
       <Filter>源文件\net</Filter>
     </ClCompile>
     <ClCompile Include="net\zm_net_http_server.cpp">
+      <Filter>源文件\net</Filter>
+    </ClCompile>
+    <ClCompile Include="net\zm_net_http_client.cpp">
+      <Filter>源文件\net</Filter>
+    </ClCompile>
+    <ClCompile Include="net\zm_net_http_client_download.cpp">
       <Filter>源文件\net</Filter>
     </ClCompile>
     <ClCompile Include="util\zm_util_evbase_runloop.cpp">
