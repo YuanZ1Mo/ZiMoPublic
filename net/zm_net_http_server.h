@@ -25,6 +25,7 @@
 #include <drogon/HttpResponse.h>
 #include <drogon/HttpTypes.h>
 #include <drogon/RequestStream.h>
+#include <drogon/RateLimiter.h>   // §16.4 限流(newRateLimiter/SafeRateLimiter)
 #include <drogon/utils/coroutine.h>
 #include <drogon/WebSocketConnection.h>
 
@@ -40,6 +41,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace drogon
@@ -137,6 +139,9 @@ public:
         bool ticketDisabled = false;       // TLS SessionTicket 禁用(安全项)
         std::string certFile;              // 全局证书(空 = 纯 HTTP)
         std::string keyFile;
+        /// 指标端点路径(空 = 不注册;建议 "/zimo/metrics";进程级计数,GET 返回 JSON;
+        /// 无鉴权,内网约定,公网时挂 filter)。
+        std::string metricsPath;
         /// CORS 白名单(按 Origin 全串精确匹配,如 "https://www.example.com")。
         /// 空 = 不回显任何 CORS 头(跨域被浏览器拒绝,默认收敛);命中才回显 Origin +
         /// Allow-Credentials。跨域调用方在此登记;不含 "*"(与凭据头互斥)。
@@ -215,6 +220,36 @@ public:
     /// origin 在名单内 → 回显 CORS 头;空名单/不在 → 不发(浏览器拒绝跨域)。
     static bool IsCorsOriginAllowed(const std::string& origin);
 
+    // ── 限流(§16.4;底层 drogon RateLimiter,全部经 SafeRateLimiter 线程安全包装) ──
+    using ZmRateLimiterPtr = drogon::RateLimiterPtr;   // SafeRateLimiter 包装
+    /// 单桶(全局配额;一次容量一个额度),如全站每小时 10 万次。
+    static ZmRateLimiterPtr CreateRateLimiter(drogon::RateLimiterType type,
+                                              size_t capacity,
+                                              double timeUnitSec);
+    /// 逐 IP 桶协调器(每个 IP 独立桶;有界 maxEntries,溢出按插入序驱逐防泄漏)。
+    class ZmIpRateLimiter
+    {
+    public:
+        static std::shared_ptr<ZmIpRateLimiter>
+        Create(drogon::RateLimiterType type, size_t capacity, double timeUnitSec,
+               size_t maxEntries = 10000);
+        /// 组合执行:overlay(封禁→false/白→true/专项额度)未命中走本桶;
+        /// false 时会把 429 响应写入 resp。@return 放行?
+        bool Check(const drogon::HttpRequestPtr& req, drogon::HttpResponsePtr& resp);
+    private:
+        ZmIpRateLimiter() = default;
+        struct Impl;
+        std::shared_ptr<Impl> m_impl;
+    };
+    // ── overlay 动态规则(进程全局;COW 快照,热路径零锁;运行期可调) ──
+    static void SetIpBlocked(const std::string& ip);          // 封禁(直接 429)
+    static void UnblockIp(const std::string& ip);             // 解封
+    static void SetIpQuota(const std::string& ip, size_t capacity,
+                           double timeUnitSec);                // 专项额度(覆盖默认)
+    static void SetIpAllowed(const std::string& ip);           // 白名单放行
+    static void RemoveRateRule(const std::string& ip);         // 删除规则
+    static bool IsRateRuleHit(const std::string& ip);          // 审计标注(命中封禁/白/专项)
+
     // ── 文件传输(FR-12,双路径;Range 由基类内部解析) ──
     /// 支持条件请求:Last-Modified(mtime)+ 强 ETag(size-mtime),If-None-Match
     /// 优先、If-Modified-Since 兜底 → 304(无 body);Range/206 语义同前。
@@ -234,6 +269,35 @@ public:
     // ── 流式(FR-13;静态工厂:返回流式响应,调用方自行设头) ──
     using StreamCb = std::function<void(drogon::ResponseStreamPtr)>;
     static drogon::HttpResponsePtr MakeStreamResponse(StreamCb cb, bool disableKickoff = true);
+
+    // ── Multipart 表单/文件上传(第二期 §16.2;流式 newMultipartReader 解析,
+    //    文件内容 v1 内存交付,受单请求 maxBytes 约束;大文件走 RegisterStreamCoro) ──
+    struct ZmMultipartResult
+    {
+        struct File
+        {
+            std::string itemName;      // 表单 item 名(原始)
+            std::string fileName;      // 已消毒文件名(仅文件名段;空 = 无合法名)
+            std::string contentType;   // 客户端声明 Content-Type
+            uint64_t size = 0;
+            std::string data;          // 内容(内存;有界 = 单请求 maxBytes)
+        };
+        std::vector<std::pair<std::string, std::string>> fields;  // 表单字段(key,value)
+        std::vector<File> files;
+    };
+    using ZmMultipartHandler = std::function<drogon::Task<drogon::HttpResponsePtr>(
+        const drogon::HttpRequestPtr&, const ZmMultipartResult&)>;
+    /// 注册 multipart 路由:Content-Type/boundary 预检(缺 → 400)→ 声明超限 413
+    /// → 流式 reader 收集(字段值 ≤1MB,超限 413)→ 交付业务协程。
+    /// @param maxBytes 单请求总量上限(0 = 仅框架 clientMaxBodySize 兜底)
+    virtual void RegisterMultipartCoro(const std::string& path, drogon::HttpMethod m,
+                                       ZmMultipartHandler h,
+                                       const std::vector<std::string>& filters = {},
+                                       uint64_t maxBytes = 256ULL * 1024 * 1024);
+    /// 助手:多部件文件落盘(离核工作池;返回写入字节数,失败 -1;
+    /// 业务回调内必须经此落盘,不得直接写文件——事件循环纪律)
+    static drogon::Task<int64_t> SaveMultipartFile(const ZmMultipartResult::File& f,
+                                                   const std::string& destPath);
 
     // ── 流式接收(FR-15,路径 B;与 Options.enableRequestStream 配套) ──
     /// @param maxBytes 路由级上传上限(0 = 不额外限制,全局 10GB 兜底);基类按
@@ -310,6 +374,25 @@ protected:
     {
         return m_listenerSet && ZmHttpLocalPort(req) == m_listener.port;
     }
+
+    // ── 静态资源条件请求(第二期 §16.1;SendFile* 与前端面 SPA 回落共用) ──
+    /// 文件元信息(单次 stat:存在性/大小/最后写入秒)
+    struct ZmFileMeta
+    {
+        bool found = false;       // 文件存在(否则 → 404)
+        bool sizeFailed = false;  // 存在但取大小失败(否则 → 500)
+        size_t size = 0;
+        int64_t mtimeSec = 0;     // last_write_time → epoch 秒
+    };
+    static ZmFileMeta FetchFileMeta(const std::string& path);  ///< 单次 stat 取元信息
+    /// 缓存头对(Last-Modified, ETag;强 ETag = "size-mtime")
+    static std::pair<std::string, std::string>
+    CacheHeaders(const ZmFileMeta& m);
+    /// 条件请求判定:If-None-Match 优先(弱比较/列表),If-Modified-Since 兜底;
+    /// @return 非空 = 304 响应;nullptr = 继续 200/206 流程
+    static drogon::HttpResponsePtr Maybe304(const drogon::HttpRequestPtr& req,
+                                            const ZmFileMeta& m,
+                                            const std::pair<std::string, std::string>& cacheHeaders);
 
 private:
     // ── filter 按名注册 ──

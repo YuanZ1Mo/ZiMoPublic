@@ -57,6 +57,17 @@ public:
     /// 自定义 404 页(仅前端;SPA 回落请用 AddSpaFallback,勿用 setImplicitPage)
     void SetNotFoundPage(const std::string& file);
 
+    // ── 静态资源缓存策略(第二期 §16.1.2,A 档;Open 前调用) ──
+    /// 发布层两态:无指纹资源走再校验态(默认,每次 IMS→304),
+    /// 指纹化资源长缓存态(按扩展名,命中本地零请求)。实现为"纯加头"的
+    /// PreSending advice(静态响应特征判定,不改响应状态,无发送路径风险)。
+    struct ZmStaticCacheConfig
+    {
+        std::string defaultPolicy;                                   // 默认(再校验态),如 "public, max-age=0, must-revalidate"
+        std::vector<std::pair<std::string, std::string>> extPolicy; // {".js", "public, max-age=31536000, immutable"}
+    };
+    void SetStaticCachePolicy(const ZmStaticCacheConfig& cfg);
+
     /// 其他面的业务根路径(前端门禁用于拒绝外来前缀;由宿主配置时调用)
     void AddOtherRootPath(const std::string& path)
     {
@@ -71,6 +82,7 @@ private:
     std::vector<std::pair<std::string, std::string>> m_spaFallbacks;  // {prefix, file}
     std::vector<std::string> m_deniedPaths;                           // 封禁前缀
     std::string m_docRoot;               // SetDocumentRoot 缓存(构造页面绝对路径用)
+    ZmStaticCacheConfig m_staticCache;   // 静态缓存头策略(§16.1.2;defaultPolicy 空 = 关闭)
     std::vector<std::string> m_otherRootPaths;  // 其他面根路径(前端门禁拒绝外来前缀)
 };
 

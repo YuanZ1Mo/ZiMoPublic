@@ -26,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 
 #include <windows.h>
 
@@ -120,6 +121,40 @@ static int64_t NowMs()
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+}
+
+// ----------------------------------------------------------------------------
+// 请求 ID 与指标计数器(第二期 §16.3;原子,每请求 1-4 次操作)
+// ----------------------------------------------------------------------------
+static std::atomic<uint64_t> s_reqIdSeq{1};
+static std::atomic<uint64_t> s_metricTotal{0}, s_metric2xx{0}, s_metric3xx{0};
+static std::atomic<uint64_t> s_metric4xx{0}, s_metric5xx{0}, s_metricInflight{0};
+static std::atomic<uint64_t> s_metricLat[4];   // <10ms / 10-100 / 100-1000 / >=1000
+static std::atomic<int64_t> s_startupEpoch{0};
+
+/// 请求 ID:zm-<unix秒>-<进程内原子序>;合法字符 [A-Za-z0-9-_.]
+/// (bugfix 2026-09-03:原实现误用 steady_clock 秒(开机起算),ID 时间语义错且
+///  重启后秒段重新计时,改用 system_clock 与注释/world time 一致)
+static string MakeRequestId()
+{
+    auto now = std::chrono::system_clock::now();
+    return "zm-" +
+           std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
+                              now.time_since_epoch())
+                              .count()) +
+           "-" + std::to_string(s_reqIdSeq.fetch_add(1, std::memory_order_relaxed));
+}
+
+static bool IsValidRequestId(const string& id)
+{
+    if (id.empty() || id.size() > 128)
+        return false;
+    for (char c : id)
+    {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_' && c != '.')
+            return false;
+    }
+    return true;
 }
 
 // ── Run:打开文件句柄并驱动第一块(事件循环线程;收到流对象时立即调用) ──
@@ -332,110 +367,6 @@ string BuildWsRegName()
     return "ZmWsCtrl" + std::to_string(n.fetch_add(1));
 }
 
-// ----------------------------------------------------------------------------
-// 文件条件请求(Last-Modified/ETag → 304;RFC 7232;文件传输三条路径共用)
-// ----------------------------------------------------------------------------
-/// RFC1123 HTTP 日期输出("Thu, 03 Sep 2026 10:00:00 GMT")
-static string HttpDateStr(int64_t t)
-{
-    std::time_t et = static_cast<std::time_t>(t);
-    std::tm tmv{};
-    if (gmtime_s(&tmv, &et) != 0)
-        return "";
-    char buf[64];
-    if (std::strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", &tmv) == 0)
-        return "";
-    return buf;
-}
-
-/// 文件元信息(存在性/大小/最后写入秒;单次 stat 提供,条件请求与 Range 共用)
-struct ZmFileMeta
-{
-    bool found = false;       // 文件存在(否则 → 404)
-    bool sizeFailed = false;  // 存在但取大小失败(否则 → 500)
-    size_t size = 0;
-    int64_t mtimeSec = 0;     // last_write_time → epoch 秒
-};
-
-static ZmFileMeta FetchFileMeta(const string& path)
-{
-    ZmFileMeta m;
-    std::error_code ec;
-    m.found = std::filesystem::exists(path, ec) && !ec;
-    if (!m.found)
-        return m;
-    m.size = static_cast<size_t>(std::filesystem::file_size(path, ec));
-    if (ec)
-    {
-        m.sizeFailed = true;
-        return m;
-    }
-    std::error_code ec2;
-    auto ft = std::filesystem::last_write_time(path, ec2);
-    if (!ec2)
-    {
-        // file_time(文件时钟) → system_clock(epoch 秒):以两个时钟的 now 为桥换算
-        auto fileNow = std::filesystem::file_time_type::clock::now();
-        auto sysNow = std::chrono::system_clock::now();
-        auto sysT = std::chrono::time_point_cast<std::chrono::seconds>(
-            sysNow - (fileNow - ft));
-        m.mtimeSec =
-            static_cast<int64_t>(std::chrono::system_clock::to_time_t(sysT));
-    }
-    return m;
-}
-
-/// 缓存头(200/206/304 共用;强 ETag = size-mtime)
-static pair<string, string> CacheHeaders(const ZmFileMeta& m)
-{
-    return {HttpDateStr(m.mtimeSec),
-            "\"" + std::to_string(m.size) + "-" + std::to_string(m.mtimeSec) + "\""};
-}
-
-/// 条件请求判定:If-None-Match 优先(命中 → 304;未命中跳过 If-Modified-Since),
-/// If-Modified-Since 兜底(文件未改 → 304)。日期非法视为未提供。
-/// @return 非空 = 304 响应(调用方直接返回);nullptr = 继续正常 200/206 流程。
-static HttpResponsePtr Maybe304(const HttpRequestPtr& req, const ZmFileMeta& m,
-                                const pair<string, string>& cacheHeaders)
-{
-    const string& lastMod = cacheHeaders.first;
-    const string& etag = cacheHeaders.second;
-    string inm = req->getHeader("If-None-Match");
-    if (!inm.empty())
-    {
-        // RFC 7232:If-None-Match 弱比较(可带 W/ 前缀/逗号列表),用子串命中已够
-        if (inm == "*" || inm.find(etag) != string::npos)
-        {
-            auto resp = HttpResponse::newHttpResponse();
-            resp->setStatusCode(k304NotModified);
-            resp->addHeader("Last-Modified", lastMod);
-            resp->addHeader("ETag", etag);
-            return resp;
-        }
-        return nullptr;
-    }
-    string ims = req->getHeader("If-Modified-Since");
-    if (!ims.empty())
-    {
-        try
-        {
-            trantor::Date d = drogon::utils::getHttpDate(ims);
-            if (d.microSecondsSinceEpoch() / 1000000 >= m.mtimeSec)
-            {
-                auto resp = HttpResponse::newHttpResponse();
-                resp->setStatusCode(k304NotModified);
-                resp->addHeader("Last-Modified", lastMod);
-                resp->addHeader("ETag", etag);
-                return resp;
-            }
-        }
-        catch (...)
-        {
-            // 日期非法 → 当作未提供
-        }
-    }
-    return nullptr;
-}
 }  // namespace
 
 // ============================================================================
@@ -542,6 +473,7 @@ bool ZmHttpServer::Init(const Options& opts)
     app().setClientMaxMemoryBodySize(opts.clientMaxMemoryBodySize);  // 内存闸:超限落临时文件
     s_nonStreamBodyLimit.store(opts.nonStreamBodyLimit, std::memory_order_relaxed);
     s_corsOrigins = opts.corsAllowedOrigins;       // CORS 白名单(启动前注入,运行期只读)
+    s_startupEpoch.store(NowMs(), std::memory_order_relaxed);
     app().setIdleConnectionTimeout(opts.idleTimeoutSec);
     app().setKeepaliveRequestsNumber(opts.keepaliveRequests);   // 0 = 不限次数回收
     app().enableRequestStream(opts.enableRequestStream);
@@ -589,35 +521,17 @@ bool ZmHttpServer::Init(const Options& opts)
     // 起始时间存 req attributes,PostHandling 观察点结算。
     app().registerPreRoutingAdvice([](const HttpRequestPtr& req) {
         req->getAttributes()->insert("ZmAccessStartMs", std::any(int64_t(NowMs())));
+        // 请求 ID(§16.3):上游透传优先(合法字符校验),否则生成 zm-<秒>-<序>
+        string rid = req->getHeader("X-Request-Id");
+        if (rid.empty() || !IsValidRequestId(rid))
+            rid = MakeRequestId();
+        req->getAttributes()->insert("ZmRequestId", std::any(rid));
+        s_metricInflight.fetch_add(1, std::memory_order_relaxed);
     });
-    app().registerPostHandlingAdvice([](const HttpRequestPtr& req,
-                                        const HttpResponsePtr& resp) {
-        int64_t cost = NowMs() - req->getAttributes()->get<int64_t>("ZmAccessStartMs");
-        string query = req->getQuery();
-        // 字节数口径:流式上传的 body 已被消费(净余≈0)、流式/文件响应的 body 为空,
-        //   此二者优先取 Content-Length 头(带 "~" 前缀)近似;chunked 流(方案乙)无该头 → 记 0。
-        string reqBytes = std::to_string(req->getBody().size());
-        if (req->getBody().empty())
-        {
-            string cl = req->getHeader("Content-Length");
-            if (!cl.empty())
-                reqBytes = "~" + cl;
-        }
-        string respBytes = std::to_string(resp->getBody().size());
-        if (resp->getBody().empty())
-        {
-            string cl = resp->getHeader("Content-Length");
-            if (!cl.empty())
-                respBytes = "~" + cl;
-        }
-        PUBLIC_LOG_INFO(
-            "{} {} {} [{}] ({} - {}) {} {} {}ms",
-            req->isOnSecureConnection() ? "https" : "http",
-            req->getMethodString(),
-            query.empty() ? string(req->path()) : string(req->path()) + "?" + query,
-            reqBytes, req->getPeerAddr().toIpPort(), req->getLocalAddr().toIpPort(),
-            static_cast<int>(resp->getStatusCode()), respBytes, cost);
-    });
+    // ⚠ 观察结算不注册在此:drogon 1.9.13 的 PostHandling advice 只覆盖
+    //    controller/binder 响应路径(HttpServer.cc:658/692/764),静态目录(含 304)、
+    //    Range 响应、重定向等经 sendResponses 直达发送链,不经本 advice ——
+    //    结算统一在 PreSending 出口(handleResponse:819 覆盖一切响应,见下)。
 
     // 非流式请求体闸门(header 阶段预检):1.9.13 无 per-route 上限 API,
     // Content-Length 声明超限 → 提前 413,防恶意大 body 落临时文件/磁盘耗尽。
@@ -645,9 +559,12 @@ bool ZmHttpServer::Init(const Options& opts)
         cc();
     });
 
-    // 安全响应头(全局 PreSending;含 80→443 重定向与全部分支):
-    //   X-Content-Type-Options / X-Frame-Options / HTTPS 面 HSTS。
-    //   CSP 不做默认(需按页面约定配置,见 Options 备注)。
+    // 安全响应头 + 观察结算(§16.3;统一出口 = PreSending[handleResponse:819 覆盖
+    // 一切响应:静态/304/Range/重定向/拦截等];PostHandling 仅覆盖 binder 路径,不作为结算点)。
+    //   - X-Content-Type-Options / X-Frame-Options / HTTPS 面 HSTS(含 301 与全分支)
+    //   - X-Request-Id 回写(与日志行首一致;含 304/重定向)
+    //   - 访问日志 + 指标(总/状态段/inflight/延迟桶)
+    //   - 注:连接已断(handleResponse 提前返回)时不结算,inflight 属测量性指标非精确。
     app().registerPreSendingAdvice([](const HttpRequestPtr& req,
                                       const HttpResponsePtr& resp) {
         resp->addHeader("X-Content-Type-Options", "nosniff");
@@ -657,7 +574,77 @@ bool ZmHttpServer::Init(const Options& opts)
             resp->addHeader("Strict-Transport-Security",
                             "max-age=31536000; includeSubDomains");
         }
+        resp->addHeader("X-Request-Id",
+                        req->getAttributes()->get<string>("ZmRequestId"));
+
+        // ── 观察结算(访问日志 + 指标;此处为唯一结算点) ──
+        int64_t start = req->getAttributes()->get<int64_t>("ZmAccessStartMs");
+        int64_t cost = start > 0 ? NowMs() - start : 0;  // 防御:未经历 PreRouting(前置解析拒绝)
+        string query = req->getQuery();
+        // 字节数口径:流式上传的 body 已被消费(净余≈0)、流式/文件响应的 body 为空,
+        //   此二者优先取 Content-Length 头(带 "~" 前缀)近似;chunked 流(方案乙)无该头 → 记 0。
+        string reqBytes = std::to_string(req->getBody().size());
+        if (req->getBody().empty())
+        {
+            string cl = req->getHeader("Content-Length");
+            if (!cl.empty())
+                reqBytes = "~" + cl;
+        }
+        string respBytes = std::to_string(resp->getBody().size());
+        if (resp->getBody().empty())
+        {
+            string cl = resp->getHeader("Content-Length");
+            if (!cl.empty())
+                respBytes = "~" + cl;
+        }
+        s_metricInflight.fetch_sub(1, std::memory_order_relaxed);
+        s_metricTotal.fetch_add(1, std::memory_order_relaxed);
+        int code = static_cast<int>(resp->getStatusCode());
+        if (code >= 500)      s_metric5xx.fetch_add(1, std::memory_order_relaxed);
+        else if (code >= 400) s_metric4xx.fetch_add(1, std::memory_order_relaxed);
+        else if (code >= 300) s_metric3xx.fetch_add(1, std::memory_order_relaxed);
+        else if (code >= 200) s_metric2xx.fetch_add(1, std::memory_order_relaxed);
+        if (cost < 10)            s_metricLat[0].fetch_add(1, std::memory_order_relaxed);
+        else if (cost < 100)      s_metricLat[1].fetch_add(1, std::memory_order_relaxed);
+        else if (cost < 1000)     s_metricLat[2].fetch_add(1, std::memory_order_relaxed);
+        else                      s_metricLat[3].fetch_add(1, std::memory_order_relaxed);
+        string rid = req->getAttributes()->get<string>("ZmRequestId");
+        PUBLIC_LOG_INFO(
+            "[{}] {} {} {} [{}] ({} - {}) {} {} {}ms",
+            rid,
+            req->isOnSecureConnection() ? "https" : "http",
+            req->getMethodString(),
+            query.empty() ? string(req->path()) : string(req->path()) + "?" + query,
+            reqBytes, req->getPeerAddr().toIpPort(), req->getLocalAddr().toIpPort(),
+            static_cast<int>(resp->getStatusCode()), respBytes, cost);
     });
+
+    // 指标端点(§16.3):Options.metricsPath 非空时注册 GET handler(JSON 输出,
+    // 进程级计数;无鉴权,内网约定,公网时挂 filter)。
+    if (!opts.metricsPath.empty())
+    {
+        app().registerHandler(opts.metricsPath,
+            [](HttpRequestPtr req) -> Task<HttpResponsePtr> {
+                ZMJSON d;
+                d["uptime_s"] = (NowMs() - s_startupEpoch.load()) / 1000;
+                ZMJSON c;
+                c["total"] = s_metricTotal.load();
+                c["2xx"] = s_metric2xx.load();
+                c["3xx"] = s_metric3xx.load();
+                c["4xx"] = s_metric4xx.load();
+                c["5xx"] = s_metric5xx.load();
+                c["inflight"] = s_metricInflight.load();
+                ZMJSON lat = ZMJSON::array();
+                lat.push_back(s_metricLat[0].load());  // <10ms
+                lat.push_back(s_metricLat[1].load());  // 10-100ms
+                lat.push_back(s_metricLat[2].load());  // 100-1000ms
+                lat.push_back(s_metricLat[3].load());  // >=1000ms
+                c["latency_buckets_ms"] = lat;
+                d["requests"] = c;
+                co_return JsonResponse(200, d);
+            },
+            { HttpMethod::Get });
+    }
 
     // 自动 JSONP(FR-24,主流中间件语义):GET + 合法 callback + JSON 响应 → 包装。
     // 规则收敛:不污染普通 REST/前端静态/WS 升级;三面共享(全局 advice)。
@@ -858,6 +845,225 @@ bool ZmHttpServer::ReloadCertificates()
         return false;
     app().reloadSSLFiles();   // 热加载:换内容不换路径(运行期唯一可热更新能力)
     return true;
+}
+
+// ============================================================================
+// Multipart 表单与文件上传(第二期 §16.2)
+//   流式 newMultipartReader(MultipartHeader{name,filename,contentType} 已由框架
+//   解析 Content-Disposition);部件间数据并入当前部件;字段值 ≤1MB、总量 maxBytes
+//   超限 → 413(止损);完成/异常在 finish 回调统一桥接业务协程。
+//   设计:docs/designs/2026-08-30-drogon-httpserver-base-design.md §16.2
+// ============================================================================
+namespace
+{
+constexpr int64_t kMaxFieldBytes = 1 << 20;  // 单字段值上限(1MB)
+
+/// Multipart 收集器状态(全部在事件循环线程按序访问,无需锁)
+struct ZmMultipartCollector
+{
+    ZmHttpServer::ZmMultipartResult result;
+    bool fieldMode = true;        // 当前部件是字段(文件索引在 result.files)
+    bool fieldActive = false;     // 已有部件开始(提交判断)
+    string curFieldKey;
+    string curField;
+    int64_t curFieldSize = 0;
+    uint64_t total = 0;
+    uint64_t maxBytes = 0;        // 单请求总量上限(0 = 不限制)
+    bool tooLarge = false;        // 累积超限/字段超限(交付 413)
+};
+
+std::string SanitizeFileName(std::string name)
+{
+    // 去掉路径成分(兼容 / 与 \)仅留文件名段
+    size_t pos = name.find_last_of("\\/");
+    if (pos != string::npos)
+        name = name.substr(pos + 1);
+    // 去 Windows 非法字符与控制符(防穿越/注入)
+    std::string out;
+    out.reserve(name.size());
+    for (char c : name)
+    {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || c == ':' || c == '*' || c == '?' || c == '"' ||
+            c == '<' || c == '>' || c == '|')
+            continue;
+        out += c;
+    }
+    if (out == "." || out == "..")
+        return "";
+    return out;
+}
+}  // namespace
+
+void ZmHttpServer::RegisterMultipartCoro(const string& path, drogon::HttpMethod m,
+                                         ZmMultipartHandler h,
+                                         const vector<string>& filters,
+                                         uint64_t maxBytes)
+{
+    vector<internal::HttpConstraint> cons;
+    cons.emplace_back(m);
+    for (const auto& fn : filters)
+    {
+        if (!CheckFilterRegistered(fn))
+            PUBLIC_LOG_ERROR("RegisterMultipartCoro[{}]: filter 未注册: {}", path, fn);
+        cons.emplace_back(fn);
+    }
+
+    // 三参流式形态(同 RegisterStreamCoro):框架注入 RequestStream
+    auto fn = [h = std::move(h), maxBytes](
+                  const HttpRequestPtr& req, drogon::RequestStreamPtr&& streamCtx,
+                  std::function<void(const HttpResponsePtr&)>&& cb) {
+        // ① Content-Type / boundary 预检(缺 → 400,不消费流)
+        string ct = req->getHeader("Content-Type");
+        if (ct.find("multipart/form-data") == string::npos ||
+            ct.find("boundary=") == string::npos)
+        {
+            cb(ZmHttpServer::ErrorResponse(400, "multipart form-data required"));
+            return;
+        }
+        // ② 声明超限预检(413;Content-Length 缺失(chunked)由运行时 total 兜底)
+        if (maxBytes > 0)
+        {
+            string cl = req->getHeader("Content-Length");
+            if (!cl.empty())
+            {
+                try
+                {
+                    if (std::stoull(cl) > maxBytes)
+                    {
+                        streamCtx->setStreamReader(
+                            drogon::RequestStreamReader::newNullReader());
+                        cb(ZmHttpServer::ErrorResponse(413, "multipart too large"));
+                        return;
+                    }
+                }
+                catch (...) {}
+            }
+        }
+
+        auto state = std::make_shared<ZmMultipartCollector>();
+        state->maxBytes = maxBytes;
+
+        auto headerCb = [state](MultipartHeader header) {
+            if (state->tooLarge)
+                return;
+            if (state->fieldActive && state->fieldMode)
+                state->result.fields.emplace_back(state->curFieldKey, state->curField);
+            state->fieldActive = true;
+            if (header.filename.empty())
+            {
+                state->fieldMode = true;
+                state->curFieldKey = header.name;
+                state->curField.clear();
+                state->curFieldSize = 0;
+            }
+            else
+            {
+                state->fieldMode = false;
+                ZmHttpServer::ZmMultipartResult::File f;
+                f.itemName = header.name;
+                f.fileName = SanitizeFileName(header.filename);
+                f.contentType = header.contentType;
+                state->result.files.push_back(std::move(f));
+            }
+        };
+        auto dataCb = [state](const char* buf, size_t len) {
+            if (state->tooLarge)
+                return;
+            if (state->fieldMode)
+            {
+                if (state->curFieldSize + static_cast<int64_t>(len) > kMaxFieldBytes)
+                {
+                    state->tooLarge = true;
+                    return;
+                }
+                state->curField.append(buf, len);
+                state->curFieldSize += static_cast<int64_t>(len);
+            }
+            else
+            {
+                auto& f = state->result.files.back();
+                f.data.append(buf, len);
+                f.size += len;
+            }
+            state->total += len;
+            if (state->maxBytes > 0 && state->total > state->maxBytes)
+                state->tooLarge = true;
+        };
+        auto finishCb = [state, h, req, cb](std::exception_ptr e) mutable {
+            if (state->tooLarge)
+            {
+                cb(ZmHttpServer::ErrorResponse(413, "multipart too large"));
+                return;
+            }
+            if (e)
+            {
+                PUBLIC_LOG_WARN("multipart 流中断(网络/客户端异常)");
+                cb(ZmHttpServer::ErrorResponse(400, "multipart aborted"));
+                return;
+            }
+            if (state->fieldActive && state->fieldMode)
+                state->result.fields.emplace_back(state->curFieldKey, state->curField);
+            drogon::async_run([h, req, cb, res = std::move(state->result)]() -> drogon::Task<> {
+                try
+                {
+                    auto resp = co_await h(req, std::move(res));
+                    if (resp)
+                        cb(resp);
+                    else
+                        cb(ZmHttpServer::ErrorResponse(500, "multipart handler: null response"));
+                }
+                catch (const std::exception& ex)
+                {
+                    PUBLIC_LOG_ERROR("multipart 业务异常: {}", ex.what());
+                    cb(ZmHttpServer::ErrorResponse(500, "multipart handler: internal error"));
+                }
+                catch (...)
+                {
+                    cb(ZmHttpServer::ErrorResponse(500, "multipart handler: internal error"));
+                }
+            });
+        };
+        streamCtx->setStreamReader(
+            drogon::RequestStreamReader::newMultipartReader(req, headerCb, dataCb, finishCb));
+    };
+
+    if (path.find('{') == string::npos)
+        app().registerHandler(path, std::move(fn), cons);
+    else
+        app().registerHandlerViaRegex(PathPatternToRegex(path), std::move(fn), cons);
+}
+
+drogon::Task<int64_t> ZmHttpServer::SaveMultipartFile(const ZmMultipartResult::File& f,
+                                                      const string& destPath)
+{
+    // 离核工作池写盘(事件循环纪律:回调内禁止直接写文件);
+    // 路径经 CP_UTF8 → WideChar(与 ZmUploadSink 一致)
+    co_return co_await RunOnPool<int64_t>([&f, &destPath]() -> int64_t {
+        wchar_t wpath[2048];
+        if (MultiByteToWideChar(CP_UTF8, 0, destPath.c_str(), -1, wpath, 2048) <= 0)
+            return -1;
+        HANDLE h = ::CreateFileW(wpath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE)
+            return -1;
+        const char* p = f.data.data();
+        size_t off = 0;
+        while (off < f.data.size())
+        {
+            DWORD chunk = static_cast<DWORD>(
+                std::min<size_t>(f.data.size() - off, (1u << 26)));
+            DWORD wrote = 0;
+            if (!::WriteFile(h, p + off, chunk, &wrote, nullptr) || wrote == 0)
+            {
+                ::CloseHandle(h);
+                return -1;
+            }
+            off += wrote;
+        }
+        ::CloseHandle(h);
+        return static_cast<int64_t>(f.data.size());
+    });
 }
 
 // ============================================================================
@@ -1326,7 +1532,6 @@ void ZmHttpServer::RegisterCoro(const string& path, drogon::HttpMethod m,
         cons.emplace_back(fn);
     }
     // 适配:本捆绑 drogon 的 FunctionTraits 协程特化(zig 形态 HttpRequestPtr 按值);
-    // ZmHttpCoroHandler 对外仍用 const 引用(业务友好),此处包一层。
     // ZmHttpCoroHandler 形参按值(HttpRequestPtr),FunctionTraits 协程特化可直接匹配;
     // 直接注册 std::function,不套中间协程(套层会在 Windows 上崩溃,实测)。
     if (path.find('{') == string::npos)
@@ -1392,57 +1597,66 @@ void ZmHttpServer::RegisterCoroWithDeadline(const string& path, drogon::HttpMeth
 
     // callback-form 注册:框架回调仅能发一次;超时定时器放连接所属 loop(设计 §7 v2.1);
     // 业务晚到结果经"原子门 + 弱引用 + connected()"安全丢弃(FR-14)
-    // 注:本捆绑 drogon 的协程函数指针特化要求首参按值 HttpRequestPtr、回调整参按值传递
-    app().registerHandler(path,
-        [h, deadlineMs](HttpRequestPtr req,
-                        std::function<void(const HttpResponsePtr&)> cb) -> Task<> {
-            auto gate = std::make_shared<std::atomic<bool>>(false);
-            auto connWk = req->getConnectionPtr();
+    // 注:本捆绑 drogon 的协程函数指针特化要求首参按值 HttpRequestPtr、回调整参按值传递。
+    // 注2(崩溃修复 2026-09-03):本捆绑 drogon 对协程 handler 的 paramCount() 恒为 0
+    //   (FunctionTraits 只统计 req+callback 之外的额外参数),含 {N} 占位符路径若直接经
+    //   app().registerHandler 注册,会命中 HttpControllersRouter::addHttpPath 的占位符校验
+    //   (place > paramCount)并 exit(1) 杀进程。故与 RegisterCoro/RegisterStreamCoro 一致,
+    //   {N} 路径必须改走 registerHandlerViaRegex 绕开该校验。
+    //   详见 docs/issues/2026-09-03-rebind-registration-crash.md。
+    auto handler = [h, deadlineMs](HttpRequestPtr req,
+                                   std::function<void(const HttpResponsePtr&)> cb) -> Task<> {
+        auto gate = std::make_shared<std::atomic<bool>>(false);
+        auto connWk = req->getConnectionPtr();
 
-            trantor::EventLoop* loop = nullptr;
-            if (auto c = connWk.lock())
-                loop = c->getLoop();
-            if (!loop)
-                loop = app().getLoop();
-            loop->runAfter(deadlineMs / 1000.0,
-                [gate, cb, connWk]() {
-                    if (gate->exchange(true))
-                        return;
-                    auto c = connWk.lock();
-                    if (!c || !c->connected())
-                        return;
-                    ZMJSON data;
-                    data["error"]["code"] = 504;
-                    data["error"]["message"] = "deadline exceeded";
-                    cb(JsonResponse(504, data));
-                });
-
-            try
-            {
-                auto resp = co_await h(req);
+        trantor::EventLoop* loop = nullptr;
+        if (auto c = connWk.lock())
+            loop = c->getLoop();
+        if (!loop)
+            loop = app().getLoop();
+        loop->runAfter(deadlineMs / 1000.0,
+            [gate, cb, connWk]() {
                 if (gate->exchange(true))
-                    co_return;                      // 已被超时占位
+                    return;
                 auto c = connWk.lock();
                 if (!c || !c->connected())
-                    co_return;                      // 连接已关,丢弃
-                if (resp)
-                    cb(resp);
-                else
-                    cb(ErrorResponse(500, "handler returned null response"));
-            }
-            catch (const std::exception& e)
-            {
-                PUBLIC_LOG_ERROR("RegisterCoroWithDeadline 业务异常: {}", e.what());
-                if (!gate->exchange(true))
-                    cb(ErrorResponse(500, "internal error"));
-            }
-            catch (...)
-            {
-                if (!gate->exchange(true))
-                    cb(ErrorResponse(500, "internal error"));
-            }
-        },
-        cons);
+                    return;
+                ZMJSON data;
+                data["error"]["code"] = 504;
+                data["error"]["message"] = "deadline exceeded";
+                cb(JsonResponse(504, data));
+            });
+
+        try
+        {
+            auto resp = co_await h(req);
+            if (gate->exchange(true))
+                co_return;                      // 已被超时占位
+            auto c = connWk.lock();
+            if (!c || !c->connected())
+                co_return;                      // 连接已关,丢弃
+            if (resp)
+                cb(resp);
+            else
+                cb(ErrorResponse(500, "handler returned null response"));
+        }
+        catch (const std::exception& e)
+        {
+            PUBLIC_LOG_ERROR("RegisterCoroWithDeadline 业务异常: {}", e.what());
+            if (!gate->exchange(true))
+                cb(ErrorResponse(500, "internal error"));
+        }
+        catch (...)
+        {
+            if (!gate->exchange(true))
+                cb(ErrorResponse(500, "internal error"));
+        }
+    };
+
+    if (path.find('{') == string::npos)
+        app().registerHandler(path, std::move(handler), cons);
+    else
+        app().registerHandlerViaRegex(PathPatternToRegex(path), std::move(handler), cons);
 }
 
 // ============================================================================
@@ -1628,6 +1842,104 @@ const string& ZmHttpServer::MimeForExt(const string& path)
         return noMime;
     auto it = m.find(path.substr(p));
     return it == m.end() ? noMime : it->second;
+}
+
+// ============================================================================
+// 静态资源条件请求(第二期 §16.1;SendFile* 与前端面 SPA 回落共用,行为单源)
+// ============================================================================
+/// RFC1123 HTTP 日期输出("Thu, 03 Sep 2026 10:00:00 GMT")
+static string HttpDateStr(int64_t t)
+{
+    std::time_t et = static_cast<std::time_t>(t);
+    std::tm tmv{};
+    if (gmtime_s(&tmv, &et) != 0)
+        return "";
+    char buf[64];
+    if (std::strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", &tmv) == 0)
+        return "";
+    return buf;
+}
+
+/// 文件元信息(单次 stat;条件请求与 Range 共用)。
+/// file_time(文件时钟) → system_clock(epoch 秒):以两个时钟的 now 为桥换算。
+ZmHttpServer::ZmFileMeta ZmHttpServer::FetchFileMeta(const string& path)
+{
+    ZmFileMeta m;
+    std::error_code ec;
+    m.found = std::filesystem::exists(path, ec) && !ec;
+    if (!m.found)
+        return m;
+    m.size = static_cast<size_t>(std::filesystem::file_size(path, ec));
+    if (ec)
+    {
+        m.sizeFailed = true;
+        return m;
+    }
+    std::error_code ec2;
+    auto ft = std::filesystem::last_write_time(path, ec2);
+    if (!ec2)
+    {
+        auto fileNow = std::filesystem::file_time_type::clock::now();
+        auto sysNow = std::chrono::system_clock::now();
+        auto sysT = std::chrono::time_point_cast<std::chrono::seconds>(
+            sysNow - (fileNow - ft));
+        m.mtimeSec =
+            static_cast<int64_t>(std::chrono::system_clock::to_time_t(sysT));
+    }
+    return m;
+}
+
+/// 缓存头(200/206/304 共用;强 ETag = "size-mtime")
+pair<string, string> ZmHttpServer::CacheHeaders(const ZmFileMeta& m)
+{
+    return {HttpDateStr(m.mtimeSec),
+            "\"" + std::to_string(m.size) + "-" + std::to_string(m.mtimeSec) + "\""};
+}
+
+/// 条件请求判定:If-None-Match 优先(命中 → 304;未命中跳过 If-Modified-Since),
+/// If-Modified-Since 兜底(文件未改 → 304)。日期非法视为未提供。
+/// @return 非空 = 304 响应(调用方直接返回);nullptr = 继续正常 200/206 流程。
+drogon::HttpResponsePtr ZmHttpServer::Maybe304(const HttpRequestPtr& req,
+                                               const ZmFileMeta& m,
+                                               const pair<string, string>& cacheHeaders)
+{
+    const string& lastMod = cacheHeaders.first;
+    const string& etag = cacheHeaders.second;
+    string inm = req->getHeader("If-None-Match");
+    if (!inm.empty())
+    {
+        // RFC 7232:If-None-Match 弱比较(可带 W/ 前缀/逗号列表),用子串命中已够
+        if (inm == "*" || inm.find(etag) != string::npos)
+        {
+            auto resp = HttpResponse::newHttpResponse();
+            resp->setStatusCode(k304NotModified);
+            resp->addHeader("Last-Modified", lastMod);
+            resp->addHeader("ETag", etag);
+            return resp;
+        }
+        return nullptr;
+    }
+    string ims = req->getHeader("If-Modified-Since");
+    if (!ims.empty())
+    {
+        try
+        {
+            trantor::Date d = drogon::utils::getHttpDate(ims);
+            if (d.microSecondsSinceEpoch() / 1000000 >= m.mtimeSec)
+            {
+                auto resp = HttpResponse::newHttpResponse();
+                resp->setStatusCode(k304NotModified);
+                resp->addHeader("Last-Modified", lastMod);
+                resp->addHeader("ETag", etag);
+                return resp;
+            }
+        }
+        catch (...)
+        {
+            // 日期非法 → 当作未提供
+        }
+    }
+    return nullptr;
 }
 
 // ============================================================================
@@ -1840,6 +2152,188 @@ void ZmHttpServer::RegisterWebSocket(const string& path, const WsCallbacks& cb)
         });
     ZmWsController::SetCallbacks(regName, cb);
     app().registerWebSocketController(path, regName);
+}
+
+// ============================================================================
+// 限流(§16.4;drogon RateLimiter 底层;全部 SafeRateLimiter 线程安全包装)
+//   overlay 规则:COW 快照(原子 shared_ptr 读零锁;写=copy+swap,低频)
+//   per-IP 桶:全局容器锁保护 map(每次请求一次短临界查找;isAllowed 无锁)
+// ============================================================================
+namespace
+{
+/// overlay 规则条目
+struct ZmOverlayRule
+{
+    enum Kind { None, Blocked, Allowed, Quota } kind = None;
+    size_t capacity = 0;
+    double timeSec = 0;
+};
+using ZmOverlayMap = std::unordered_map<string, ZmOverlayRule>;
+
+/// 进程级 overlay(COW):原子指针读、写时整体替换
+std::atomic<std::shared_ptr<const ZmOverlayMap>> s_overlayPtr{
+    std::make_shared<const ZmOverlayMap>()};
+std::mutex s_overlayWriteMtx;
+
+void OverlayWrite(const string& ip, ZmOverlayRule::Kind kind,
+                  size_t capacity, double timeSec)
+{
+    std::lock_guard lk(s_overlayWriteMtx);
+    auto cur = s_overlayPtr.load();
+    auto nxt = std::make_shared<ZmOverlayMap>(*cur);
+    if (kind == ZmOverlayRule::None)
+        nxt->erase(ip);
+    else
+        (*nxt)[ip] = ZmOverlayRule{kind, capacity, timeSec};
+    s_overlayPtr.store(nxt);
+}
+
+drogon::RateLimiterPtr MakeSafeRateLimiter(drogon::RateLimiterType type,
+                                           size_t capacity, double timeSec)
+{
+    return std::make_shared<drogon::SafeRateLimiter>(
+        drogon::RateLimiter::newRateLimiter(
+            type, capacity, std::chrono::duration<double>(timeSec)));
+}
+}  // namespace
+
+drogon::RateLimiterPtr ZmHttpServer::CreateRateLimiter(drogon::RateLimiterType type,
+                                                       size_t capacity,
+                                                       double timeUnitSec)
+{
+    return MakeSafeRateLimiter(type, capacity, timeUnitSec);
+}
+
+void ZmHttpServer::SetIpBlocked(const string& ip)
+{
+    OverlayWrite(ip, ZmOverlayRule::Blocked, 0, 0);
+}
+void ZmHttpServer::UnblockIp(const string& ip)
+{
+    OverlayWrite(ip, ZmOverlayRule::None, 0, 0);
+}
+void ZmHttpServer::SetIpQuota(const string& ip, size_t capacity, double timeUnitSec)
+{
+    OverlayWrite(ip, ZmOverlayRule::Quota, capacity, timeUnitSec);
+}
+void ZmHttpServer::SetIpAllowed(const string& ip)
+{
+    OverlayWrite(ip, ZmOverlayRule::Allowed, 0, 0);
+}
+void ZmHttpServer::RemoveRateRule(const string& ip)
+{
+    OverlayWrite(ip, ZmOverlayRule::None, 0, 0);
+}
+bool ZmHttpServer::IsRateRuleHit(const string& ip)
+{
+    auto ov = s_overlayPtr.load();
+    return ov->find(ip) != ov->end();
+}
+
+// ----------------------------------------------------------------------------
+// ZmIpRateLimiter:逐 IP 桶协调器(每个 IP 独立桶;有界 + 插入序驱逐)
+// ----------------------------------------------------------------------------
+struct ZmHttpServer::ZmIpRateLimiter::Impl
+{
+    drogon::RateLimiterType type = drogon::RateLimiterType::kFixedWindow;
+    size_t cap = 0;
+    double timeSec = 0;
+    size_t maxEntries = 10000;
+
+    std::mutex mtx;   // 短临界:桶查找/创建/驱逐(仅事件循环线程批;耗时微秒级)
+    std::unordered_map<string, drogon::RateLimiterPtr> buckets;
+    std::deque<string> order;   // 插入序(驱逐队头)
+    // 专项额度桶(参数随规则;变更时重建)
+    struct QuotaEntry { size_t cap = 0; double timeSec = 0; drogon::RateLimiterPtr lim; };
+    std::unordered_map<string, QuotaEntry> quotaBuckets;
+    size_t quotaCount = 0;      // 与 maxEntries 共用上限
+
+    drogon::RateLimiterPtr BucketFor(const string& ip)
+    {
+        std::lock_guard lk(mtx);
+        auto it = buckets.find(ip);
+        if (it != buckets.end())
+            return it->second;
+        if (buckets.size() >= maxEntries)
+        {
+            // 驱逐最旧(插入序队头)
+            while (!order.empty())
+            {
+                string old = std::move(order.front());
+                order.pop_front();
+                if (buckets.erase(old) > 0)
+                    break;
+            }
+        }
+        auto lim = MakeSafeRateLimiter(type, cap, timeSec);
+        buckets.emplace(ip, lim);
+        order.emplace_back(ip);
+        return lim;
+    }
+};
+
+std::shared_ptr<ZmHttpServer::ZmIpRateLimiter>
+ZmHttpServer::ZmIpRateLimiter::Create(drogon::RateLimiterType type, size_t capacity,
+                                      double timeUnitSec, size_t maxEntries)
+{
+    auto r = std::shared_ptr<ZmIpRateLimiter>(new ZmIpRateLimiter());
+    r->m_impl = std::make_shared<Impl>();
+    r->m_impl->type = type;
+    r->m_impl->cap = capacity;
+    r->m_impl->timeSec = timeUnitSec;
+    r->m_impl->maxEntries = maxEntries > 0 ? maxEntries : 1;
+    return r;
+}
+
+/// 组合执行:overlay(封禁→429 / 白名单→放行 / 专项额度)→ 未命中走默认 per-IP 桶。
+bool ZmHttpServer::ZmIpRateLimiter::Check(const drogon::HttpRequestPtr& req,
+                                          drogon::HttpResponsePtr& resp)
+{
+    string ip = req->getPeerAddr().toIp();
+    if (ip.empty())
+        return true;   // 无对端信息(异常态)不拦
+
+    auto ov = s_overlayPtr.load();
+    auto it = ov->find(ip);
+    if (it != ov->end())
+    {
+        switch (it->second.kind)
+        {
+        case ZmOverlayRule::Blocked:
+            resp = ErrorResponse(429, "rate limited");   // 引用入参:无条件赋值(doFilter 判非空)
+            return false;
+        case ZmOverlayRule::Allowed:
+            return true;
+        case ZmOverlayRule::Quota:
+        {
+            // 专项额度:独立缓存桶(状态延续;参数变更 → 重建)
+            drogon::RateLimiterPtr lim;
+            {
+                std::lock_guard lk(m_impl->mtx);
+                auto& q = m_impl->quotaBuckets[ip];
+                if (!q.lim || q.cap != it->second.capacity ||
+                    q.timeSec != it->second.timeSec)
+                {
+                    q.cap = it->second.capacity;
+                    q.timeSec = it->second.timeSec;
+                    q.lim = MakeSafeRateLimiter(m_impl->type, q.cap, q.timeSec);
+                }
+                lim = q.lim;
+            }
+            if (lim->isAllowed())
+                return true;
+            resp = ErrorResponse(429, "rate limited");
+            return false;
+        }
+        default:
+            break;
+        }
+    }
+    auto lim = m_impl->BucketFor(ip);
+    if (lim->isAllowed())
+        return true;
+    resp = ErrorResponse(429, "rate limited");
+    return false;
 }
 
 // ============================================================================

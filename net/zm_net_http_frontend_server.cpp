@@ -21,6 +21,11 @@ ZmHttpFrontendServer::ZmHttpFrontendServer(bool redirectOnly)
 // ============================================================================
 // 前端专属:静态文件 + 自定义 404(FR-20;仅前端有"文档根"概念)
 // ============================================================================
+/// 静态目录条件请求说明(2026-09-03 源码核验):SetDocumentRoot 下的文件由
+/// drogon StaticFileRouter 服务,If-Modified-Since → 304 为内建且默认开启
+/// (StaticFileRouter.h:144),本面无需重复实现;缓存头策略见下游 SetStaticCachePolicy;
+/// SPA 回落路径(AddSpaFallback)不经 StaticFileRouter,其条件请求由
+/// RegisterRoutes 分支补齐(§16.1.1)。
 void ZmHttpFrontendServer::SetDocumentRoot(const string& www)
 {
     m_docRoot = www;
@@ -36,6 +41,32 @@ void ZmHttpFrontendServer::SetNotFoundPage(const string& file)
     }
     app().setCustom404Page(HttpResponse::newFileResponse(file), true);
 }
+
+// ============================================================================
+// 静态资源缓存头策略(第二期 §16.1.2,A 档)
+//   只加头不改状态:StaticFileRouter 的响应(无 body + Last-Modified 特征)
+//   按扩展名下发 Cache-Control;不覆盖已有的头。浏览器与 304(§16.1.0)配合:
+//   no-cache 态每次 IMS→304,长缓存态 max-age 命中本地零请求。
+// ============================================================================
+void ZmHttpFrontendServer::SetStaticCachePolicy(const ZmStaticCacheConfig& cfg)
+{
+    m_staticCache = cfg;
+}
+
+namespace
+{
+/// 取扩展名(含点),如 ".js";无扩展名返回空串
+string ExtOfPath(const string& path)
+{
+    size_t dot = path.rfind('.');
+    if (dot == string::npos || dot == path.size() - 1)
+        return "";
+    // 目录名中的点不算(取最后一段最后一个点前要有非斜杠)
+    if (path.find('/', dot) != string::npos)
+        return "";
+    return path.substr(dot);
+}
+}  // namespace
 
 // ============================================================================
 // 监听:useSSL(HTTPS 模式)→ 443(HTTPS)+ 80(HTTP,重定向);否则仅 80(HTTP)
@@ -147,14 +178,27 @@ void ZmHttpFrontendServer::RegisterRoutes()
                     if (!page.empty() && page.back() != '\\' && page.back() != '/')
                         page += "\\";
                     page += file;
-                    if (std::filesystem::exists(page))
+                    // 条件请求(§16.1.1):单次 stat → 304 命中直接回;否则 200 带缓存头
+                    auto meta = ZmHttpServer::FetchFileMeta(page);
+                    if (!meta.found || meta.sizeFailed)
                     {
-                        cb(HttpResponse::newFileResponse(page));
+                        PUBLIC_LOG_ERROR("SPA 回落: 页面不可用(不存在/stat 失败): {}", page);
+                        cb(HttpResponse::newNotFoundResponse());
                     }
                     else
                     {
-                        PUBLIC_LOG_ERROR("SPA 回落: 页面不存在: {}", page);
-                        cb(HttpResponse::newNotFoundResponse());
+                        auto ch = ZmHttpServer::CacheHeaders(meta);
+                        if (auto notMod = ZmHttpServer::Maybe304(req, meta, ch))
+                        {
+                            cb(notMod);
+                        }
+                        else
+                        {
+                            auto resp = HttpResponse::newFileResponse(page);
+                            resp->addHeader("Last-Modified", ch.first);
+                            resp->addHeader("ETag", ch.second);
+                            cb(resp);
+                        }
                     }
                     return;
                 }
@@ -176,4 +220,35 @@ void ZmHttpFrontendServer::RegisterRoutes()
 
         cc();
     });
+
+    // ── 静态缓存头(§16.1.2,A 档):PreSending 纯加头(不改状态,无发送路径风险) ──
+    if (!m_staticCache.defaultPolicy.empty())
+    {
+        RegisterPreSending([this](const HttpRequestPtr& req,
+                                  const HttpResponsePtr& resp) {
+            if (!IsLocalPortIn(req))
+                return;
+            // 静态响应特征:文件通道(带 Last-Modified;注:文件型 getBody() 亦非空,
+            // 不能以 body 为空判定);已有 Cache-Control 不覆盖
+            if (!resp->getHeader("Last-Modified").empty() &&
+                resp->getHeader("Cache-Control").empty())
+            {
+                string policy = m_staticCache.defaultPolicy;
+                string ext = ExtOfPath(req->path());
+                if (!ext.empty())
+                {
+                    for (const auto& [e, v] : m_staticCache.extPolicy)
+                    {
+                        if (e == ext)
+                        {
+                            policy = v;
+                            break;
+                        }
+                    }
+                }
+                if (!policy.empty())
+                    resp->addHeader("Cache-Control", policy);
+            }
+        });
+    }
 }
