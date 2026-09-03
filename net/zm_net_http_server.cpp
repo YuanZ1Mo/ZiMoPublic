@@ -1908,8 +1908,19 @@ drogon::HttpResponsePtr ZmHttpServer::Maybe304(const HttpRequestPtr& req,
     string inm = req->getHeader("If-None-Match");
     if (!inm.empty())
     {
-        // RFC 7232:If-None-Match 弱比较(可带 W/ 前缀/逗号列表),用子串命中已够
-        if (inm == "*" || inm.find(etag) != string::npos)
+        // RFC 7232:If-None-Match 弱比较(逗号列表、W/ 前缀、entity-tag 本身带引号)。
+        // 容错修复(2026-09-04):比较前去 W/ 前缀与首尾引号——curl 等客户端经 -H 会剥掉
+        // 引号,若直接用带引号的 etag 做子串匹配会漏命中(实测 200 而非 304)。
+        auto StripTag = [](string s) -> string {
+            if (s.size() >= 2 && (s[0] == 'W' || s[0] == 'w') && s[1] == '/')
+                s = s.substr(2);
+            if (s.size() >= 2 && s.front() == '"' && s.back() == '"')
+                s = s.substr(1, s.size() - 2);
+            return s;
+        };
+        string inmN = StripTag(inm);
+        string etagN = StripTag(etag);
+        if (inm == "*" || (!etagN.empty() && inmN.find(etagN) != string::npos))
         {
             auto resp = HttpResponse::newHttpResponse();
             resp->setStatusCode(k304NotModified);
