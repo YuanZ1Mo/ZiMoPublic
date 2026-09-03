@@ -623,9 +623,24 @@ void ZmDownloadSession::HandleBodyData(const char* data, size_t len)
             }
             if (pendingBuf_.size() < (size_t)chunkPendingSize_ + 2)
                 return;
-            AppendToFile(pendingBuf_.data(), (size_t)chunkPendingSize_);
-            if (finished_)
-                return;
+            // 修复(2026-09-04):chunk 数据已在 pendingBuf_ 前端,直接按块写盘。
+            // 此前经 AppendToFile(pendingBuf_.data(), ...) 会触发 std::string 自追加
+            // (把 pendingBuf_ 追加进自身,UB),实测 20MB 源被写成 40MB(两半相同)。
+            {
+                size_t remain = (size_t)chunkPendingSize_;
+                size_t off = 0;
+                while (remain > 0)
+                {
+                    size_t n = std::min(remain, chunkBytes_);
+                    if (!WriteToFile(pendingBuf_.data() + off, n))
+                        return;
+                    if (finished_)
+                        return;
+                    off += n;
+                    remain -= n;
+                }
+                recvBody_ += (size_t)chunkPendingSize_;
+            }
             pendingBuf_.erase(0, (size_t)chunkPendingSize_ + 2);  // + CRLF
             chunkPendingSize_ = UINT64_MAX;
         }
