@@ -8,6 +8,7 @@
 #include <drogon/HttpFilter.h>
 #include <drogon/WebSocketController.h>
 #include <drogon/utils/HttpConstraint.h>
+#include <drogon/utils/Utilities.h>   // getHttpDate(条件请求 If-Modified-Since 解析)
 #include <drogon/RequestStream.h>
 
 #include <trantor/net/TcpConnection.h>
@@ -19,6 +20,7 @@
 #include <cctype>
 #include <deque>
 #include <chrono>
+#include <ctime>
 #include <filesystem>
 #include <future>
 #include <memory>
@@ -227,8 +229,8 @@ void ZmStreamLoopState::OnReadDone(std::shared_ptr<std::string> buf, bool ok)
         return;
     }
     // 定时器节流:事件循环处理发送、缓冲自然排水(内存有界:在途预读 = 1 块)
-    uint64_t delayMs = opts.interBlockMs ? opts.interBlockMs : 50;
-    drogon::app().getLoop()->runAfter(delayMs / 1000.0,
+    // interBlockMs == 0 → 发完即调度(runAfter(0) 下一轮立即跑,无节流,对应头文件契约)
+    drogon::app().getLoop()->runAfter(opts.interBlockMs / 1000.0,
                                       [st = shared_from_this()]() { st->Next(); });
 }
 
@@ -329,6 +331,111 @@ string BuildWsRegName()
     static std::atomic<uint32_t> n{0};
     return "ZmWsCtrl" + std::to_string(n.fetch_add(1));
 }
+
+// ----------------------------------------------------------------------------
+// 文件条件请求(Last-Modified/ETag → 304;RFC 7232;文件传输三条路径共用)
+// ----------------------------------------------------------------------------
+/// RFC1123 HTTP 日期输出("Thu, 03 Sep 2026 10:00:00 GMT")
+static string HttpDateStr(int64_t t)
+{
+    std::time_t et = static_cast<std::time_t>(t);
+    std::tm tmv{};
+    if (gmtime_s(&tmv, &et) != 0)
+        return "";
+    char buf[64];
+    if (std::strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", &tmv) == 0)
+        return "";
+    return buf;
+}
+
+/// 文件元信息(存在性/大小/最后写入秒;单次 stat 提供,条件请求与 Range 共用)
+struct ZmFileMeta
+{
+    bool found = false;       // 文件存在(否则 → 404)
+    bool sizeFailed = false;  // 存在但取大小失败(否则 → 500)
+    size_t size = 0;
+    int64_t mtimeSec = 0;     // last_write_time → epoch 秒
+};
+
+static ZmFileMeta FetchFileMeta(const string& path)
+{
+    ZmFileMeta m;
+    std::error_code ec;
+    m.found = std::filesystem::exists(path, ec) && !ec;
+    if (!m.found)
+        return m;
+    m.size = static_cast<size_t>(std::filesystem::file_size(path, ec));
+    if (ec)
+    {
+        m.sizeFailed = true;
+        return m;
+    }
+    std::error_code ec2;
+    auto ft = std::filesystem::last_write_time(path, ec2);
+    if (!ec2)
+    {
+        // file_time(文件时钟) → system_clock(epoch 秒):以两个时钟的 now 为桥换算
+        auto fileNow = std::filesystem::file_time_type::clock::now();
+        auto sysNow = std::chrono::system_clock::now();
+        auto sysT = std::chrono::time_point_cast<std::chrono::seconds>(
+            sysNow - (fileNow - ft));
+        m.mtimeSec =
+            static_cast<int64_t>(std::chrono::system_clock::to_time_t(sysT));
+    }
+    return m;
+}
+
+/// 缓存头(200/206/304 共用;强 ETag = size-mtime)
+static pair<string, string> CacheHeaders(const ZmFileMeta& m)
+{
+    return {HttpDateStr(m.mtimeSec),
+            "\"" + std::to_string(m.size) + "-" + std::to_string(m.mtimeSec) + "\""};
+}
+
+/// 条件请求判定:If-None-Match 优先(命中 → 304;未命中跳过 If-Modified-Since),
+/// If-Modified-Since 兜底(文件未改 → 304)。日期非法视为未提供。
+/// @return 非空 = 304 响应(调用方直接返回);nullptr = 继续正常 200/206 流程。
+static HttpResponsePtr Maybe304(const HttpRequestPtr& req, const ZmFileMeta& m,
+                                const pair<string, string>& cacheHeaders)
+{
+    const string& lastMod = cacheHeaders.first;
+    const string& etag = cacheHeaders.second;
+    string inm = req->getHeader("If-None-Match");
+    if (!inm.empty())
+    {
+        // RFC 7232:If-None-Match 弱比较(可带 W/ 前缀/逗号列表),用子串命中已够
+        if (inm == "*" || inm.find(etag) != string::npos)
+        {
+            auto resp = HttpResponse::newHttpResponse();
+            resp->setStatusCode(k304NotModified);
+            resp->addHeader("Last-Modified", lastMod);
+            resp->addHeader("ETag", etag);
+            return resp;
+        }
+        return nullptr;
+    }
+    string ims = req->getHeader("If-Modified-Since");
+    if (!ims.empty())
+    {
+        try
+        {
+            trantor::Date d = drogon::utils::getHttpDate(ims);
+            if (d.microSecondsSinceEpoch() / 1000000 >= m.mtimeSec)
+            {
+                auto resp = HttpResponse::newHttpResponse();
+                resp->setStatusCode(k304NotModified);
+                resp->addHeader("Last-Modified", lastMod);
+                resp->addHeader("ETag", etag);
+                return resp;
+            }
+        }
+        catch (...)
+        {
+            // 日期非法 → 当作未提供
+        }
+    }
+    return nullptr;
+}
 }  // namespace
 
 // ============================================================================
@@ -341,6 +448,8 @@ std::map<string, std::function<bool(const drogon::HttpRequestPtr&,
 
 static std::atomic<size_t> s_workPoolSize{8};
 std::atomic<bool> ZmHttpServer::s_autoJsonp{true};   // 自动 JSONP 默认开(对齐主流)
+std::atomic<size_t> ZmHttpServer::s_nonStreamBodyLimit{0};  // Init 注入;0 = 关闭预检
+std::vector<string> ZmHttpServer::s_corsOrigins;            // Init 注入(启动后只读)
 
 /// 三面共享的静态阻塞工作池(FR-19):RunOnPool 的唯一目的地。
 /// 容量为进程级全局(SetWorkPoolSize 注入),首次使用即定型;
@@ -428,15 +537,18 @@ bool ZmHttpServer::Init(const Options& opts)
     // ── 全局运行参数(FR-03;均为 drogon app() 全局量,运行期不可改) ──
     app().setThreadNum(opts.threadNum);            // 0 = 自动 = CPU 核数
     app().setMaxConnectionNum(opts.maxConnections);
+    app().setMaxConnectionNumPerIP(opts.maxConnectionsPerIP);  // per-IP 护栏(0=不限;单机压测慎设)
     app().setClientMaxBodySize(opts.clientMaxBodySize);
+    app().setClientMaxMemoryBodySize(opts.clientMaxMemoryBodySize);  // 内存闸:超限落临时文件
+    s_nonStreamBodyLimit.store(opts.nonStreamBodyLimit, std::memory_order_relaxed);
+    s_corsOrigins = opts.corsAllowedOrigins;       // CORS 白名单(启动前注入,运行期只读)
     app().setIdleConnectionTimeout(opts.idleTimeoutSec);
     app().setKeepaliveRequestsNumber(opts.keepaliveRequests);   // 0 = 不限次数回收
     app().enableRequestStream(opts.enableRequestStream);
     app().enableGzip(opts.gzip);
     app().enableBrotli(opts.brotli);
     app().setGzipStatic(opts.gzipStatic);
-    if (opts.brotliStatic)
-        PUBLIC_LOG_WARN("Init: 本捆绑 drogon 1.9.13 无静态 brotli 开关,忽略");
+    app().setBrStatic(opts.brotliStatic);   // 捆绑 1.9.13 已含 setBrStatic 且 lib 已链接 brotli(USE_BROTLI,已实测符号在)
     s_workPoolSize.store(opts.workPoolSize);       // 首次 RunOnPool 前定型
 
     // ── TLS(FR-10/11;证书全局,保证热加载) ──
@@ -482,15 +594,69 @@ bool ZmHttpServer::Init(const Options& opts)
                                         const HttpResponsePtr& resp) {
         int64_t cost = NowMs() - req->getAttributes()->get<int64_t>("ZmAccessStartMs");
         string query = req->getQuery();
+        // 字节数口径:流式上传的 body 已被消费(净余≈0)、流式/文件响应的 body 为空,
+        //   此二者优先取 Content-Length 头(带 "~" 前缀)近似;chunked 流(方案乙)无该头 → 记 0。
+        string reqBytes = std::to_string(req->getBody().size());
+        if (req->getBody().empty())
+        {
+            string cl = req->getHeader("Content-Length");
+            if (!cl.empty())
+                reqBytes = "~" + cl;
+        }
+        string respBytes = std::to_string(resp->getBody().size());
+        if (resp->getBody().empty())
+        {
+            string cl = resp->getHeader("Content-Length");
+            if (!cl.empty())
+                respBytes = "~" + cl;
+        }
         PUBLIC_LOG_INFO(
-            "{} {} {} [{}] ({} - {}) {} {}B {}ms",
+            "{} {} {} [{}] ({} - {}) {} {} {}ms",
             req->isOnSecureConnection() ? "https" : "http",
             req->getMethodString(),
             query.empty() ? string(req->path()) : string(req->path()) + "?" + query,
-            req->getBody().size(),
-            req->getPeerAddr().toIpPort(), req->getLocalAddr().toIpPort(),
-            static_cast<int>(resp->getStatusCode()),
-            resp->getBody().size(), cost);
+            reqBytes, req->getPeerAddr().toIpPort(), req->getLocalAddr().toIpPort(),
+            static_cast<int>(resp->getStatusCode()), respBytes, cost);
+    });
+
+    // 非流式请求体闸门(header 阶段预检):1.9.13 无 per-route 上限 API,
+    // Content-Length 声明超限 → 提前 413,防恶意大 body 落临时文件/磁盘耗尽。
+    // 豁免:带 X-File-Size 者视为流式大上传(RegisterStreamCoro 业务,其 maxBytes 兜底);
+    //   ⚠ 该豁免可被伪造,防御定位为"默认配置收口",非完备防护(全局 clientMaxBodySize 兜底)。
+    app().registerPreRoutingAdvice([](const HttpRequestPtr& req, AdviceCallback&& cb,
+                                      AdviceChainCallback&& cc) {
+        size_t limit = s_nonStreamBodyLimit.load();
+        if (limit > 0)
+        {
+            string cl = req->getHeader("Content-Length");
+            if (!cl.empty())
+            {
+                try
+                {
+                    if (std::stoull(cl) > limit && req->getHeader("X-File-Size").empty())
+                    {
+                        cb(ErrorResponse(413, "body too large"));
+                        return;
+                    }
+                }
+                catch (const std::exception&) { /* 非法长度头,交给框架解析 */ }
+            }
+        }
+        cc();
+    });
+
+    // 安全响应头(全局 PreSending;含 80→443 重定向与全部分支):
+    //   X-Content-Type-Options / X-Frame-Options / HTTPS 面 HSTS。
+    //   CSP 不做默认(需按页面约定配置,见 Options 备注)。
+    app().registerPreSendingAdvice([](const HttpRequestPtr& req,
+                                      const HttpResponsePtr& resp) {
+        resp->addHeader("X-Content-Type-Options", "nosniff");
+        resp->addHeader("X-Frame-Options", "SAMEORIGIN");
+        if (req->isOnSecureConnection())
+        {
+            resp->addHeader("Strict-Transport-Security",
+                            "max-age=31536000; includeSubDomains");
+        }
     });
 
     // 自动 JSONP(FR-24,主流中间件语义):GET + 合法 callback + JSON 响应 → 包装。
@@ -1470,36 +1636,49 @@ const string& ZmHttpServer::MimeForExt(const string& path)
 //   零拷贝分段读盘入发送缓冲),Range/206/Content-Length/Accept-Ranges 语义由框架兜底。
 //   适用:常规文件(< Hybrid 阈值);要求简洁、带宽内无额外延迟。
 //   边界:无字节级水位(慢客户端背压依赖 trantor 输出缓冲,见设计 §6.1 O1 待实测)。
+//   条件请求:Last-Modified(mtime)+ 强 ETag(size-mtime) → If-None-Match 优先、
+//   If-Modified-Since 兜底 → 304(缓存节流,配合前端静态资源显著省流量)。
 // ============================================================================
 drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileCoro(const HttpRequestPtr& req,
-                                                             const string& path,
-                                                             const string& attachmentName)
+                                                         const string& path,
+                                                         const string& attachmentName)
 {
-    // ① 文件存在性/可读性校验(stat;失败 → 404)
-    std::error_code ec;
-    if (!std::filesystem::exists(path, ec) || ec)
-    {
+    // 单次 stat(存在性/大小/mtime;失败 404/500),转 Impl 复用元信息
+    ZmFileMeta m = FetchFileMeta(path);
+    if (!m.found)
         co_return ErrorResponse(404, "file not found");
-    }
-    // ② 取文件大小:Range 解析与 206 Content-Range 都需要它;失败 → 500
-    size_t fileSize = static_cast<size_t>(std::filesystem::file_size(path, ec));
-    if (ec)
-    {
+    if (m.sizeFailed)
         co_return ErrorResponse(500, "file stat failed");
-    }
+    co_return co_await SendFileCoroImpl(req, path, attachmentName, m.size, m.mtimeSec);
+}
 
-    // ③ 解析 Range 头(共用解析器):present=带 Range;valid=单段合法(多段/非法 → 无效)
+drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileCoroImpl(const HttpRequestPtr& req,
+                                                             const string& path,
+                                                             const string& attachmentName,
+                                                             size_t fileSize,
+                                                             int64_t mtimeSec)
+{
+    ZmFileMeta m;                       // 元信息由公开入口/Hybrid 已取,此处只组装
+    m.size = fileSize;
+    m.mtimeSec = mtimeSec;
+
+    // ① 条件请求(304 无 body);命中即返回,不再走 Range/200
+    auto cacheHeaders = CacheHeaders(m);
+    if (auto notMod = Maybe304(req, m, cacheHeaders))
+        co_return notMod;
+
+    // ② 解析 Range 头(共用解析器):present=带 Range;valid=单段合法(多段/非法 → 无效)
     RangeInfo r = ParseRange(req, fileSize);
     if (r.present && !r.valid)
     {
         // Range 头存在但不可满足 → 413/416 语义:416 + Content-Range: bytes */size
         co_return Range416Response(true, fileSize);
     }
-    // ④ "bytes=a-" 这类开放终点:length=0 表示"到文件尾",这里把语义具体化
+    // ③ "bytes=a-" 这类开放终点:length=0 表示"到文件尾",这里把语义具体化
     if (r.partial && r.length == 0)
         r.length = fileSize - r.offset;
 
-    // ⑤ 构造文件响应:
+    // ④ 构造文件响应:
     //    partial(有合法 Range)→ offset/length 只发区间,setContentRange 由下面手动加头;
     //    全文件 → offset=0,length=fileSize;
     //    attachmentName 非空 → 框架自动写 Content-Disposition: attachment。
@@ -1508,6 +1687,9 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileCoro(const HttpRequestPtr& r
         path, r.offset, r.partial ? r.length : fileSize,
         /*setContentRange=*/false, attachmentName, CT_NONE, "", req);
 
+    // ⑤ 缓存头(与 304 一致:客户端代理/浏览器核对条件)
+    resp->addHeader("Last-Modified", cacheHeaders.first);
+    resp->addHeader("ETag", cacheHeaders.second);
     // ⑥ 告知客户端支持断点续传(Range 请求有效依据)
     resp->addHeader("Accept-Ranges", "bytes");
     // ⑦ 部分内容:206 + Content-Range: bytes {offset}-{offset+length-1}/{fileSize}
@@ -1529,23 +1711,34 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileCoro(const HttpRequestPtr& r
 //   读盘走专用 I/O 线程池(HttpIoPool),事件循环线程绝不阻塞(NFR);
 //   支持停滞放弃(stallAbortMs,客户端 Range 续传)与进度回调(onProgress)。
 //   适用:≥Hybrid 阈值的大文件、需要进度回调/长连接稳定性控制的场景。
+//   条件请求:同方案甲(304 为普通响应,不在流内)。
 // ============================================================================
 drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoro(const HttpRequestPtr& req,
-                                                                   const string& path,
-                                                                   const string& attachmentName,
-                                                                   const ZmHttpSendFileOptions& opts)
+                                                               const string& path,
+                                                               const string& attachmentName,
+                                                               const ZmHttpSendFileOptions& opts)
 {
-    // ① 文件存在性/大小校验(同方案甲;失败 → 404/500)
-    std::error_code ec;
-    if (!std::filesystem::exists(path, ec) || ec)
-    {
+    // 单次 stat(存在性/大小/mtime;失败 404/500),转 Impl 复用元信息
+    ZmFileMeta m = FetchFileMeta(path);
+    if (!m.found)
         co_return ErrorResponse(404, "file not found");
-    }
-    size_t fileSize = static_cast<size_t>(std::filesystem::file_size(path, ec));
-    if (ec)
-    {
+    if (m.sizeFailed)
         co_return ErrorResponse(500, "file stat failed");
-    }
+    co_return co_await SendFileStreamCoroImpl(req, path, attachmentName, opts,
+                                              m.size, m.mtimeSec);
+}
+
+drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoroImpl(
+    const HttpRequestPtr& req, const string& path, const string& attachmentName,
+    const ZmHttpSendFileOptions& opts, size_t fileSize, int64_t mtimeSec)
+{
+    // ① 条件请求(304 无 body);命中即返回,不再走流式
+    ZmFileMeta m;
+    m.size = fileSize;
+    m.mtimeSec = mtimeSec;
+    auto cacheHeaders = CacheHeaders(m);
+    if (auto notMod = Maybe304(req, m, cacheHeaders))
+        co_return notMod;
 
     // ② Range 解析(同方案甲共用):合法单段 → partial 区间;非法 → 416
     RangeInfo r = ParseRange(req, fileSize);
@@ -1576,7 +1769,10 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoro(const HttpRequest
     // ④ 响应头:断点续传声明 + MIME(方案乙无 Content-Length,chunked 编码)
     resp->addHeader("Accept-Ranges", "bytes");
     resp->addHeader("Content-Type", MimeForExt(path));
-    // ⑤ 部分内容 → 206 + Content-Range(格式同方案甲;长度由 chunked 流承载)
+    // ⑤ 缓存头(与 304 一致;大文件下载客户端亦可条件续用)
+    resp->addHeader("Last-Modified", cacheHeaders.first);
+    resp->addHeader("ETag", cacheHeaders.second);
+    // ⑥ 部分内容 → 206 + Content-Range(格式同方案甲;长度由 chunked 流承载)
     if (r.partial)
     {
         resp->setStatusCode(k206PartialContent);
@@ -1585,7 +1781,7 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoro(const HttpRequest
                             std::to_string(r.offset + r.length - 1) + "/" +
                             std::to_string(fileSize));
     }
-    // ⑥ 下载文件名(浏览器另存为)
+    // ⑦ 下载文件名(浏览器另存为)
     if (!attachmentName.empty())
     {
         resp->addHeader("Content-Disposition",
@@ -1601,23 +1797,21 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoro(const HttpRequest
 //   阈值默认 2GB(调用方可覆盖;0 = 恒乙);不关心细节的业务层直接用本入口。
 // ============================================================================
 drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileHybridCoro(const HttpRequestPtr& req,
-                                                                   const string& path,
-                                                                   const string& attachmentName,
-                                                                   size_t threshold,
-                                                                   const ZmHttpSendFileOptions& streamOpts)
+                                                               const string& path,
+                                                               const string& attachmentName,
+                                                               size_t threshold,
+                                                               const ZmHttpSendFileOptions& streamOpts)
 {
-    // ① 文件存在性校验(失败 → 404)
-    std::error_code ec;
-    if (!std::filesystem::exists(path, ec) || ec)
-    {
+    // 单次 stat(存在性/大小/mtime)后按阈值路由到对应内部实现,不重复取元信息
+    ZmFileMeta m = FetchFileMeta(path);
+    if (!m.found)
         co_return ErrorResponse(404, "file not found");
-    }
-    // ② 取文件大小用于路由抉择
-    size_t fileSize = static_cast<size_t>(std::filesystem::file_size(path, ec));
-    // ③ 路由:小文件(含 stat 失败情形)走方案甲;≥ 阈值走方案乙并携带行为参数
-    if (fileSize < threshold)
-        co_return co_await SendFileCoro(req, path, attachmentName);
-    co_return co_await SendFileStreamCoro(req, path, attachmentName, streamOpts);
+    if (m.sizeFailed)
+        co_return ErrorResponse(500, "file stat failed");
+    if (m.size < threshold)
+        co_return co_await SendFileCoroImpl(req, path, attachmentName, m.size, m.mtimeSec);
+    co_return co_await SendFileStreamCoroImpl(req, path, attachmentName, streamOpts,
+                                              m.size, m.mtimeSec);
 }
 
 // ============================================================================
@@ -1746,6 +1940,20 @@ bool ZmHttpServer::IsValidJsonpCallback(const std::string& cb)
     return std::all_of(cb.begin(), cb.end(), [](char c) {
         return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.';
     });
+}
+
+/// CORS 白名单查询(Init 注入 Options.corsAllowedOrigins,运行期只读):
+/// 空名单 → 一律拒绝(不回显 CORS 头,浏览器判跨域失败);命中才放行凭据回显。
+bool ZmHttpServer::IsCorsOriginAllowed(const std::string& origin)
+{
+    if (origin.empty())
+        return false;
+    for (const auto& o : s_corsOrigins)
+    {
+        if (o == origin)
+            return true;
+    }
+    return false;
 }
 
 /// 显式 JSONP 响应(FR-24):有合法 callback → cb(json);(application/javascript);

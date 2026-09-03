@@ -114,18 +114,33 @@ public:
     {
         size_t threadNum = 0;              // 事件循环线程数(0 = 自动 = CPU 核数)
         size_t maxConnections = 8192;      // 最大连接数护栏(0 大概率不限,慎用)
-        size_t clientMaxBodySize = 10ULL * 1024 * 1024 * 1024;  // 单请求体上限 10GB(超限 413;0 无特殊语义,别设 0)
+        // 框架级请求体上限(1.9.13 对【全体请求含流式】强制,HttpRequestParser.cc:266,超限 413)。
+        // 它是流式大上传(RegisterStreamCoro)唯一的框架兜底,勿调小于业务最大上传;
+        // 非流式路由的提前拒绝由 nonStreamBodyLimit 承担。
+        size_t clientMaxBodySize = 10ULL * 1024 * 1024 * 1024;
+        /// 非流式路由请求体上限(PreRouting 按 Content-Length 预检,超限 413):
+        /// 带 X-File-Size 声明的请求豁免(流式大上传路径,业务经 RegisterStreamCoro 的 maxBytes 兜底);
+        /// 0 = 关闭预检。注:1.9.13 无 per-route 上限 API,此为 header 阶段全局闸门(路由无关)。
+        size_t nonStreamBodyLimit = 256ULL * 1024 * 1024;
+        /// 请求体内存缓冲上限(超过部分落临时文件,drogon 默认 64KB):
+        /// "打满内存"的防护闸,内存增长有界(非流式大 body 的代价是磁盘/IO 而非内存)。
+        size_t clientMaxMemoryBodySize = 64 * 1024;
+        size_t maxConnectionsPerIP = 0;    // per-IP 连接数护栏(0 = 不限;⚠ 单机压测全部连接同源 IP,设值小于压测并发 → 拒连)
         size_t idleTimeoutSec = 90;        // keep-alive 空闲回收秒(0 = 关闭空闲回收)
         size_t keepaliveRequests = 0;      // 单连接请求数上限(0 = 不限次数回收)
         bool enableRequestStream = true;   // 上传流式落盘开关(业务依赖,保持 true)
         size_t workPoolSize = 8;           // 业务阻塞工作池线程数(切勿设 0)
-        bool gzip = false;                 // 动态 gzip 压缩
-        bool brotli = false;               // 动态 brotli 压缩
-        bool gzipStatic = false;           // 静态 gzip 压缩
-        bool brotliStatic = false;         // 静态 brotli(本捆绑 1.9.13 未生效)
+        bool gzip = false;                 // 动态 gzip 压缩(>1024 非二进制 body,事件循环线程同步压)
+        bool brotli = false;               // 动态 brotli 压缩(同上;CPU 更高,压缩率更优)
+        bool gzipStatic = false;           // 静态 gzip:客户端支持时优先发同路径 <file>.gz 孪生(非现场压缩,无孪生照发原文件)
+        bool brotliStatic = false;         // 静态 brotli:同上,孪生为 <file>.br(库已链接;无孪生照发原文件)
         bool ticketDisabled = false;       // TLS SessionTicket 禁用(安全项)
         std::string certFile;              // 全局证书(空 = 纯 HTTP)
         std::string keyFile;
+        /// CORS 白名单(按 Origin 全串精确匹配,如 "https://www.example.com")。
+        /// 空 = 不回显任何 CORS 头(跨域被浏览器拒绝,默认收敛);命中才回显 Origin +
+        /// Allow-Credentials。跨域调用方在此登记;不含 "*"(与凭据头互斥)。
+        std::vector<std::string> corsAllowedOrigins;
     };
 
     // ── 静态生命周期(进程级一次;状态机 Uninit→Initialized→Opened→Closed) ──
@@ -195,7 +210,14 @@ public:
     virtual void SetRootPath(const std::string& path) { m_rootPath = path; }
     virtual const std::string& GetRootPath() const { return m_rootPath; }
 
+    // ── 条件请求(FR-12 增强):Last-Modified/ETag → 304,white经 If-None-Match 优先 ──
+    /// CORS 白名单查询(Init 注入 Options.corsAllowedOrigins,启动后只读):
+    /// origin 在名单内 → 回显 CORS 头;空名单/不在 → 不发(浏览器拒绝跨域)。
+    static bool IsCorsOriginAllowed(const std::string& origin);
+
     // ── 文件传输(FR-12,双路径;Range 由基类内部解析) ──
+    /// 支持条件请求:Last-Modified(mtime)+ 强 ETag(size-mtime),If-None-Match
+    /// 优先、If-Modified-Since 兜底 → 304(无 body);Range/206 语义同前。
     virtual drogon::Task<drogon::HttpResponsePtr>
     SendFileCoro(const drogon::HttpRequestPtr& req, const std::string& path,
                  const std::string& attachmentName = "");
@@ -298,6 +320,8 @@ private:
     /// JSONP 回调名白名单校验(FR-24,防 XSS):[A-Za-z0-9_.] 且长度 ≤128
     static bool IsValidJsonpCallback(const std::string& cb);
     static std::atomic<bool> s_autoJsonp;   // 全局自动 JSONP 开关(默认开,对齐主流)
+    static std::atomic<size_t> s_nonStreamBodyLimit;          // 非流式 body 上限(Init 注入;0 = 关)
+    static std::vector<std::string> s_corsOrigins;            // CORS 白名单(Init 注入;启动后只读)
     /// {N} 占位符 → 正则(手动转换;设计 FR-05,绕开本捆绑 drogon 的崩溃点)
     static std::string PathPatternToRegex(const std::string& path);
 
@@ -313,6 +337,19 @@ private:
     static RangeInfo ParseRange(const drogon::HttpRequestPtr& req, size_t fileSize);
     static drogon::HttpResponsePtr Range416Response(bool hasRange, size_t fileSize);
     static const std::string& MimeForExt(const std::string& path);
+
+    /// 已知元信息的发送内部实现(公开入口与 Hybrid 共用,避免重复 stat):
+    /// 接收已取的 fileSize/mtimeSec,内部完成 条件请求(304)→ Range → 响应构造。
+    static drogon::Task<drogon::HttpResponsePtr>
+    SendFileCoroImpl(const drogon::HttpRequestPtr& req, const std::string& path,
+                     const std::string& attachmentName, size_t fileSize,
+                     int64_t mtimeSec);
+    static drogon::Task<drogon::HttpResponsePtr>
+    SendFileStreamCoroImpl(const drogon::HttpRequestPtr& req,
+                           const std::string& path,
+                           const std::string& attachmentName,
+                           const ZmHttpSendFileOptions& opts, size_t fileSize,
+                           int64_t mtimeSec);
 };
 
 // ----------------------------------------------------------------------------
