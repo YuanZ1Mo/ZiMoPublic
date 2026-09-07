@@ -102,6 +102,9 @@ public:
     int64_t abortMs = 120000;
     ZmHttpSendFileOptions opts;
     drogon::ResponseStreamPtr stream;
+    /// 连接弱引用(停滞判定用:bytesSent 差值反映对端真实消费;DEF-1 2026-09-07)
+    std::weak_ptr<trantor::TcpConnection> connWk;
+    uint64_t lastConnSent = 0;   // 上次观测的连接累计发送字节(仅事件循环线程访问)
 
     void Run();   // 打开文件并驱动第一块
     void Next();  // 提交异步读 → I/O 线程读盘 → queueInLoop 回执发送(事件循环不阻塞)
@@ -121,6 +124,23 @@ static int64_t NowMs()
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+}
+
+/// UTF-8 → UTF-16 路径转换(平台路径统一 UTF-8 契约;文件 stat/打开/落盘共用)。
+/// 严禁把窄串直接交给 std::filesystem——MSVC 按本机 ANSI 码页解码,中文路径必错。
+static std::wstring Utf8ToWide(const std::string& utf8)
+{
+    if (utf8.empty())
+        return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
+                                static_cast<int>(utf8.size()), nullptr, 0);
+    if (n <= 0)
+        return {};
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()),
+                        w.data(), n);
+    w.resize(static_cast<size_t>(n));
+    return w;
 }
 
 // ----------------------------------------------------------------------------
@@ -160,9 +180,9 @@ static bool IsValidRequestId(const string& id)
 // ── Run:打开文件句柄并驱动第一块(事件循环线程;收到流对象时立即调用) ──
 void ZmStreamLoopState::Run()
 {
-    // 路径为内部构造的 ASCII 路径;File 已按 UTF-8(A:\ZiMo\...)
-    std::filesystem::path fsPath(path);
-    m_handle = CreateFileW(fsPath.c_str(), GENERIC_READ,
+    // 路径为 UTF-8 契约(与上传侧一致):显式 CP_UTF8 → wide,窄串直接进 filesystem 会被按 ANSI 解码
+    std::wstring wpath = Utf8ToWide(path);
+    m_handle = CreateFileW(wpath.c_str(), GENERIC_READ,
                            FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                            FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (m_handle == INVALID_HANDLE_VALUE)
@@ -183,6 +203,9 @@ void ZmStreamLoopState::Run()
             return;
         }
     }
+    // 停滞判定基准:以连接累计发送字节为"对端真实消费"信号(DEF-1)
+    if (auto c = connWk.lock())
+        lastConnSent = c->bytesSent();
     lastSentMs = NowMs();
     Next();
 }
@@ -200,12 +223,24 @@ void ZmStreamLoopState::Next()
         Finish();
         return;
     }
-    // 停滞判定:距上次成功 send 超阈值且连接未关闭(慢客户端兜底,可 Range 续传)
-    if (NowMs() - lastSentMs > abortMs)
+    // 停滞判定(DEF-1 2026-09-07):send() 返回 true 只代表排入 trantor 输出缓冲,
+    // 不反映对端消费——以 conn->bytesSent()(套接字实发)差值为准:
+    // 字节持续增长 = 对端在消费;冻结超过 abortMs = 对端停滞 → 放弃(客户端可 Range 续传)。
+    // 注:bytesSent 覆盖响应头+正文,慢但仍在消费的客户端不会误杀。
+    if (auto c = connWk.lock())
     {
-        PUBLIC_LOG_WARN("SendFileStreamCoro 停滞放弃: {}", path);
-        Finish();
-        return;
+        uint64_t sentNow = c->bytesSent();
+        if (sentNow != lastConnSent)
+        {
+            lastConnSent = sentNow;
+            lastSentMs = NowMs();
+        }
+        else if (NowMs() - lastSentMs > abortMs)
+        {
+            PUBLIC_LOG_WARN("SendFileStreamCoro 对端消费停滞放弃: {}", path);
+            Finish();
+            return;
+        }
     }
 
     size_t want = static_cast<size_t>(
@@ -254,7 +289,8 @@ void ZmStreamLoopState::OnReadDone(std::shared_ptr<std::string> buf, bool ok)
     }
     remaining -= buf->size();
     sent += buf->size();
-    lastSentMs = NowMs();
+    // 注:此处不再刷新 lastSentMs——停滞判定只认 bytesSent 差值(DEF-1),
+    //     send() 成功 ≠ 对端消费。
     if (opts.onProgress && sent <= total)
         opts.onProgress(sent, total);
 
@@ -306,12 +342,15 @@ void ZmStreamLoopState::DoClose()
 class ZmWsController : public drogon::WebSocketControllerBase
 {
 public:
-    explicit ZmWsController(string regName) : m_regName(std::move(regName)) {}
+    explicit ZmWsController(string regName)
+        : m_regName(std::move(regName)), m_cbs(GetCallbacksCopy(m_regName))
+    {
+    }
 
     void handleNewConnection(const HttpRequestPtr& req,
                              const WebSocketConnectionPtr& conn) override
     {
-        const auto& cb = GetWsCallbacks(m_regName);
+        const auto& cb = m_cbs;   // 构造时快照,消息路径零锁(改进项 2)
         bool ok = cb.onAuth ? cb.onAuth(req) : true;
         if (!ok)
         {
@@ -326,24 +365,22 @@ public:
     void handleNewMessage(const WebSocketConnectionPtr& conn, string&& msg,
                           const WebSocketMessageType& type) override
     {
-        const auto& cb = GetWsCallbacks(m_regName);
-        if (cb.onMessage)
-            cb.onMessage(conn, std::move(msg), type);
+        if (m_cbs.onMessage)
+            m_cbs.onMessage(conn, std::move(msg), type);
     }
 
     void handleConnectionClosed(const WebSocketConnectionPtr& conn) override
     {
-        const auto& cb = GetWsCallbacks(m_regName);
-        if (cb.onClose)
-            cb.onClose(conn);
+        if (m_cbs.onClose)
+            m_cbs.onClose(conn);
     }
 
-    static const ZmHttpServer::WsCallbacks& GetWsCallbacks(const string& name)
+    /// 快照取回(按值;工厂实例化先于任何回调,注册表 Phase1 后只读)
+    static ZmHttpServer::WsCallbacks GetCallbacksCopy(const string& name)
     {
         std::lock_guard lock(s_mtx);
         auto it = s_cbs.find(name);
-        static ZmHttpServer::WsCallbacks empty;
-        return it == s_cbs.end() ? empty : it->second;
+        return it == s_cbs.end() ? ZmHttpServer::WsCallbacks{} : it->second;
     }
 
     static void SetCallbacks(const string& name, ZmHttpServer::WsCallbacks cb)
@@ -354,6 +391,7 @@ public:
 
 private:
     string m_regName;
+    ZmHttpServer::WsCallbacks m_cbs;   ///< 注册时快照(高比消息路径零锁)
     static std::mutex s_mtx;
     static std::map<string, ZmHttpServer::WsCallbacks> s_cbs;
 };
@@ -648,7 +686,9 @@ bool ZmHttpServer::Init(const Options& opts)
 
     // 自动 JSONP(FR-24,主流中间件语义):GET + 合法 callback + JSON 响应 → 包装。
     // 规则收敛:不污染普通 REST/前端静态/WS 升级;三面共享(全局 advice)。
-    // 注:在 PostHandling 之后执行,访问日志记录的字节数为包装前的 JSON 大小。
+    // 注①:仅包装纯 JSON(CT_APPLICATION_JSON)——显式 JsonpResponse 的产物已是
+    //      CT_TEXT_JAVASCRIPT,纳入条件会二次包装(BUG-1 2026-09-07 修复)。
+    // 注②:在 PostHandling 之后执行,访问日志记录的字节数为包装前的 JSON 大小。
     app().registerPreSendingAdvice([](const HttpRequestPtr& req,
                                       const HttpResponsePtr& resp) {
         if (!ZmHttpServer::IsAutoJsonpEnabled())
@@ -658,8 +698,7 @@ bool ZmHttpServer::Init(const Options& opts)
         string cb = req->getParameter("callback");
         if (cb.empty() || !ZmHttpServer::IsValidJsonpCallback(cb))
             return;
-        auto ct = resp->contentType();
-        if (ct != CT_APPLICATION_JSON && ct != CT_TEXT_JAVASCRIPT)
+        if (resp->contentType() != CT_APPLICATION_JSON)
             return;
         string body = cb + "(" + std::string(resp->getBody()) + ");";
         resp->setBody(body);
@@ -675,8 +714,11 @@ bool ZmHttpServer::Init(const Options& opts)
 /// 前置:已 Init 且已登记至少一个监听;启动成功以"事件循环就绪信号"
 /// (registerBeginningAdvice)为准,绑定失败(端口占用等)经 run 线程异常
 /// fail-fast 返回 false。
+/// 并发纪律(DEF-4 2026-09-07):状态迁移全程持 s_stateMtx —— Close 在 Open
+/// 启动窗口/等待期插入时,看到一致状态并正常收管(run 线程由 Close join)。
 bool ZmHttpServer::Open()
 {
+    std::unique_lock<std::mutex> lock(s_stateMtx);
     ZmRuntimeState cur = s_state.load();
     if (cur != ZmRuntimeState::Initialized)
     {
@@ -703,6 +745,8 @@ bool ZmHttpServer::Open()
     // 后台线程跑 app().run()(ZmThread 模型;Stop 靠 request_stop + join,
     // 实际退出由 app().quit() 驱动,run() 不查 stop_token)。
     // 绑定失败(端口占用等)会在事件循环启动前抛异常 → s_runError 捕获兜底。
+    // 注:run 线程异常路径仅写 s_runErrorMsg + release s_runError,不取 s_stateMtx,
+    //     避免与 Close 的 Stop(join) 互等。
     s_runThread = std::make_unique<ZmThread>(
         "DrogonHttpRun", [](std::stop_token) {
             try
@@ -711,20 +755,14 @@ bool ZmHttpServer::Open()
             }
             catch (const std::exception& e)
             {
-                {
-                    std::lock_guard lk(s_stateMtx);
-                    s_runErrorMsg = e.what();
-                }
-                s_runError.store(true);
+                s_runErrorMsg = e.what();
+                s_runError.store(true, std::memory_order_release);
                 s_stateCv.notify_all();
             }
             catch (...)
             {
-                {
-                    std::lock_guard lk(s_stateMtx);
-                    s_runErrorMsg = "unknown";
-                }
-                s_runError.store(true);
+                s_runErrorMsg = "unknown";
+                s_runError.store(true, std::memory_order_release);
                 s_stateCv.notify_all();
             }
         });
@@ -736,13 +774,20 @@ bool ZmHttpServer::Open()
         return false;
     }
 
-    // 纯事件等待"启动结果":两个信号必然有一个到达并 notify ——
-    //   BeginningAdvice 触发(事件循环已跑)→ 成功;run 抛异常(绑定失败等)→ s_runError。
-    // 无需超时:绑定失败必抛异常、启动成功必触发 advice,二者必有其一。
-    std::unique_lock lock(s_stateMtx);
-    s_stateCv.wait(lock, [&] { return s_runError.load() || s_startReady.load(); });
+    // 纯事件等待"启动结果":三个信号必然有一个到达并 notify ——
+    //   BeginningAdvice 触发(事件循环已跑)→ 成功;run 抛异常(绑定失败等)→ s_runError;
+    //   并发 Close 收管 → s_state == Closed。
+    // 无需超时:绑定失败必抛异常、启动成功必触发 advice。
+    s_stateCv.wait(lock, [&] {
+        return s_runError.load(std::memory_order_acquire) || s_startReady.load() ||
+               s_state.load() == ZmRuntimeState::Closed;
+    });
 
-    if (s_runError.load())
+    // 并发 Close 已收管(线程已 join、s_runThread 已复位):本次 Open 视为失败
+    if (s_state.load() == ZmRuntimeState::Closed)
+        return false;
+
+    if (s_runError.load(std::memory_order_acquire))
     {
         PUBLIC_LOG_ERROR("app().run() 启动异常: {}", s_runErrorMsg);
         // 让 run 线程收尾退出,再回退状态允许重试
@@ -761,8 +806,11 @@ bool ZmHttpServer::Open()
 /// Opened → 先 app().quit() 停事件循环,再 Stop(join)。
 /// ⚠ 在飞 HTTP 语义(v2.7):quit 后挂起协程不再调度,业务层自保障
 ///    (守护线程 join/断点),本函数不等待在飞业务。
+/// 并发纪律(DEF-4):全程持 s_stateMtx,可安全打断 Open 的启动等待窗口
+/// (notify_all 唤醒其 CV 等待;run 线程由本函数 join 并复位)。
 void ZmHttpServer::Close()
 {
+    std::lock_guard<std::mutex> lock(s_stateMtx);
     ZmRuntimeState cur = s_state.load();
     if (cur == ZmRuntimeState::Uninit || cur == ZmRuntimeState::Closed)
     {
@@ -772,6 +820,7 @@ void ZmHttpServer::Close()
     {
         // 未 Open 就直接 Close:仅回退状态
         s_state.store(ZmRuntimeState::Closed);
+        s_stateCv.notify_all();
         return;
     }
     // Opened:先 quit 让 run() 返回,再 Stop(join) — 顺序必须保持
@@ -782,6 +831,7 @@ void ZmHttpServer::Close()
         s_runThread.reset();
     }
     s_state.store(ZmRuntimeState::Closed);
+    s_stateCv.notify_all();   // 唤醒并发 Open 的等待(其按 Closed 收场)
     PUBLIC_LOG_INFO("ZmHttpServer::Close 完成(已 quit+Stop,终态)");
 }
 
@@ -821,6 +871,13 @@ void ZmHttpServer::AddListener(uint16_t port, bool useSSL, const string& ip,
     if (port == 0)
     {
         PUBLIC_LOG_ERROR("AddListener 端口非法(port=0),忽略");
+        return;
+    }
+    // 相位契约硬约束(改进项 6):监听须在 Init 之后(全局参数先行注入)登记
+    if (!IsInitialized())
+    {
+        PUBLIC_LOG_ERROR("AddListener 须在 ZmHttpServer::Init 之后调用(当前未 Init),已忽略: port={}",
+                         port);
         return;
     }
     if (IsOpened())
@@ -943,6 +1000,8 @@ void ZmHttpServer::RegisterMultipartCoro(const string& path, drogon::HttpMethod 
 
         auto state = std::make_shared<ZmMultipartCollector>();
         state->maxBytes = maxBytes;
+        // DEF-5:超限后中途换 NullReader 用(拷贝持有流;见 dataCb)
+        drogon::RequestStreamPtr stream = streamCtx;
 
         auto headerCb = [state](MultipartHeader header) {
             if (state->tooLarge)
@@ -967,7 +1026,7 @@ void ZmHttpServer::RegisterMultipartCoro(const string& path, drogon::HttpMethod 
                 state->result.files.push_back(std::move(f));
             }
         };
-        auto dataCb = [state](const char* buf, size_t len) {
+        auto dataCb = [state, stream](const char* buf, size_t len) {
             if (state->tooLarge)
                 return;
             if (state->fieldMode)
@@ -975,6 +1034,10 @@ void ZmHttpServer::RegisterMultipartCoro(const string& path, drogon::HttpMethod 
                 if (state->curFieldSize + static_cast<int64_t>(len) > kMaxFieldBytes)
                 {
                     state->tooLarge = true;
+                    // DEF-5(2026-09-07):字段超限 → 中途换 NullReader 丢弃剩余网络数据,
+                    // 不再整条消费(与 RegisterStreamCoro 早拒语义对齐);正在执行的
+                    // 旧 multipart reader 由流内部在本次交付后释放,无悬空。
+                    stream->setStreamReader(drogon::RequestStreamReader::newNullReader());
                     return;
                 }
                 state->curField.append(buf, len);
@@ -988,7 +1051,11 @@ void ZmHttpServer::RegisterMultipartCoro(const string& path, drogon::HttpMethod 
             }
             state->total += len;
             if (state->maxBytes > 0 && state->total > state->maxBytes)
+            {
                 state->tooLarge = true;
+                // DEF-5:总量超限 → 同上,立即停止消费
+                stream->setStreamReader(drogon::RequestStreamReader::newNullReader());
+            }
         };
         auto finishCb = [state, h, req, cb](std::exception_ptr e) mutable {
             if (state->tooLarge)
@@ -1037,14 +1104,13 @@ void ZmHttpServer::RegisterMultipartCoro(const string& path, drogon::HttpMethod 
 drogon::Task<int64_t> ZmHttpServer::SaveMultipartFile(const ZmMultipartResult::File& f,
                                                       const string& destPath)
 {
-    // 离核工作池写盘(事件循环纪律:回调内禁止直接写文件);
-    // 路径经 CP_UTF8 → WideChar(与 ZmUploadSink 一致)
+    // 离核工作池写盘(事件循环纪律:回调内禁止直接写文件);路径 UTF-8 → wide
     co_return co_await RunOnPool<int64_t>([&f, &destPath]() -> int64_t {
-        wchar_t wpath[2048];
-        if (MultiByteToWideChar(CP_UTF8, 0, destPath.c_str(), -1, wpath, 2048) <= 0)
+        std::wstring wpath = Utf8ToWide(destPath);
+        if (wpath.empty())
             return -1;
-        HANDLE h = ::CreateFileW(wpath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                                 FILE_ATTRIBUTE_NORMAL, nullptr);
+        HANDLE h = ::CreateFileW(wpath.c_str(), GENERIC_WRITE, 0, nullptr,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h == INVALID_HANDLE_VALUE)
             return -1;
         const char* p = f.data.data();
@@ -1157,10 +1223,10 @@ private:
 
     bool OpenFile()
     {
-        wchar_t wpath[2048];
-        if (MultiByteToWideChar(CP_UTF8, 0, m_dest.c_str(), -1, wpath, 2048) <= 0)
+        std::wstring wpath = Utf8ToWide(m_dest);
+        if (wpath.empty())
             return false;
-        m_handle = ::CreateFileW(wpath, GENERIC_WRITE, 0, nullptr,
+        m_handle = ::CreateFileW(wpath.c_str(), GENERIC_WRITE, 0, nullptr,
                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         return m_handle != INVALID_HANDLE_VALUE;
     }
@@ -1193,9 +1259,9 @@ private:
         CloseFile();
         if (deleteFile)
         {
-            wchar_t wpath[2048];
-            if (MultiByteToWideChar(CP_UTF8, 0, m_dest.c_str(), -1, wpath, 2048) > 0)
-                ::DeleteFileW(wpath);
+            std::wstring wpath = Utf8ToWide(m_dest);
+            if (!wpath.empty())
+                ::DeleteFileW(wpath.c_str());
         }
     }
 
@@ -1333,7 +1399,10 @@ private:
             if (written == len || now - m_lastProgressMs >= (int64_t)m_opts.progressIntervalMs)
             {
                 m_lastProgressMs = now;
-                m_opts.onProgress(written, m_opts.maxBytes);
+                // 改进项 1:total 优先取业务透传的 totalBytes(如 X-File-Size),
+                // maxBytes=0(不限)时不再恒回 0
+                m_opts.onProgress(written, m_opts.totalBytes ? m_opts.totalBytes
+                                                             : m_opts.maxBytes);
             }
         }
     }
@@ -1695,11 +1764,11 @@ void ZmHttpServer::RegisterPreSending(std::function<void(const HttpRequestPtr&,
 // 文件传输(FR-12):Range 解析 + 方案甲/乙 + Hybrid
 // ============================================================================
 // ----------------------------------------------------------------------------
-// ParseRange —— 请求 Range 头解析(方案甲/乙共用)
-//   支持:bytes=a-b(闭区间)、bytes=a-(开终点,到文件尾)、bytes=-N(后缀 N 字节)
-//   规则:仅单段;多段/非数字/起点越界/终点小于起点 → valid=false
-//        (present=true 且 !valid 时调用方按 RFC 7233 返回 416);
-//        无 Range 头 → present=false(调用方走全文件 200);
+// ParseRange —— 请求 Range 头解析(方案甲/乙共用;2026-09-07 RFC 7233 语义修订)
+//   结果三分:①合法单段 → partial(206);②合法但不可满足(起点越界/后缀 0/空文件)
+//   → unsatisfiable(416 + Content-Range: bytes */size,§4.4);③语法非法/多段/
+//   未知 unit → present=true 且两者皆 false → 忽略,200 全文件(§3.1 MAY ignore
+//   or reject;取 ignore 对多线程下载器更友好,§4.4 亦允许 416,两者皆合规)。
 //   注:drogon 的 newFileResponse 不解析 Range 头,故所有范围语义在此统一实现。
 // ----------------------------------------------------------------------------
 ZmHttpServer::RangeInfo ZmHttpServer::ParseRange(const HttpRequestPtr& req,
@@ -1712,53 +1781,34 @@ ZmHttpServer::RangeInfo ZmHttpServer::ParseRange(const HttpRequestPtr& req,
     r.present = true;
 
     if (range.rfind("bytes=", 0) != 0)
-    {
-        r.valid = false;
-        return r;
-    }
+        return r;                                    // 不认识的 unit → MUST ignore(§3.1)
     string body = range.substr(6);
     if (body.find(',') != string::npos)
-    {
-        r.valid = false;                             // 多段不支持
-        return r;
-    }
+        return r;                                    // 多段不支持 → ignore(200,下载器友好)
     size_t dash = body.find('-');
     if (dash == string::npos)
-    {
-        r.valid = false;
-        return r;
-    }
+        return r;                                    // 语法非法 → ignore
     string startS = body.substr(0, dash);
     string endS = body.substr(dash + 1);
 
     if (startS.empty() && endS.empty())
-    {
-        r.valid = false;
-        return r;
-    }
+        return r;                                    // "bytes=-" 语法非法 → ignore
     if (!startS.empty() && !std::all_of(startS.begin(), startS.end(),
                                         [](char c) { return std::isdigit((unsigned char)c); }))
-    {
-        r.valid = false;
-        return r;
-    }
+        return r;                                    // 语法非法 → ignore
     if (!endS.empty() && !std::all_of(endS.begin(), endS.end(),
                                       [](char c) { return std::isdigit((unsigned char)c); }))
-    {
-        r.valid = false;
-        return r;
-    }
+        return r;                                    // 语法非法 → ignore
 
-    r.partial = true;
     try
     {
         if (startS.empty())
         {
             // 后缀范围:bytes=-N(最后 N 字节)
             size_t n = std::stoull(endS);
-            if (n == 0)
+            if (n == 0 || fileSize == 0)
             {
-                r.valid = false;
+                r.unsatisfiable = true;              // 零长度后缀/空文件 → 不可满足(§2.1)
                 return r;
             }
             n = std::min(n, fileSize);
@@ -1768,26 +1818,23 @@ ZmHttpServer::RangeInfo ZmHttpServer::ParseRange(const HttpRequestPtr& req,
         else
         {
             size_t start = std::stoull(startS);
-            if (start >= fileSize)
+            if (fileSize == 0 || start >= fileSize)
             {
-                r.valid = false;                     // 起点越界 → 416
+                r.unsatisfiable = true;              // 起点越界 → 416(§4.4)
                 return r;
             }
             size_t end = endS.empty() ? fileSize - 1 : std::stoull(endS);
             if (end < start)
-            {
-                r.valid = false;
-                return r;
-            }
+                return r;                            // last < first 非法(§2.1)→ ignore
             end = std::min(end, fileSize - 1);
             r.offset = start;
             r.length = end - start + 1;
         }
-        r.valid = true;
+        r.partial = true;
     }
     catch (...)
     {
-        r.valid = false;
+        // 数值溢出等解析异常 → ignore(200 全文件)
     }
     return r;
 }
@@ -1860,23 +1907,73 @@ static string HttpDateStr(int64_t t)
     return buf;
 }
 
+/// Content-Disposition 值构造(DEF-3,2026-09-07;RFC 6266/5987/8187):
+///   ASCII 安全名 → filename="..."(剔除控制符/引号/反斜杠,防头结构破坏与注入);
+///   含非 ASCII → 追加 filename*=UTF-8''<percent-encoding>(RFC 5987,浏览器正确显示中文名)。
+static string MakeContentDisposition(const string& name)
+{
+    string fallback;
+    bool ascii = true;
+    for (char c : name)
+    {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc > 0x7E || c == '"' || c == '\\')
+        {
+            ascii = false;
+            continue;
+        }
+        fallback += c;
+    }
+    if (fallback.empty())
+        fallback = "download";
+
+    string out = "attachment; filename=\"" + fallback + "\"";
+    if (ascii)
+        return out;
+
+    // filename*:UTF-8 百分号编码(unreserved = A-Za-z0-9-._~)
+    static const char* hex = "0123456789ABCDEF";
+    string enc;
+    enc.reserve(name.size() * 3);
+    for (char c : name)
+    {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (std::isalnum(uc) || c == '-' || c == '.' || c == '_' || c == '~')
+            enc += c;
+        else
+        {
+            enc += '%';
+            enc += hex[uc >> 4];
+            enc += hex[uc & 0xF];
+        }
+    }
+    out += "; filename*=UTF-8''" + enc;
+    return out;
+}
+
 /// 文件元信息(单次 stat;条件请求与 Range 共用)。
 /// file_time(文件时钟) → system_clock(epoch 秒):以两个时钟的 now 为桥换算。
 ZmHttpServer::ZmFileMeta ZmHttpServer::FetchFileMeta(const string& path)
 {
     ZmFileMeta m;
+    // BUG-3(2026-09-07):filesystem 窄串按 ANSI 码页解码,UTF-8 路径必错——
+    // 先 UTF-8 → wide 再进 filesystem(与上传侧 CP_UTF8 契约一致)
+    const std::wstring wpath = Utf8ToWide(path);
+    if (wpath.empty() && !path.empty())
+        return m;
+    const std::filesystem::path fsPath(wpath);
     std::error_code ec;
-    m.found = std::filesystem::exists(path, ec) && !ec;
+    m.found = std::filesystem::exists(fsPath, ec) && !ec;
     if (!m.found)
         return m;
-    m.size = static_cast<size_t>(std::filesystem::file_size(path, ec));
+    m.size = static_cast<size_t>(std::filesystem::file_size(fsPath, ec));
     if (ec)
     {
         m.sizeFailed = true;
         return m;
     }
     std::error_code ec2;
-    auto ft = std::filesystem::last_write_time(path, ec2);
+    auto ft = std::filesystem::last_write_time(fsPath, ec2);
     if (!ec2)
     {
         auto fileNow = std::filesystem::file_time_type::clock::now();
@@ -1898,6 +1995,8 @@ pair<string, string> ZmHttpServer::CacheHeaders(const ZmFileMeta& m)
 
 /// 条件请求判定:If-None-Match 优先(命中 → 304;未命中跳过 If-Modified-Since),
 /// If-Modified-Since 兜底(文件未改 → 304)。日期非法视为未提供。
+/// If-None-Match 为逗号列表(改进项 5):按项 StripTag 后精确相等比较,
+/// 不再整串子串匹配(防 etag 前缀误命中)。
 /// @return 非空 = 304 响应(调用方直接返回);nullptr = 继续正常 200/206 流程。
 drogon::HttpResponsePtr ZmHttpServer::Maybe304(const HttpRequestPtr& req,
                                                const ZmFileMeta& m,
@@ -1909,8 +2008,8 @@ drogon::HttpResponsePtr ZmHttpServer::Maybe304(const HttpRequestPtr& req,
     if (!inm.empty())
     {
         // RFC 7232:If-None-Match 弱比较(逗号列表、W/ 前缀、entity-tag 本身带引号)。
-        // 容错修复(2026-09-04):比较前去 W/ 前缀与首尾引号——curl 等客户端经 -H 会剥掉
-        // 引号,若直接用带引号的 etag 做子串匹配会漏命中(实测 200 而非 304)。
+        // 容错:比较前去 W/ 前缀与首尾引号——curl 等客户端经 -H 会剥掉引号,
+        // 若直接用带引号的 etag 做匹配会漏命中(实测 200 而非 304)。
         auto StripTag = [](string s) -> string {
             if (s.size() >= 2 && (s[0] == 'W' || s[0] == 'w') && s[1] == '/')
                 s = s.substr(2);
@@ -1918,9 +2017,32 @@ drogon::HttpResponsePtr ZmHttpServer::Maybe304(const HttpRequestPtr& req,
                 s = s.substr(1, s.size() - 2);
             return s;
         };
-        string inmN = StripTag(inm);
         string etagN = StripTag(etag);
-        if (inm == "*" || (!etagN.empty() && inmN.find(etagN) != string::npos))
+        bool hit = (inm == "*");
+        if (!hit && !etagN.empty())
+        {
+            size_t pos = 0;
+            while (pos <= inm.size())
+            {
+                size_t comma = inm.find(',', pos);
+                string tag =
+                    inm.substr(pos, comma == string::npos ? string::npos : comma - pos);
+                // 去项内空白后精确比较(弱比较:忽略 W/ 前缀)
+                size_t b = tag.find_first_not_of(" \t");
+                size_t e = tag.find_last_not_of(" \t");
+                tag = (b == string::npos) ? string()
+                                          : tag.substr(b, e - b + 1);
+                if (!tag.empty() && StripTag(tag) == etagN)
+                {
+                    hit = true;
+                    break;
+                }
+                if (comma == string::npos)
+                    break;
+                pos = comma + 1;
+            }
+        }
+        if (hit)
         {
             auto resp = HttpResponse::newHttpResponse();
             resp->setStatusCode(k304NotModified);
@@ -1990,32 +2112,30 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileCoroImpl(const HttpRequestPt
     if (auto notMod = Maybe304(req, m, cacheHeaders))
         co_return notMod;
 
-    // ② 解析 Range 头(共用解析器):present=带 Range;valid=单段合法(多段/非法 → 无效)
+    // ② 解析 Range 头(共用解析器):合法单段 → partial 区间(206);合法但越界
+    //    → unsatisfiable(416);语法非法/多段 → ignore(200 全文件,RFC 7233 §3.1)
     RangeInfo r = ParseRange(req, fileSize);
-    if (r.present && !r.valid)
+    if (r.unsatisfiable)
     {
-        // Range 头存在但不可满足 → 413/416 语义:416 + Content-Range: bytes */size
         co_return Range416Response(true, fileSize);
     }
-    // ③ "bytes=a-" 这类开放终点:length=0 表示"到文件尾",这里把语义具体化
-    if (r.partial && r.length == 0)
-        r.length = fileSize - r.offset;
 
-    // ④ 构造文件响应:
+    // ③ 构造文件响应:
     //    partial(有合法 Range)→ offset/length 只发区间,setContentRange 由下面手动加头;
     //    全文件 → offset=0,length=fileSize;
-    //    attachmentName 非空 → 框架自动写 Content-Disposition: attachment。
+    //    attachmentName 非空 → 经 MakeContentDisposition 统一写头(转义 + RFC 5987,
+    //    不再交给框架裸拼,DEF-3)。
     //    ⚠ setContentRange 传 false:统一由本函数显式写 Content-Range,避免框架/手动双写
     HttpResponsePtr resp = HttpResponse::newFileResponse(
         path, r.offset, r.partial ? r.length : fileSize,
-        /*setContentRange=*/false, attachmentName, CT_NONE, "", req);
+        /*setContentRange=*/false, /*attachmentName=*/"", CT_NONE, "", req);
 
-    // ⑤ 缓存头(与 304 一致:客户端代理/浏览器核对条件)
+    // ④ 缓存头(与 304 一致:客户端代理/浏览器核对条件)
     resp->addHeader("Last-Modified", cacheHeaders.first);
     resp->addHeader("ETag", cacheHeaders.second);
-    // ⑥ 告知客户端支持断点续传(Range 请求有效依据)
+    // ⑤ 告知客户端支持断点续传(Range 请求有效依据)
     resp->addHeader("Accept-Ranges", "bytes");
-    // ⑦ 部分内容:206 + Content-Range: bytes {offset}-{offset+length-1}/{fileSize}
+    // ⑥ 部分内容:206 + Content-Range: bytes {offset}-{offset+length-1}/{fileSize}
     if (r.partial)
     {
         resp->setStatusCode(k206PartialContent);
@@ -2024,6 +2144,9 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileCoroImpl(const HttpRequestPt
                             std::to_string(r.offset + r.length - 1) + "/" +
                             std::to_string(fileSize));
     }
+    // ⑦ 下载文件名(浏览器另存为;转义 + RFC 5987 编码)
+    if (!attachmentName.empty())
+        resp->addHeader("Content-Disposition", MakeContentDisposition(attachmentName));
     co_return resp;
 }
 
@@ -2063,20 +2186,19 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoroImpl(
     if (auto notMod = Maybe304(req, m, cacheHeaders))
         co_return notMod;
 
-    // ② Range 解析(同方案甲共用):合法单段 → partial 区间;非法 → 416
+    // ② Range 解析(同方案甲共用):合法单段 → partial 区间;合法但越界 → 416;
+    //    语法非法/多段 → ignore(200 全文件,RFC 7233 §3.1)
     RangeInfo r = ParseRange(req, fileSize);
-    if (r.present && !r.valid)
+    if (r.unsatisfiable)
     {
         co_return Range416Response(true, fileSize);
     }
-    if (r.partial && r.length == 0)
-        r.length = fileSize - r.offset;
 
     // ③ 流式响应工厂:回调在发送启动时(事件循环线程)被框架调用,
     //    在此把 文件路径/区间/行为参数 注入发送状态机,并立即 Run() 驱动第一块;
     //    true = disableKickoffTimeout:禁用 trantor 默认启动超时(大文件/长流不被误杀)
     HttpResponsePtr resp = HttpResponse::newAsyncStreamResponse(
-        [path, fileSize, r, opts, attachmentName](ResponseStreamPtr stream) mutable {
+        [path, fileSize, r, opts, attachmentName, req](ResponseStreamPtr stream) mutable {
             auto st = std::make_shared<ZmStreamLoopState>();   // 状态机对象(持所有权)
             st->path = path;
             st->offset = r.offset;                              // Range 起点(续传定位)
@@ -2085,6 +2207,8 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoroImpl(
             st->abortMs = opts.stallAbortMs;                    // 停滞放弃阈值(默认 120s)
             st->opts = opts;
             st->stream = std::move(stream);                     // 排他持有流(close 由状态机负责)
+            // 停滞判定信号源(DEF-1):连接弱引用 → bytesSent 差值反映对端真实消费
+            st->connWk = req->getConnectionPtr();
             st->Run();                                          // 打开文件句柄并调度第一块
         },
         true);
@@ -2104,11 +2228,10 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoroImpl(
                             std::to_string(r.offset + r.length - 1) + "/" +
                             std::to_string(fileSize));
     }
-    // ⑦ 下载文件名(浏览器另存为)
+    // ⑦ 下载文件名(浏览器另存为;转义 + RFC 5987 编码)
     if (!attachmentName.empty())
     {
-        resp->addHeader("Content-Disposition",
-                        "attachment; filename=\"" + attachmentName + "\"");
+        resp->addHeader("Content-Disposition", MakeContentDisposition(attachmentName));
     }
     co_return resp;
 }

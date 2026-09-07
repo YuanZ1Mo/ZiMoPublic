@@ -33,6 +33,7 @@
 
 #include <zm_util_thread.h>
 #include <zm_util_json.h>
+#include <zm_util_logger.h>
 
 #include <atomic>
 #include <cstdint>
@@ -81,6 +82,8 @@ using ZmHttpStreamHandler = std::function<drogon::Task<drogon::HttpResponsePtr>(
 struct ZmHttpUploadFileOptions
 {
     uint64_t maxBytes = 0;              ///< 实时兜底上限(块累加,超限停写并清理);0 = 不限制
+    /// 进度总量(百分比分母;0 = 未知,进度回退用 maxBytes)。业务可传 X-File-Size。
+    uint64_t totalBytes = 0;
     uint64_t progressIntervalMs = 100;  ///< 进度回调最小间隔(毫秒)
     std::function<void(uint64_t written, uint64_t total)> onProgress;  ///< (可选)进度回调
 };
@@ -408,14 +411,17 @@ private:
     /// {N} 占位符 → 正则(手动转换;设计 FR-05,绕开本捆绑 drogon 的崩溃点)
     static std::string PathPatternToRegex(const std::string& path);
 
-    // ── Range 解析与文件传输实现 ──
+    // ── Range 解析与文件传输实现(2026-09-07 语义修订,RFC 7233):
+    //    语法非法/多段/未知 unit → present=true、partial/unsatisfiable=false → 忽略(200 全文件,
+    //    对多线程下载器友好;§3.1 MAY ignore or reject);合法但不可满足(起点越界/后缀 0/空文件)
+    //    → unsatisfiable → 416;合法单段 → partial → 206 ──
     struct RangeInfo
     {
-        bool present = false;      ///< 请求带 Range 头
-        bool valid = false;        ///< Range 头合法(单段)
-        bool partial = false;      ///< 请求了部分内容(非全文件)
+        bool present = false;       ///< 请求带 Range 头
+        bool unsatisfiable = false; ///< 合法但不可满足(416 + Content-Range: bytes */size)
+        bool partial = false;       ///< 合法单段区间(206)
         size_t offset = 0;
-        size_t length = 0;         ///< 0 = 到文件尾
+        size_t length = 0;          ///< 0 = 到文件尾
     };
     static RangeInfo ParseRange(const drogon::HttpRequestPtr& req, size_t fileSize);
     static drogon::HttpResponsePtr Range416Response(bool hasRange, size_t fileSize);
@@ -448,7 +454,11 @@ struct ZmRunOnPoolAwaiter : drogon::CallbackAwaiter<T>
 
     void await_suspend(std::coroutine_handle<> h)
     {
-        trantor::EventLoop* loop = drogon::app().getLoop();
+        // 恢复投递:优先协程当前线程所属事件循环(连接 loop,免跨线程唤醒);
+        // 无所属 loop → 退回 app().getLoop();仍无(未 Open 等异常态)→ 告警后于工作线程恢复。
+        trantor::EventLoop* loop = trantor::EventLoop::getEventLoopOfCurrentThread();
+        if (!loop)
+            loop = drogon::app().getLoop();
         ZmHttpServer::WorkPool().Submit([this, h, loop] {
             try
             {
@@ -461,7 +471,10 @@ struct ZmRunOnPoolAwaiter : drogon::CallbackAwaiter<T>
             if (loop)
                 loop->queueInLoop([h] { h.resume(); });
             else
+            {
+                PUBLIC_LOG_WARN("RunOnPool: 无可用事件循环,协程于工作线程恢复");
                 h.resume();
+            }
         });
     }
 };

@@ -61,6 +61,14 @@ void ZmHttpJsonRpcServer::RegisterMethod(const string& name, ZmJrpcMethodHandler
 // ============================================================================
 void ZmHttpJsonRpcServer::RegisterRoutes()
 {
+    // BUG-5(2026-09-07 修复):根路径未设置 → 不注册(空路径会向全局注册未知路由),
+    // 仅告警,门禁与 handler 均不生效
+    if (m_rootPath.empty())
+    {
+        PUBLIC_LOG_ERROR("ZmHttpJsonRpcServer::RegisterRoutes: 未设置根路径(SetRootPath),JRPC 门禁与 handler 均未生效");
+        return;
+    }
+
     // 门禁(设计 §4.4):本地端口在本面 && 路径非本面根路由(且非 /ping)→ 404
     RegisterPreRouting([this](const HttpRequestPtr& req, AdviceCallback&& cb,
                               AdviceChainCallback&& cc) {
@@ -86,10 +94,6 @@ void ZmHttpJsonRpcServer::RegisterRoutes()
             ZMJSON rsp = Dispatch(ParseRequest(req));
             co_return ZmHttpServer::JsonResponse(200, rsp);
         });
-
-    // 结构依赖:RegisterCoro 将于 rootPath 空时注册失败,防御提示
-    if (m_rootPath.empty())
-        PUBLIC_LOG_ERROR("ZmHttpJsonRpcServer::RegisterRoutes: 未设置根路径(SetRootPath),JRPC handler 未生效");
 }
 
 // ============================================================================

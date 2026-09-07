@@ -134,9 +134,15 @@ void ZmHttpFrontendServer::RegisterRoutes()
                            ? (m_listener.ip.empty() ? string("127.0.0.1") : m_listener.ip)
                            : localIp;
             }
+            // 端口剥离(BUG-4 2026-09-07):IPv6 形如 "[::1]:80" —— 冒号须在 ']' 之后
+            // 才是端口分隔符(否则 "https://[::1]:80:443" 非法地址)
             size_t colon = host.rfind(':');
-            if (colon != string::npos && host.find(']') == string::npos)
+            size_t bracket = host.find(']');
+            if (colon != string::npos &&
+                (bracket == string::npos || colon > bracket))
+            {
                 host = host.substr(0, colon);
+            }
             string loc = "https://" + host + ":443" + string(req->path());
             string query = req->getQuery();
             if (!query.empty())
