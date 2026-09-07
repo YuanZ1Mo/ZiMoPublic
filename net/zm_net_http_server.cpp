@@ -2,6 +2,7 @@
 #define NOMINMAX
 #endif
 #include "zm_net_http_server.h"
+#include "zm_net_http_client.h"   // 服务器 loop 登记(设计二期 §16.7;SendSync 拒绝面)
 
 #include <drogon/DrClassMap.h>
 #include <drogon/HttpAppFramework.h>
@@ -476,6 +477,54 @@ std::atomic<bool> s_hasCert{false};
 std::mutex s_startMtx;
 std::unique_ptr<std::promise<void>> s_startPromise;
 std::atomic<bool> s_startReady{false};
+
+// 服务器 loop 登记(设计二期 §16.7):主 loop + 全部 IO loop 登记进 ZmHttpClient
+// 的已登记 loop 表——SendSync 在这些线程上调用一律拒绝,防"服务器 loop 被同步出站
+// 请求卡死"(drogon 自身断言只保护客户端自身 loop)。
+void RegisterServerLoops()
+{
+    try
+    {
+        size_t registered = 0;
+        if (auto* lp = app().getLoop())
+        {
+            ZmHttpClient::RegisterLoop(lp);
+            ++registered;
+        }
+        const size_t n = app().getThreadNum();
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (auto* lp = app().getIOLoop(i))
+            {
+                ZmHttpClient::RegisterLoop(lp);
+                ++registered;
+            }
+        }
+        PUBLIC_LOG_INFO("ZmHttpServer: 服务器事件循环已登记 ZmHttpClient(count={})", registered);
+    }
+    catch (...)
+    {
+        PUBLIC_LOG_WARN("ZmHttpServer: 服务器事件循环登记 ZmHttpClient 失败(忽略)");
+    }
+}
+
+void UnregisterServerLoops()
+{
+    try
+    {
+        if (auto* lp = app().getLoop())
+            ZmHttpClient::UnregisterLoop(lp);
+        const size_t n = app().getThreadNum();
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (auto* lp = app().getIOLoop(i))
+                ZmHttpClient::UnregisterLoop(lp);
+        }
+    }
+    catch (...)
+    {
+    }
+}
 }  // namespace
 
 /// 进程级状态查询:是否已完成 Init(当前可登记监听/路由,启动与否均可)
@@ -798,6 +847,7 @@ bool ZmHttpServer::Open()
         return false;
     }
     PUBLIC_LOG_INFO("ZmHttpServer::Open 完成(app().run 运行中)");
+    RegisterServerLoops();  // 设计二期 §16.7:服务器 loop 登记(Open 成功后一次)
     return true;
 }
 
@@ -830,6 +880,7 @@ void ZmHttpServer::Close()
         s_runThread->Stop();
         s_runThread.reset();
     }
+    UnregisterServerLoops();  // 设计二期 §16.7:与 RegisterServerLoops 对称注销
     s_state.store(ZmRuntimeState::Closed);
     s_stateCv.notify_all();   // 唤醒并发 Open 的等待(其按 Closed 收场)
     PUBLIC_LOG_INFO("ZmHttpServer::Close 完成(已 quit+Stop,终态)");

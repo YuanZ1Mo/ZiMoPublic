@@ -83,7 +83,7 @@ public:
         size_t normalLoopThreads = 1;   ///< 普通请求 lane 事件循环线程数(1..8;>1 时按 target 哈希绑定 loop)
         size_t workPoolSize = 4;        ///< 客户端自持阻塞工作池(离核任务,切勿设 0)
         size_t maxConnPerHost = 4;      ///< 每目标持久连接数
-        size_t maxTargets = 256;        ///< 池容量上限(超限逐出 idle 池,LRU 由创建序近似)
+        size_t maxTargets = 256;        ///< 池容量上限(超限逐出"创建序最旧"者,近 LRU;持锁查 busy 会跨 lane 死锁故不复查 idle)
         double defaultTimeoutSec = 10;  ///< 总超时默认值(0 不准,-1 不超时)
         int    retryMax = 3;            ///< 幂等请求最大重试次数
         int    maxTotalAttempts = 8;    ///< 重试+重定向 总尝试预算(防互跳死循环)
@@ -102,8 +102,8 @@ public:
         // —— 流式下载通道 ——
         bool   enableDownload = true;      ///< 是否创建下载通道
         size_t downloadChunkBytes = 1 * 1024 * 1024;  ///< 读回调单次写盘分块
-        size_t downloadStallAbortMs = 120 * 1000;     ///< 对端停滞/无写进展放弃
-        size_t downloadWriteMaxMs = 200;   ///< 单次写盘耗时超限 → abort(防慢盘卡死通道 loop)
+        size_t downloadStallAbortMs = 120 * 1000;     ///< 读侧停滞放弃(无收包且写队列已空)
+        size_t downloadQueueMaxBytes = 64ULL * 1024 * 1024;  ///< 写线程指令队列字节上限(触顶 ABORT,.part 保留可续传)
     };
 
     // ── 静态生命周期(进程级一次;状态机 Uninit→Initialized→Closed,独立于 ZmHttpServer) ──
@@ -141,11 +141,12 @@ public:
     {
         bool ok = false;          ///< 是否整体成功
         int  status = 0;          ///< HTTP 状态码(0 = 未获得响应)
-        uint64_t written = 0;     ///< 实际落盘字节数
+        uint64_t written = 0;     ///< 最终文件大小(字节)
+        uint64_t resumedFrom = 0; ///< 续传起始偏移(0 = 全新下载)
         std::string error;        ///< 失败原因(ok=false 时)
     };
     static drogon::Task<ZmDownloadResult> DownloadCoro(const std::string& url,
-        const std::string& destPath, const ZmHttpRequestOptions& opts = {});  // 断点续传:自动取 .part/.meta 判定 Range 起点,服务端校验不符随时回退 0(设计 §10.3)
+        const std::string& destPath, const ZmHttpRequestOptions& opts = {});  // 断点续传:起点恒 = .part 现有大小,If-Range 校验,不符回退 0(设计二期 §15.1)
 
     // ── 内部:编排实现(唯一实现;公共形态一律薄壳转发,避免 Task 层数膨胀) ──
     // 设计约束:编排不在协程帧内——重试/重定向/多尝试循环 = 堆上 ZmSendMachine 回调状态机

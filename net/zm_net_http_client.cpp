@@ -10,6 +10,8 @@
 #include <trantor/net/EventLoop.h>
 #include <trantor/net/EventLoopThreadPool.h>
 
+#include <windows.h>  // MultiByteToWideChar(LoadUploadFile UTF-8 路径契约);trantor 先行铁律
+
 #include <zm_util_logger.h>
 
 #include <algorithm>
@@ -77,6 +79,7 @@ ZmThreadPool* s_workPool = nullptr;   // 客户端自持阻塞工作池(设计 �
 // 统计(设计 §11;第一版为全局计数,per-target 明细留 P5)
 std::atomic<uint64_t> s_statRequests{0};
 std::atomic<uint64_t> s_statOk{0};
+std::atomic<uint64_t> s_statStatus4xx{0};  // 传输成功但 4xx(设计二期 §16.8;ok 语义 = 传输成功)
 std::atomic<uint64_t> s_statBadResponse{0};
 std::atomic<uint64_t> s_statTimeout{0};
 std::atomic<uint64_t> s_statNetworkErr{0};
@@ -130,6 +133,26 @@ struct ZmUrlTarget
     string path;       // "/path?query"(无 fragment)
     string key;        // scheme://host:port
 };
+
+/// path 白名单(设计二期 §16.1):pathEncode(false) 后按原样上线,
+/// 裸空格/控制字符/畸形 %XX 一律拒绝(UTF-8 字节 >=0x80 允许)
+bool IsSafePath(const string& path)
+{
+    for (size_t i = 0; i < path.size(); ++i)
+    {
+        unsigned char c = (unsigned char)path[i];
+        if (c <= 0x20 || c == 0x7F)
+            return false;
+        if (c == '%')
+        {
+            if (i + 2 >= path.size() || !isxdigit((unsigned char)path[i + 1]) ||
+                !isxdigit((unsigned char)path[i + 2]))
+                return false;
+            i += 2;
+        }
+    }
+    return true;
+}
 
 ZmUrlTarget ParseUrl(const string& raw)
 {
@@ -205,6 +228,8 @@ ZmUrlTarget ParseUrl(const string& raw)
     t.host = host;
     t.port = (uint16_t)p;
     t.key = scheme + "://" + host + ":" + to_string(p);
+    if (!IsSafePath(t.path))
+        return t;  // path 白名单不过 → BadServerAddress(设计二期 §16.1)
     t.ok = true;
     return t;
 }
@@ -337,6 +362,7 @@ bool IsSensitiveHeader(const string& name)
 using ZmHeaderList = std::vector<std::pair<string, string>>;  // 与下方定义同类型(重复声明合法)
 drogon::HttpClientPtr GetPoolClient(const ZmUrlTarget& t,
                                     const drogon::HttpClientPtr& avoid = nullptr);
+void RemovePoolClient(const string& key, const drogon::HttpClientPtr& bad);
 void PrepareRequest(drogon::HttpRequestPtr& req, drogon::HttpMethod m, const ZMJSON& jsonBody,
                     const string* rawBody, const string& rawContentType,
                     const ZmHeaderList& headers, const ZmUrlTarget& tgt, bool stripSensitive);
@@ -394,6 +420,11 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
 
         if (prelude)
         {
+            if (!s_workPool)
+            {
+                FinishErr(drogon::ReqResult::NetworkFailure, 0);  // Close 竞态窄窗(工作池已停)
+                return;
+            }
             auto self = shared_from_this();
             s_workPool->Submit([self]() {
                 try
@@ -405,7 +436,7 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
                         self->FinishErr(drogon::ReqResult::NetworkFailure, 0);
                     }
                     else
-                        self->NextAttempt();  // 工作池线程继续首跳(线程安全:状态机仅经
+                        self->NextAttempt();  // 工作池线程继续首跳(异步;线程安全:状态机仅经
                                               // drogon queueInLoop 与池快照序列化触达共享面)
                 }
                 catch (...)
@@ -417,7 +448,16 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
         }
         else
         {
-            NextAttempt();
+            // 首跳异步化(设计二期 §16.2):await_suspend 栈上不存在同步 Finish
+            trantor::EventLoop* disp =
+                (s_lanePool && ZmHttpClient::IsReady()) ? s_lanePool->getLoop(0) : nullptr;
+            if (!disp)
+            {
+                FinishErr(drogon::ReqResult::NetworkFailure, 0);  // Close 竞态窄窗
+                return;
+            }
+            auto self = shared_from_this();
+            disp->queueInLoop([self]() { self->NextAttempt(); });
         }
     }
 
@@ -431,6 +471,12 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
     {
         if (finished_)
             return;
+        if (!ZmHttpClient::IsReady())
+        {
+            // Close 竞态:拒绝在关闭后建池/回退 app loop(设计二期 §16.2)
+            FinishErr(drogon::ReqResult::NetworkFailure, 0);
+            return;
+        }
         if (attemptUsed >= totalBudget)  // 预算耗尽:返回上一次结果(与旧循环出口一致)
         {
             Finish(std::move(attemptResult));
@@ -517,11 +563,15 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
         bool methodRetriable = IsIdempotentMethod(curMethod) || opts->idempotent;
         bool handled = false;
 
-        // 连接层失败(无响应)标记该 client:下一跳 GetPoolClient 规避/替换之。
-        // 依据(实测+drogon 1.9.13 源码):服务器提前 FIN 而客户端以为 keep-alive 时,
-        // 同 client 重发会持续撞"半关闭连接"→ 换连接即绕开窗口(替代原 20ms 定时缓冲)。
+        // 连接层失败处置(设计二期 §16.3):Timeout 慢≠坏,仅下一跳规避;
+        // 其余无响应(NetworkFailure/BadServerAddress 等)→ 从池中移除,死连接不再留存
         if (!resp)
-            lastFailedClient = lastClient;
+        {
+            if (r == drogon::ReqResult::Timeout)
+                lastFailedClient = lastClient;
+            else
+                RemovePoolClient(lastTargetKey, lastClient);
+        }
 
         // —— 重试(指数退避 + Retry-After 优先;定时在客户端 lane loop,不睡业务线程) ——
         if ((netRetriable || statusRetriable) && methodRetriable && retriesUsed < retryBudget)
@@ -602,7 +652,11 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
         const auto& def = ZmHttpClient::GetOptions();
         s_statRequests.fetch_add(1);
         if (result.err == drogon::ReqResult::Ok)
+        {
             s_statOk.fetch_add(1);
+            if (result.status >= 400 && result.status <= 499)
+                s_statStatus4xx.fetch_add(1);
+        }
         else if (result.err == drogon::ReqResult::BadResponse)
             s_statBadResponse.fetch_add(1);
         else if (result.err == drogon::ReqResult::Timeout)
@@ -800,6 +854,8 @@ trantor::EventLoop* ChooseLaneLoop(const string& key)
 ///      返回也取自快照——杜绝 vector 并发读写。
 drogon::HttpClientPtr GetPoolClient(const ZmUrlTarget& t, const drogon::HttpClientPtr& avoid)
 {
+    if (!ZmHttpClient::IsReady())
+        return nullptr;  // Close 竞态:拒绝在关闭后新建池(设计二期 §16.2)
     std::shared_ptr<ZmPoolEntry> entry;
     std::vector<drogon::HttpClientPtr> snap;
     {
@@ -903,6 +959,23 @@ drogon::HttpClientPtr GetPoolClient(const ZmUrlTarget& t, const drogon::HttpClie
     return cands[bestIdx];
 }
 
+/// 连接层失败(无响应)的 client 从池中移除(设计二期 §16.3):死连接 busy=0 反被
+/// least-busy 优先选中,留存会令后续请求反复首撞失败;池空则新建替换。
+/// 纯结构操作(锁内),CreatePoolClient 非阻塞;在飞引用由 shared_ptr 保持安全。
+void RemovePoolClient(const string& key, const drogon::HttpClientPtr& bad)
+{
+    if (!bad)
+        return;
+    std::lock_guard lock(s_poolMtx);
+    auto it = s_pools.find(key);
+    if (it == s_pools.end())
+        return;
+    auto& v = it->second->clients;
+    v.erase(std::remove(v.begin(), v.end(), bad), v.end());
+    if (v.empty())
+        v.push_back(CreatePoolClient(*it->second));
+}
+
 // ----------------------------------------------------------------------------
 // 表单编码(设计 §9:application/x-www-form-urlencoded,UTF-8 百分号编码,RFC3986)
 // ----------------------------------------------------------------------------
@@ -950,24 +1023,53 @@ string BuildFormBody(const std::map<string, string>& fields)
 // ----------------------------------------------------------------------------
 // multipart 手拼(设计 §9;捆绑版无客户端 Multipart API)
 // ----------------------------------------------------------------------------
-/// 生成 boundary:与 body/文件名做无碰撞校验(最多 8 次)
-string MakeMultipartBoundary(const string& body)
+/// 生成 boundary:与最终 body 组成内容(fileData/field/fileName)做无碰撞校验(最多 8 次)
+string MakeMultipartBoundary(const string& fileData, const string& field, const string& fileName)
 {
     static thread_local std::mt19937 rng(std::random_device{}());  // 各线程独立,免数据竞争
     for (int i = 0; i < 8; ++i)
     {
         char b[32];
         snprintf(b, sizeof(b), "ZiMoFormBoundary%08x%08x", (unsigned)rng(), (unsigned)rng());
-        if (body.find(b) == string::npos)
+        if (fileData.find(b) == string::npos && field.find(b) == string::npos &&
+            fileName.find(b) == string::npos)
             return b;
     }
     return "ZiMoFormBoundaryFailback";  // 理论不可达;兜底仍可写
 }
 
+/// multipart filename 转义(设计二期 §16.5):剔除控制字符,quoted-string 转义 " 与 \,
+/// 与服务端 MakeContentDisposition 同源姿势
+string EscapeMultipartFileName(const string& name)
+{
+    string out;
+    out.reserve(name.size());
+    for (unsigned char c : name)
+    {
+        if (c < 0x20 || c == 0x7F)
+            continue;
+        if (c == '"' || c == '\\')
+            out += '\\';
+        out += (char)c;
+    }
+    return out;
+}
+
 /// 读盘 + 尺寸护栏(在客户端自持工作池执行;文件 ≤ maxBytes 才允许)
+/// 路径 UTF-8 契约:窄串路径经 CP_UTF8 转宽后打开(平台铁律,禁窄串直接进 fstream)
 bool LoadUploadFile(const string& filePath, size_t maxBytes, string& outData, string& errMsg)
 {
-    std::ifstream f(filePath, std::ios::binary);
+    int wn = MultiByteToWideChar(CP_UTF8, 0, filePath.c_str(), -1, nullptr, 0);
+    if (wn <= 0)
+    {
+        errMsg = "path 编码非法: " + filePath;
+        return false;
+    }
+    std::wstring wpath((size_t)wn, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, filePath.c_str(), -1, &wpath[0], wn);
+    if (!wpath.empty() && wpath.back() == L'\0')
+        wpath.pop_back();
+    std::ifstream f(wpath.c_str(), std::ios::binary);  // MSVC 扩展:ifstream 接受宽路径
     if (!f)
     {
         errMsg = "open file failed: " + filePath;
@@ -1037,6 +1139,7 @@ void PrepareRequest(drogon::HttpRequestPtr& req, drogon::HttpMethod m, const ZMJ
                     const ZmHeaderList& headers, const ZmUrlTarget& tgt, bool stripSensitive)
 {
     req->setMethod(m);
+    req->setPathEncode(false);  // 设计二期 §16.1:drogon urlEncode 不保留 %,默认开启会双重编码
     req->setPath(tgt.path);
 
     for (const auto& kv : headers)
@@ -1102,7 +1205,12 @@ bool ZmHttpClient::Init(const Options& opts)
         if (!lp)
         {
             PUBLIC_LOG_ERROR("ZmHttpClient::Init 事件循环池启动超时");
-            return false;  // lane 未就绪,整体失败(宁可拒绝初始化)
+            // 失败回滚(设计二期 §16.4):拒绝"假 Initialized"砖化,允许重新 Init
+            delete s_lanePool;
+            s_lanePool = nullptr;
+            std::lock_guard lock(s_stateMtx);
+            s_state = ZmClientState::Uninit;
+            return false;
         }
         RegisterLoop(lp);
     }
@@ -1150,7 +1258,8 @@ void ZmHttpClient::Close()
     }
     if (s_workPool)
     {
-        delete s_workPool;  // 析构 join 全部 worker(在飞离核任务完成)
+        // s_workPool 有意不 delete(设计二期 §16.2):析构会丢弃未执行任务并使在飞
+        // Submit 构成 UAF;进程级终态对象随进程回收,指针置空令后续 Submit 走拒绝路径
         s_workPool = nullptr;
     }
     if (s_lanePool)
@@ -1237,8 +1346,8 @@ drogon::Task<ZmHttpResult> ZmHttpClient::UploadCoro(const std::string& url,
         if (!LoadUploadFile(filePath, effMax, fileData, errMsg))
             return false;
         string fileName = filePath.substr(filePath.find_last_of("/\\") + 1);
-        string boundary = MakeMultipartBoundary(fileData);
-        mach.curRaw = AssembleMultipart(fileData, fileName, field, boundary);
+        string boundary = MakeMultipartBoundary(fileData, field, fileName);
+        mach.curRaw = AssembleMultipart(fileData, EscapeMultipartFileName(fileName), field, boundary);
         mach.curContentType = "multipart/form-data; boundary=" + boundary;
         return true;
     };
@@ -1315,6 +1424,7 @@ string ZmHttpClient::DumpStats()
 {
     return string("{") + "\"requests\":" + to_string(s_statRequests.load()) +
            ",\"ok\":" + to_string(s_statOk.load()) +
+           ",\"status4xx\":" + to_string(s_statStatus4xx.load()) +
            ",\"badResponse\":" + to_string(s_statBadResponse.load()) +
            ",\"timeout\":" + to_string(s_statTimeout.load()) +
            ",\"networkErr\":" + to_string(s_statNetworkErr.load()) +
@@ -1325,6 +1435,7 @@ void ZmHttpClient::ResetStats()
 {
     s_statRequests.store(0);
     s_statOk.store(0);
+    s_statStatus4xx.store(0);
     s_statBadResponse.store(0);
     s_statTimeout.store(0);
     s_statNetworkErr.store(0);

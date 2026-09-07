@@ -3,36 +3,32 @@
 
 /**
  * @file zm_net_http_client_download.h
- * @brief 流式下载通道 ZmHttpDownloadChannel(设计 §10;trantor 直写盘)
+ * @brief 流式下载通道 ZmHttpDownloadChannel(设计二期 §15;写线程 + 指令队列直写盘)
  *
- * 设计要点(实现约束,均经 spike/源码核实):
+ * 设计要点(第二期重设计,docs/designs/2026-09-01-drogon-httpclient-design.md §14-§15):
  *  - 载体:自建 HttpClient-DL(单 trantor::EventLoopThread,Init 时启动、Close 时退出);
- *    **与 drogon app() / 服务器三面完全隔离**。
- *  - DNS:**TcpClient 构造只收 InetAddress**,故 connect 前必须经
- *    trantor::Resolver::newResolver(dlLoop) 异步解析;禁止在通道 loop 内同步 getaddrinfo。
- *    **注意:resolve 回调的 InetAddress 端口恒为 0**——须回填
- *    setPortNetEndian(htons(url端口)) 后再 connect。
- *  - TLS:enableSSL(TLSPolicyPtr) **必须在 connect() 之前**;客户端策略 =
- *    TLSPolicy::defaultClientPolicy(hostname) + setCaPath(trustCA) + 保持系统证书库
- *    (setUseSystemCertStore(false)+仅 caPath = 完全不校验,禁止)。mTLS 经 setCertPath/setKeyPath。
- *  - 请求:手写 HTTP/1.1 GET(行 = GET path?query HTTP/1.1;头 = Host/User-Agent/
- *    Range(续传)/If-Match(.part.meta.etag)/Connection: close/Accept-Encoding: identity
- *    + 全局与请求级头注入)。
- *  - 响应:极简自研解析(状态行/状态码/Content-Length/Content-Range/Transfer-Encoding/
- *    Location;100 Continue 跳过);非 2xx/非 206 → 错误终结不落盘。
- *  - **直写盘**:读回调缓冲至 downloadChunkBytes 后一次顺序 WriteFile(方案 A;本通道是
- *    "事件循环绝不磁盘读写"铁律的定向豁免——专属 loop,单次写超阈值即 abort 止损);
- *    单次写 > downloadWriteMaxMs 或停滞 > downloadStallAbortMs → abort(保留 .part/.meta)。
- *  - 续传:先写 destPath + ".part",完成后 MoveFileExW(..., MOVEFILE_REPLACE_EXISTING) 覆盖;
- *    侧写 .part.meta(ZMJSON:url/etag/lastModified/offset);分支表见设计 §10.3
- *    (206 校验首字节;200 → 截断从头;Content-Range 不符/412 → 截断从头)。
+ *    **与 drogon app() / 服务器三面完全隔离**。dlLoop 零磁盘操作(撤销第一期直写豁免)。
+ *  - 续传协议(§15.1):**.part 现有大小即续传起点 N**(唯一事实源,无 offset 持久化);
+ *    变更检测用 **If-Range**(强 ETag 优先,退 Last-Modified);
+ *    侧车 .part.meta 仅 {etag,lastModified},**每响应头后一次写**(经写线程),无周期更新;
+ *    分支表:206+Content-Range 首字节==N → 续写;200 → **原连接续读 + 就地截断**(不重连);
+ *    206 首字节≠N / 416 / 412 → 断开截断重连一次(epoch 守卫),仍异常 → BadResponse。
+ *  - 写盘模型(§15.2):**每会话一个写线程**,dlLoop 经有界指令队列(WRITE/TRUNCATE/
+ *    WRITE_META/FINISH/ABORT)投递;队列字节上限 downloadQueueMaxBytes(默认 64MB),
+ *    触顶 ABORT(.part/.meta 保留可续传);写阻塞由 dlLoop CancelIoEx 解除;
+ *    FINISH 由写线程确认"队列排空+句柄关闭+改名成功"后回调——残余未落盘类缺陷结构性不存在。
+ *  - 解析器(§15.3):fail-closed——chunk size 行必须全 hex;206 必须有可验证 Content-Range;
+ *    Content-Length 与 Transfer-Encoding 冲突、响应体超 CL、畸形状态行均 BadResponse 终结。
+ *  - 生命周期(§15.4):连接代数(epoch)守卫,重连窗口内旧连接回调被忽略;
+ *    文件打开/侧车读取在 StartDownload 提交时(调用方线程)同步完成,失败同步返回 false;
+ *    Done 回调线程 = 写线程,恰好一次。
  *
- * 设计:ZiMoService docs/designs/2026-09-01-drogon-httpclient-design.md §10
+ * 设计:ZiMoService docs/designs/2026-09-01-drogon-httpclient-design.md 第二期 §15
  */
 
 #include "zm_net_http_client.h"
 
-/// 单次下载的完成回调(线程 = HttpClient-DL 事件循环线程或发起线程)
+/// 单次下载的完成回调(线程 = 会话写线程;恰一次)
 class ZmHttpDownloadChannel
 {
   public:
@@ -40,13 +36,15 @@ class ZmHttpDownloadChannel
 
     // —— 生命周期(Init/Close 三步序 ①;幂等) ——
     static bool Start();                 ///< 启动通道(创建 dl 事件循环线程并等待就绪)
-    static void Shutdown();              ///< 停收新任务 → 全部 disconnect → 关文件 → quit + join
+    static void Shutdown();              ///< 停收新任务 → 在飞会话中止(写线程收尾)→ quit + join
     static bool IsRunning();
 
-    /// 提交一次下载(立即返回;结果经 done 回调,线程 = dl loop)
-    /// @return true 已受理;false 通道未运行/参数非法(此时 done 不会被调用)
+    /// 提交一次下载(立即返回;结果经 done 回调,线程 = 会话写线程)
+    /// @return true 已受理;false 通道未运行/参数非法/文件打开失败(此时 done 不会被调用)
+    /// @param err false 时回填原因(可空)
     static bool StartDownload(const std::string& url, const std::string& destPath,
-                              ZmHttpClient::ZmHttpRequestOptionsPtr opts, DoneFn done);
+                              ZmHttpClient::ZmHttpRequestOptionsPtr opts, DoneFn done,
+                              std::string* err = nullptr);
 };
 
 #endif  // ZM_NET_HTTP_CLIENT_DOWNLOAD_H
