@@ -96,7 +96,10 @@ struct ZmHttpUploadFileOptions
     /// 进度总量（百分比分母；0 = 未知，进度回退用 maxBytes）。业务可传 X-File-Size。
     uint64_t totalBytes = 0;
     uint64_t progressIntervalMs = 100;  ///< 进度回调最小间隔（毫秒）
-    std::function<void(uint64_t written, uint64_t total)> onProgress;  ///< （可选）进度回调
+    /// （可选）进度回调：在请求所属事件循环线程执行（与数据块到达同线程）。
+    /// 上传成功时最后一笔必为全量（written = 落盘总量，业务据此收到 100%）；
+    /// 失败/超限路径不补终态（结果由完成回调的 ok 表达）。
+    std::function<void(uint64_t written, uint64_t total)> onProgress;
 };
 
 /**
@@ -234,7 +237,8 @@ public:
      */
     struct ZmJsonpOptions
     {
-        /// 候选参数名（按序取首个非空）
+        /// 候选参数名（按序取首个非空）；取到的回调名须过白名单校验
+        /// （[A-Za-z0-9_.] 且长度 ≤128，防 XSS 反射），不合法则不包装
         std::vector<std::string> paramNames = {"callback"};
         /// 错误响应（4xx/5xx 的 JSON）是否也包装 —— JSONP 客户端经 <script>
         /// 加载，本就不看状态码，故默认 true（兼容现状）
@@ -831,7 +835,11 @@ public:
                                               double timeUnitSec);
 
     /**
-     * @brief 逐 IP 桶协调器（每个 IP 独立桶；有界 maxEntries，溢出按插入序驱逐防泄漏）
+     * @brief 逐 IP 桶协调器（每个 IP 独立桶；默认桶有界 maxEntries，溢出按插入序驱逐防泄漏）
+     *
+     * 两类桶的归属不同：默认桶的 key 是来访 IP（攻击者可控），故必须有界；
+     * 专项额度桶的 key 是有 Quota 规则的 IP（管理动作可控），故挂在规则上随规则存亡，
+     * 条目数恒等于规则数，不做驱逐（驱逐会重置额度＝放行一波）。
      */
     class ZmIpRateLimiter
     {
@@ -848,7 +856,7 @@ public:
         Create(drogon::RateLimiterType type, size_t capacity, double timeUnitSec,
                size_t maxEntries = 10000);
         /**
-         * @brief 组合执行：overlay（封禁→false/白→true/专项额度）未命中走本桶
+         * @brief 组合执行：overlay（封禁→false/白→true/专项额度桶）未命中走默认桶
          *
          * @param req   请求（取对端 IP）
          * @param resp  输出：被限流时写入 429 响应
@@ -1036,7 +1044,6 @@ protected:
 private:
 
     // ── filter 按名注册 ──
-                                                        ///< 名字 → 判定函数
     /**
      * @brief 查询 filter 是否已按名注册
      * @param name  过滤器名
@@ -1044,11 +1051,6 @@ private:
      */
     static bool CheckFilterRegistered(const std::string& name);
 
-    /**
-     * @brief JSONP 回调名白名单校验（防 XSS 反射）
-     * @param cb  客户端传入的 callback 名
-     * @return true 合法（[A-Za-z0-9_.] 且长度 ≤128）
-     */
     static std::vector<std::string> s_corsOrigins;      ///< CORS 白名单（Init 注入；启动后只读）
     /**
      * @brief {N} 占位符 → 正则（手动转换；设计，绕开本捆绑 drogon 的崩溃点）
@@ -1058,6 +1060,24 @@ private:
      * @return 等价正则串
      */
     static std::string PathPatternToRegex(const std::string& path);
+
+    /**
+     * @brief 校验路径占位符编号与形参数是否匹配（{N} 原生绑定的前置守卫）
+     *
+     * drogon 在 addHttpPath 中对越界编号（N > paramCount() 或 N == 0）与重复编号
+     * 直接 exit(1)（HttpControllersRouter.cc:368-383），报错也在框架深处；本函数把
+     * 该判定提前到注册处，非法即拒绝注册而不是杀掉进程。
+     * 只认纯数字编号：drogon 的占位符正则 `\{([^/]*)\}` 同样只把纯数字串当编号，
+     * 其余形态（命名占位符等）走它的其它分支，不在本校验范围。
+     * 占位符**少于**形参不校验：drogon 对缺失参数回落到 req->as<T>()，不致命。
+     *
+     * @param path   路由模式（如 "/api/user/{1}"）
+     * @param arity  handler 声明的路径参数个数（协程特化的 arity 不含 HttpRequestPtr）
+     * @param what   调用方名称（错误日志前缀）
+     * @return true 编号全部合法（1 ≤ N ≤ arity 且不重复）；false 非法（已打 ERROR）
+     */
+    static bool CheckPathParamPlaceholders(const std::string& path, size_t arity,
+                                           const char* what);
 
     // ── Range 解析 ──
     //    语法非法/多段/未知 unit → present=true、partial/unsatisfiable=false → 忽略
@@ -1142,13 +1162,15 @@ private:
 //  - 与 RegisterCoro 共用归属校验与 filter 装配，唯一区别是注册方式：
 //    本接口走 app().registerHandler（原生，paramCount = 路径参数个数 ≥ 1）；
 //    RegisterCoro 走类型擦除 + PathPatternToRegex（paramCount 恒 0）。
-//  - 守卫刻意做成"用错就失败得早"：arity==0 编译期报错；路径无 {N} 运行期拒绝。
+//  - 守卫刻意做成"用错就失败得早"：arity==0 编译期报错；路径无 {N}、编号越界/重复
+//    运行期拒绝（编号非法会被 drogon 判为致命并退出进程）。
 // ----------------------------------------------------------------------------
 /**
  * @brief 注册带路径参数形参的协程路由（声明见类内，此处为模板定义）
  *
  * 编译期守卫：handler 形态非法（首参非按值 HttpRequestPtr）或 arity==0 直接
- * static_assert 报错；运行期守卫：路径不含 {N} → ERROR + 拒绝注册。
+ * static_assert 报错；运行期守卫：路径不含 {N}、编号越界或重复 → ERROR + 拒绝注册
+ * （后两者若放行，drogon 的占位符校验会直接 exit(1) 杀进程）。
  *
  * @tparam F  协程 handler 类型：`Task<HttpResponsePtr>(HttpRequestPtr, 路径参数...)`
  * @param path     路由路径（须含 {N} 占位符）
@@ -1177,6 +1199,9 @@ void ZmHttpServer::RegisterCoroWithPathParams(const std::string& path, drogon::H
                          path);
         return;
     }
+    // 编号越界/重复会让 drogon 的 addHttpPath 直接 exit(1),故在注册前拦下
+    if (!CheckPathParamPlaceholders(path, Traits::arity, "RegisterCoroWithPathParams"))
+        return;
     std::vector<drogon::internal::HttpConstraint> cons;
     cons.emplace_back(m);
     for (const auto& fn : filters)

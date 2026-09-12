@@ -212,3 +212,11 @@ RegisterPreRouting([this](const HttpRequestPtr& req, AdviceCallback&& cb,
 5. 标准库头文件
 
 ---
+
+## 9. 代码验证
+
+若需要验证代码是否正常运行时, 测试工程及产物放在上层ZiMoTest目录中, 不要随意创建到别的目录下
+
+若要编写临时脚本, 需要放到上层ZiMoAiscript目录中, 不要随意创建到别的目录下
+
+若服务进程需要验证, 先备份我的工作环境, 在ZiMoTest构建测试工作环境进行测试(复制我的工作环境即可)

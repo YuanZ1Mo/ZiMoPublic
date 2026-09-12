@@ -38,6 +38,13 @@ void ZmHttpJsonRpcServer::SetupListeners(uint16_t port, const string& ip, bool u
  */
 void ZmHttpJsonRpcServer::RegisterMethod(const string& name, ZmJrpcMethodHandler handler)
 {
+    // 相位守卫:method 表只在启动期写(无锁;运行期由事件循环线程读)
+    if (IsOpened())
+    {
+        PUBLIC_LOG_ERROR("ZmHttpJsonRpcServer::RegisterMethod 已拒绝(run 后 method 表只读): {}",
+                         name);
+        return;
+    }
     if (m_methods.count(name))
         PUBLIC_LOG_WARN("ZmHttpJsonRpcServer::RegisterMethod 重复覆盖: {}", name);
     m_methods[name] = std::move(handler);   // 同名覆盖：后注册者生效

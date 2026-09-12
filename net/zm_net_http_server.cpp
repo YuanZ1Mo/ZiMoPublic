@@ -115,10 +115,20 @@ ZmThreadPool& HttpIoPool()
  * @brief 方案乙（流式分块发送）的单次发送状态机
  *
  * 由 newAsyncStreamResponse 的工厂回调创建，Run() 打开文件句柄并驱动第一块；
- * 此后由"定时器 → 异步读 → 回执发送"的链式循环推进。所有状态仅在事件循环线程变更，
+ * 此后由"定时器 → 异步读 → 回执发送"的链式循环推进。
+ *
+ * 状态机归属本连接的事件循环：工厂回调由框架在该 loop 上调用
+ * （HttpServer::sendResponse 断言在 loop 内），Run() 据此定型 m_loop，此后全部
+ * 定时器与读回执都投回该 loop —— 状态与 conn->bytesSent() 的读写因此只发生在
+ * 单一线程上，分块发送也不占用主 loop。
+ *
  * 读盘投递到 HttpIoPool 执行，事件循环永不阻塞（NFR）。
  * 收尾统一走 Finish()（幂等）→ DoClose()：句柄与流的释放在途读计数归零后才执行，
  * 与 I/O 线程无竞态。
+ *
+ * 读盘出错或提前读到文件尾时按"发完"收尾：流正常关闭，客户端只看到更短的 body。
+ * 纯 200 响应无 Content-Length，客户端无从察觉（206 由 Content-Range 声明长度，
+ * 客户端可判定），故两条异常路径都记日志留痕（见 ReadChunk）。
  */
 class ZmStreamLoopState : public std::enable_shared_from_this<ZmStreamLoopState>
 {
@@ -142,18 +152,31 @@ public:
     void Finish();
     void DoClose();
 
-    /// @brief 读一块到缓冲并投回事件循环发送(I/O 线程执行,绝不阻塞事件循环)
+    /// @brief 读一块到缓冲并投回本连接的事件循环发送(I/O 线程执行,绝不阻塞事件循环)
+    ///
+    /// 读失败与提前读到文件尾都产出 ok=false,由事件循环侧按"发完"收尾 ——
+    /// 两条异常路径在此留日志:客户端只看到短了的一坨字节,日志是唯一线索。
+    ///
     /// @param want 本次期望读取的字节数(不超过 chunkSize)
     void ReadChunk(uint64_t want)
     {
         DWORD rd = 0;
         auto buf = std::make_shared<std::string>();
         buf->resize(want);
-        if (::ReadFile(m_handle, buf->data(), static_cast<DWORD>(want), &rd, nullptr) &&
-            rd > 0)
+        const BOOL readOk =
+            ::ReadFile(m_handle, buf->data(), static_cast<DWORD>(want), &rd, nullptr);
+        if (readOk && rd > 0)
             buf->resize(static_cast<size_t>(rd));
+        else if (!readOk)
+            PUBLIC_LOG_ERROR("SendFileStreamCoro 读盘失败(本块期望 {} 字节,GetLastError={}): {}",
+                             want, ::GetLastError(), path);
+        else
+            // 提交时恒有 remaining > 0(Next 判定),故读到 0 字节 = 文件比 stat 时短
+            PUBLIC_LOG_WARN("SendFileStreamCoro 提前读到文件尾(本块期望 {} 字节): {}",
+                            want, path);
         const bool ok = (rd > 0);
-        drogon::app().getLoop()->queueInLoop(
+        // m_loop 由 Run() 在本任务提交前定型(经线程池入队同步),此处只读
+        m_loop->queueInLoop(
             [st = shared_from_this(), buf = std::move(buf), ok]() mutable {
                 st->OnReadDone(std::move(buf), ok);
             });
@@ -161,6 +184,8 @@ public:
 
 private:
     HANDLE m_handle = INVALID_HANDLE_VALUE;
+    /// 状态机所属事件循环(连接 loop;Run() 时定型,此后所有回调与定时器都投这里)
+    trantor::EventLoop* m_loop = nullptr;
     bool m_fini = false;
     int m_inFlight = 0;   // 在途异步读计数(仅事件循环线程访问)
     bool m_closed = false;
@@ -245,6 +270,12 @@ static bool IsValidRequestId(const string& id)
  */
 void ZmStreamLoopState::Run()
 {
+    // 定型状态机所属事件循环:本回调由框架在连接 loop 上调用(工厂回调即在发送起点),
+    // 故取连接 loop;取不到(异常态)退回主 loop,与 ZmDeadlineState 同款取值顺序
+    if (auto c = connWk.lock())
+        m_loop = c->getLoop();
+    if (!m_loop)
+        m_loop = drogon::app().getLoop();
     // 路径为 UTF-8 契约(与上传侧一致):显式 CP_UTF8 → wide,窄串直接进 filesystem 会被按 ANSI 解码
     std::wstring wpath = ZmString::UTF8_To_Unicode(path);
     m_handle = CreateFileW(wpath.c_str(), GENERIC_READ,
@@ -362,8 +393,8 @@ void ZmStreamLoopState::OnReadDone(std::shared_ptr<std::string> buf, bool ok)
     }
     // 定时器节流:事件循环处理发送、缓冲自然排水(内存有界:在途预读 = 1 块)
     // interBlockMs == 0 → 发完即调度(runAfter(0) 下一轮立即跑,无节流,对应头文件契约)
-    drogon::app().getLoop()->runAfter(opts.interBlockMs / 1000.0,
-                                      [st = shared_from_this()]() { st->Next(); });
+    m_loop->runAfter(opts.interBlockMs / 1000.0,
+                     [st = shared_from_this()]() { st->Next(); });
 }
 
 /**
@@ -547,11 +578,62 @@ namespace
 using ZmRootOwnerMap = std::map<std::string, const ZmHttpServer*, std::less<>>;
 
 std::mutex s_ownerMtx;
-ZmRootOwnerMap s_rootOwners;                                   // SetRootPath 声明(root 唯一)
+ZmRootOwnerMap s_rootOwners;                                   // root → 面(由 s_rootClaims 推导)
 std::set<std::string, std::less<>> s_sharedPaths;              // 平台共享路径(MarkShared)
-std::map<uint16_t, const ZmHttpServer*> s_portFace;            // 端口 → 面(AddListener 登记)
+std::map<uint16_t, const ZmHttpServer*> s_portFace;            // 端口 → 面(由 s_portClaims 推导)
 std::vector<std::pair<const ZmHttpServer*, std::string>> s_routeLog;   // 已登记路由(Open 复检)
-std::vector<std::string> s_ownerConflicts;                     // root 重复/兜底重复
+/// root 声明(一对象一条;换 root 即覆盖旧声明)——冲突在 Open 期按此表重算,故修正后自愈
+std::vector<std::pair<const ZmHttpServer*, std::string>> s_rootClaims;
+/// 端口登记(一对象一条;重登记即覆盖)——同上
+std::vector<std::pair<const ZmHttpServer*, uint16_t>> s_portClaims;
+
+/**
+ * @brief 由声明表重建 root 归属表
+ *
+ * 声明表是唯一事实来源,归属表只是它的投影:同 root 被多个面声明时保留最早声明者,
+ * 空声明表示本面不拥有任何前缀。整体重建而非增量修补,保证两者不会各自漂移。
+ */
+void ZmRebuildRootOwners()
+{
+    s_rootOwners.clear();
+    for (const auto& [face, path] : s_rootClaims)
+    {
+        if (!path.empty())
+            s_rootOwners.emplace(path, face);
+    }
+}
+
+/**
+ * @brief 由声明表重建端口归属表(同端口重复登记时保留最早登记者)
+ */
+void ZmRebuildPortFace()
+{
+    s_portFace.clear();
+    for (const auto& [face, port] : s_portClaims)
+        s_portFace.emplace(port, face);
+}
+
+/**
+ * @brief 取出(或追加)某面的声明条目,返回可写引用
+ *
+ * 一对象一条:已存在则就地覆盖,否则追加到表尾(重建时按表序取先到者)。
+ *
+ * @param claims  声明表
+ * @param face    服务器面
+ * @return 该面的声明值引用(默认构造)
+ */
+template <typename T>
+T& ZmClaimSlot(std::vector<std::pair<const ZmHttpServer*, T>>& claims,
+               const ZmHttpServer* face)
+{
+    for (auto& c : claims)
+    {
+        if (c.first == face)
+            return c.second;
+    }
+    claims.emplace_back(face, T{});
+    return claims.back().second;
+}
 
 /// 启动后只读的归属快照(热路径零锁:门禁一次查表、归属网一次查表)
 struct ZmOwnerSnapshot
@@ -940,8 +1022,13 @@ void FinalizeResponse(const HttpRequestPtr& req, const HttpResponsePtr& resp)
         resp->addHeader("Strict-Transport-Security",
                         "max-age=31536000; includeSubDomains");
     }
-    resp->addHeader("X-Request-Id",
-                    req->getAttributes()->get<string>("ZmRequestId"));
+    // 请求 ID:与 ZmAccessStartMs 同款防御 —— 未经历 PreRouting 时属性缺失
+    // (drogon 对缺失键返回空串),给出可辨识占位而不是空头(见 RecordAccessStart
+    // 的顺序不变式);正常路径下这里取到的是实际 ID
+    string rid = req->getAttributes()->get<string>("ZmRequestId");
+    if (rid.empty())
+        rid = "zm-unknown";
+    resp->addHeader("X-Request-Id", rid);
 
     // ── 观察结算(访问日志 + 指标;此处为唯一结算点) ──
     int64_t start = req->getAttributes()->get<int64_t>("ZmAccessStartMs");
@@ -963,10 +1050,9 @@ void FinalizeResponse(const HttpRequestPtr& req, const HttpResponsePtr& resp)
         if (!cl.empty())
             respBytes = "~" + cl;
     }
-    string rid = req->getAttributes()->get<string>("ZmRequestId");
     PUBLIC_LOG_INFO(
         "[{}] {} {} {} [{}] ({} - {}) {} {} {}ms",
-        rid,
+        rid,   // 与 X-Request-Id 回写同一个值(行首与响应头可对照)
         req->isOnSecureConnection() ? "https" : "http",
         req->getMethodString(),
         query.empty() ? string(req->path()) : string(req->path()) + "?" + query,
@@ -1089,6 +1175,10 @@ bool ZmHttpServer::Init(const Options& opts)
     // 请求访问记录(:不用 AccessLogger/access.log,
     // 格式化后经公共库日志 PUBLIC_LOG_* 承载,与运行日志同文件按标签区分)。
     // 起始时间存 req attributes,PostHandling 观察点结算。
+    // ⚠ 顺序不变式:本 advice 必须是**首个** PreRouting advice。请求 ID 在此写入,
+    //   而后面的 advice 一旦短路(如 body 闸门 413),该响应仍会经 PreSending 出口
+    //   结算 —— 若本 advice 被排到短路者之后,那些响应取不到 "ZmRequestId"
+    //   (drogon 对缺失键返回空串),表现为空 X-Request-Id 头与日志行首 "[]"。
     app().registerPreRoutingAdvice(&RecordAccessStart);
     // ⚠ 观察结算不注册在此:drogon 1.9.13 的 PostHandling advice 只覆盖
     //    controller/binder 响应路径(HttpServer.cc:658/692/764),静态目录(含 304)、
@@ -1368,22 +1458,17 @@ void ZmHttpServer::AddListener(uint16_t port, bool useSSL, const string& ip,
     s_hasListener.store(true, std::memory_order_relaxed);
 
     // 登记端口 → 面(运行时归属网判定"端口所属面";Open 期固化为只读快照)。
-    // 同一端口被两个面登记 = 配置错误,记入归属冲突 → Open() 拒绝启动。
+    // 同一端口被两个面登记 = 配置错误,Open() 期报冲突拒绝启动;
+    // 一对象一端口:重登记即覆盖旧端口(归属表随之重建,修正配置后自愈)。
     {
         std::lock_guard<std::mutex> lk(s_ownerMtx);
+        ZmClaimSlot(s_portClaims, this) = port;
+        ZmRebuildPortFace();
         auto it = s_portFace.find(port);
         if (it != s_portFace.end() && it->second != this)
-        {
-            const std::string conflict = "端口 " + std::to_string(port) + " 被 " +
-                                         it->second->FaceDesc() + " 与 " + FaceDesc() +
-                                         " 同时登记";
-            s_ownerConflicts.push_back(conflict);
-            PUBLIC_LOG_ERROR("AddListener: {} —— 端口冲突,Open() 将拒绝启动", conflict);
-        }
-        else
-        {
-            s_portFace[port] = this;
-        }
+            PUBLIC_LOG_ERROR("AddListener: 端口 {} 被 {} 与 {} 同时登记"
+                             " —— 端口冲突,Open() 将拒绝启动(保留先登记者)",
+                             port, it->second->FaceDesc(), FaceDesc());
     }
 }
 
@@ -1509,6 +1594,67 @@ string ZmHttpServer::PathPatternToRegex(const string& path)
         ++i;
     }
     return out;
+}
+
+/**
+ * @brief 校验路径占位符编号与形参数是否匹配
+ *
+ * 逐个取出 {…} 体：纯数字才当编号（与 drogon 的 \\{([^/]*)\\} 判定一致），
+ * 编号须落在 1..arity 且互不重复 —— 越界与重复都会让 drogon 的 addHttpPath 直接
+ * exit(1) 杀进程（HttpControllersRouter.cc:368-383），故在此提前拦下。
+ *
+ * @param path   路由模式（如 "/api/user/{1}"）
+ * @param arity  handler 声明的路径参数个数（协程特化的 arity 不含 HttpRequestPtr）
+ * @param what   调用方名称（错误日志前缀）
+ * @return true 编号全部合法；false 非法（已打 ERROR，调用方须拒绝注册）
+ */
+bool ZmHttpServer::CheckPathParamPlaceholders(const string& path, size_t arity,
+                                              const char* what)
+{
+    std::vector<size_t> places;   // 已出现的编号（形参数很少，线性查重足够）
+    for (size_t i = 0; i < path.size();)
+    {
+        size_t open = path.find('{', i);
+        if (open == string::npos)
+            break;
+        size_t close = path.find('}', open);
+        if (close == string::npos)
+            break;
+        string body = path.substr(open + 1, close - open - 1);
+        i = close + 1;
+        // 非纯数字占位符（空体/命名形态）不属编号，交由 drogon 的其它分支处理
+        if (body.empty() ||
+            !std::all_of(body.begin(), body.end(), [](char c) {
+                return std::isdigit(static_cast<unsigned char>(c)) != 0;
+            }))
+            continue;
+        size_t place = 0;
+        try
+        {
+            place = static_cast<size_t>(std::stoul(body));
+        }
+        catch (const std::exception&)
+        {
+            PUBLIC_LOG_ERROR("{}[{}]: 占位符编号 {} 超出可解析范围,拒绝注册", what, path, body);
+            return false;
+        }
+        if (place == 0 || place > arity)
+        {
+            PUBLIC_LOG_ERROR("{}[{}]: 占位符编号 {} 越界(形参 {} 个,合法编号 1..{})"
+                             "—— drogon 对该情形直接退出进程,故拒绝注册",
+                             what, path, place, arity, arity);
+            return false;
+        }
+        if (std::find(places.begin(), places.end(), place) != places.end())
+        {
+            PUBLIC_LOG_ERROR("{}[{}]: 占位符编号 {} 重复"
+                             "—— drogon 对该情形直接退出进程,故拒绝注册",
+                             what, path, place);
+            return false;
+        }
+        places.push_back(place);
+    }
+    return true;
 }
 
 /**
@@ -2093,6 +2239,11 @@ private:
      */
     void Attach()
     {
+        // 回调与回执统一投本请求所属事件循环:进度/完成回调与数据块回调(OnData)同线程,
+        // 业务侧无需加锁(与 RunOnPool 的"连接 loop 优先"取值一致)
+        m_loop = trantor::EventLoop::getEventLoopOfCurrentThread();
+        if (!m_loop)
+            m_loop = drogon::app().getLoop();
         // Create 的返回值被 awaiter 丢弃(见 ZmSinkAwaiter),此处自引用持有自身,
         // 直到 Done 完成回调才释放 —— 保证 sink 存活至收尾(done 必达)
         m_self = shared_from_this();
@@ -2108,7 +2259,7 @@ private:
         {
             PUBLIC_LOG_ERROR("ZmUploadSink 写线程启动失败: {}", m_dest);
             m_stream->setStreamReader(drogon::RequestStreamReader::newNullReader());
-            Finish(false, true);
+            Finish(false, true, 0);
             return;
         }
         m_stream->setStreamReader(drogon::RequestStreamReader::newReader(
@@ -2210,15 +2361,19 @@ private:
      * @brief 写线程 → 事件循环的结果回执,仅写线程调用
      *
      * 以强引用入队,保证残局(半成品清理 + done 回调)必然执行,不依赖对象的存活判定。
+     * 投到本请求所属事件循环:与 OnData 同线程,故 m_fini/流对象都只在单一线程上变更。
      *
      * @param self      自引用(保证入队与回执期间对象存活)
      * @param ok        上传是否成功
      * @param tooLarge  是否因超限失败
+     * @param written   本次落盘总字节(成功路径的终态进度值)
      */
-    void PostFinish(std::shared_ptr<ZmUploadSink> self, bool ok, bool tooLarge)
+    void PostFinish(std::shared_ptr<ZmUploadSink> self, bool ok, bool tooLarge,
+                    uint64_t written)
     {
-        auto loop = drogon::app().getLoop();
-        loop->queueInLoop([self, ok, tooLarge]() { self->Finish(ok, tooLarge); });
+        auto* loop = m_loop ? m_loop : drogon::app().getLoop();
+        loop->queueInLoop(
+            [self, ok, tooLarge, written]() { self->Finish(ok, tooLarge, written); });
     }
 
     /**
@@ -2233,9 +2388,9 @@ private:
     {
         if (!OpenFile())
         {
-            // 开文件失败:语义与现状一致(置 tooLarge 标记),删半成品
+            // 开文件失败:置 tooLarge 标记,由事件循环侧删半成品
             m_writerDead.store(true);
-            PostFinish(std::move(keepAlive), false, true);
+            PostFinish(std::move(keepAlive), false, true, 0);
             return;
         }
         uint64_t written = 0;
@@ -2269,7 +2424,7 @@ private:
                 PUBLIC_LOG_ERROR("ZmUploadSink 写盘失败: {}", m_dest);
                 Cleanup(true);
                 m_writerDead.store(true);
-                PostFinish(std::move(keepAlive), false, false);
+                PostFinish(std::move(keepAlive), false, false, 0);
                 return;
             }
             written += item.size();
@@ -2283,7 +2438,7 @@ private:
                 }
                 Cleanup(true);   // 超限 → 删半成品
                 m_writerDead.store(true);
-                PostFinish(std::move(keepAlive), false, true);
+                PostFinish(std::move(keepAlive), false, true, 0);
                 return;
             }
         }
@@ -2294,18 +2449,21 @@ private:
         else
             Cleanup(true);
         m_writerDead.store(true);
-        PostFinish(std::move(keepAlive), ok, false);
+        // written = 本次应落盘总量(队列已排空),成功即业务可见的 100%
+        PostFinish(std::move(keepAlive), ok, false, written);
     }
 
     /**
      * @brief 收尾(幂等),仅事件循环线程调用
      *
      * 回填超限标记,失败/超限时把流换成 NullReader 丢弃剩余网络数据,最后触发 done。
+     * 成功路径在 done 之前补发一次终态进度(全量已落盘),业务因此必然收到 100%。
      *
-     * @param ok        上传是否成功
-     * @param tooLarge  是否超限
+     * @param ok            上传是否成功
+     * @param tooLarge      是否超限
+     * @param finalWritten  本次落盘总字节(成功路径的终态进度值;失败路径忽略)
      */
-    void Finish(bool ok, bool tooLarge)
+    void Finish(bool ok, bool tooLarge, uint64_t finalWritten)
     {
         if (m_fini)
             return;
@@ -2314,14 +2472,32 @@ private:
             *m_tooLarge = tooLarge;
         if (!ok || tooLarge)
             m_stream->setStreamReader(drogon::RequestStreamReader::newNullReader());
+        else
+            EmitProgress(finalWritten);   // 终态进度:先报满量,再触发 done
         Done(ok);
+    }
+
+    /**
+     * @brief 回调一次进度
+     *
+     * 分母优先取业务透传的 totalBytes(如 X-File-Size),未透传时退回 maxBytes
+     * (maxBytes = 0 即不限量,此时百分比分母为 0,由业务自行处理)。
+     *
+     * @param written  本次已落盘字节
+     */
+    void EmitProgress(uint64_t written)
+    {
+        if (m_opts.onProgress)
+            m_opts.onProgress(written, m_opts.totalBytes ? m_opts.totalBytes
+                                                         : m_opts.maxBytes);
     }
 
     /**
      * @brief 数据块到达(事件循环线程):入队给写线程,并处理积压与进度
      *
      * 积压超过上限(kUploadQueueCap)即中止上传,保证缓冲内存有界;
-     * 进度回调按 progressIntervalMs 节流,首块与末块强制回调。
+     * 进度回调按 progressIntervalMs 节流(m_lastProgressMs 初值 0 使首块必过闸)。
+     * 本函数看到的是"已落盘量",恒落后于当前块,故 100% 由 Finish() 在落盘完成后补发。
      *
      * @param buf  数据块指针
      * @param len  数据块长度(字节)
@@ -2350,20 +2526,16 @@ private:
                 m_pending.clear();
                 m_wcv.notify_all();
             }
-            Finish(false, false);
+            Finish(false, false, 0);
             return;
         }
         if (m_opts.onProgress)
         {
             int64_t now = NowMs();
-            uint64_t written = m_written.load(std::memory_order_relaxed);
-            if (written == len || now - m_lastProgressMs >= (int64_t)m_opts.progressIntervalMs)
+            if (now - m_lastProgressMs >= (int64_t)m_opts.progressIntervalMs)
             {
                 m_lastProgressMs = now;
-                // total 优先取业务透传的 totalBytes(如 X-File-Size),
-                // 未透传时退回 maxBytes(maxBytes=0 即不限时百分比分母为 0)
-                m_opts.onProgress(written, m_opts.totalBytes ? m_opts.totalBytes
-                                                             : m_opts.maxBytes);
+                EmitProgress(m_written.load(std::memory_order_relaxed));
             }
         }
     }
@@ -2390,7 +2562,7 @@ private:
         }
         if (!e)
             return;   // 正常结束:等写线程把队列落完再回执成功
-        Finish(false, false);
+        Finish(false, false, 0);
     }
 
     drogon::RequestStreamPtr m_stream;
@@ -2399,6 +2571,9 @@ private:
     bool* m_tooLarge = nullptr;
     std::function<void(bool)> m_done;
     std::shared_ptr<ZmUploadSink> m_self;   ///< 自引用:Create 返回值被丢弃,靠它撑生命周期
+
+    /// 本请求所属事件循环(Attach 时定型):数据块回调、进度、完成回执与写线程回执都投这里
+    trantor::EventLoop* m_loop = nullptr;
 
     // 文件句柄生命周期归属写线程;事件循环不得触碰
     HANDLE m_handle = INVALID_HANDLE_VALUE;
@@ -2775,21 +2950,19 @@ void ZmHttpServer::SetRootPath(const std::string& path)
         return;
     }
     std::lock_guard<std::mutex> lk(s_ownerMtx);
-    // 换 root:先清本实例旧条目(一对象一端口,root 亦为一次性设置)
-    for (auto it = s_rootOwners.begin(); it != s_rootOwners.end();)
-        it = (it->second == this) ? s_rootOwners.erase(it) : std::next(it);
+    // 一对象一条声明:换 root 即覆盖旧声明(空串 = 撤回),归属表随之整体重建
+    ZmClaimSlot(s_rootClaims, this) = path;
     m_rootPath = path;
+    ZmRebuildRootOwners();
     if (path.empty())
         return;   // 空 = 不拥有任何前缀(如前端重定向专用实例:只挂 advice)
-    auto ins = s_rootOwners.emplace(path, this);
-    if (!ins.second && ins.first->second != this)
+    auto it = s_rootOwners.find(path);
+    if (it != s_rootOwners.end() && it->second != this)
     {
-        const std::string conflict = "root \"" + path + "\" 被 " +
-                                     ins.first->second->FaceDesc() + " 与 " + FaceDesc() +
-                                     " 同时声明";
-        s_ownerConflicts.push_back(conflict);
-        PUBLIC_LOG_ERROR("SetRootPath: {} —— 归属冲突,Open() 将拒绝启动", conflict);
-        return;   // 保留先声明者
+        PUBLIC_LOG_ERROR("SetRootPath: root \"{}\" 被 {} 与 {} 同时声明"
+                         " —— 归属冲突,Open() 将拒绝启动(保留先声明者)",
+                         path, it->second->FaceDesc(), FaceDesc());
+        return;
     }
     PUBLIC_LOG_INFO("ZmHttpServer::SetRootPath: {} 声明归属 \"{}\"{}", FaceDesc(), path,
                     path == "/" ? "(兜底:未被其他面认领的路径归本面)" : "");
@@ -2889,9 +3062,11 @@ bool ZmHttpServer::CheckRouteOwnership(const std::string& path, const char* what
 /**
  * @brief 归属一致性校验(Open 期一次):任一项失败即拒绝启动
  *
- * 校验两类问题:root 声明冲突(root 重复/多个兜底面)、已登记路由的归属漂移
- * (注册时归属与现在不一致 —— 说明 root 声明晚于路由注册)。静默泄漏比启动失败危险得多,
- * 故一律 fail-fast。通过后固化只读快照,此后 LookupOwner/IsSharedPath/门禁/归属网零锁查表。
+ * 校验三类问题:root 声明冲突(root 重复/多个兜底面)、端口登记冲突(两面同端口)、
+ * 已登记路由的归属漂移(注册时归属与现在不一致 —— 说明 root 声明晚于路由注册)。
+ * 前两类按**当前声明表**重算,不累积历史:声明改掉即自愈,故"修正配置后可重试 Open"成立。
+ * 静默泄漏比启动失败危险得多,故一律 fail-fast。通过后固化只读快照,此后
+ * LookupOwner/IsSharedPath/门禁/归属网零锁查表。
  * 注:平台侧不设路由闸门—— 新增平台路由须自行确保落在某个面的 root 下或
  *   `MarkShared`(否则会在所有端口可达);运行期归属网会对"实际被服务且归属不符"
  *   的请求打 `[ROUTE-LEAK]` 告警作为兜底。
@@ -2904,14 +3079,46 @@ bool ZmHttpServer::ValidateRouteOwnership()
         std::lock_guard<std::mutex> lk(s_ownerMtx);
         size_t bad = 0;
 
-        // ① root 声明冲突(重复 root / 多个兜底面)
-        for (const auto& c : s_ownerConflicts)
+        // ① root 声明冲突(重复 root / 多个兜底面):按当前声明表重算
         {
-            PUBLIC_LOG_ERROR("归属校验失败(root 冲突): {}", c);
-            ++bad;
+            std::map<std::string, std::vector<const ZmHttpServer*>, std::less<>> byRoot;
+            for (const auto& [face, path] : s_rootClaims)
+            {
+                if (!path.empty())
+                    byRoot[path].push_back(face);
+            }
+            for (const auto& [path, faces] : byRoot)
+            {
+                if (faces.size() < 2)
+                    continue;
+                string who;
+                for (const auto* f : faces)
+                    who += (who.empty() ? "" : " 与 ") + f->FaceDesc();
+                PUBLIC_LOG_ERROR("归属校验失败(root 冲突): root \"{}\" 被 {} 同时声明",
+                                 path, who);
+                ++bad;
+            }
         }
 
-        // ② 已登记路由归属复检:防"先注册路由、后声明 root"改变归属
+        // ② 端口登记冲突(两面同端口):按当前声明表重算
+        {
+            std::map<uint16_t, std::vector<const ZmHttpServer*>> byPort;
+            for (const auto& [face, port] : s_portClaims)
+                byPort[port].push_back(face);
+            for (const auto& [port, faces] : byPort)
+            {
+                if (faces.size() < 2)
+                    continue;
+                string who;
+                for (const auto* f : faces)
+                    who += (who.empty() ? "" : " 与 ") + f->FaceDesc();
+                PUBLIC_LOG_ERROR("归属校验失败(端口冲突): 端口 {} 被 {} 同时登记",
+                                 port, who);
+                ++bad;
+            }
+        }
+
+        // ③ 已登记路由归属复检:防"先注册路由、后声明 root"改变归属
         for (const auto& r : s_routeLog)
         {
             const ZmHttpServer* now = ZmLookupInTable(s_rootOwners, r.second);
@@ -4003,45 +4210,9 @@ HttpResponsePtr ZmHttpServer::NotFoundResponse(const HttpRequestPtr& req)
 // ── 限流(drogon RateLimiter 底层;全部 SafeRateLimiter 线程安全包装) ──
 //   overlay 规则:COW 快照(原子 shared_ptr 读零锁;写=copy+swap,低频)
 //   per-IP 桶:全局容器锁保护 map(每次请求一次短临界查找;isAllowed 无锁)
+//   专项额度桶:挂在规则上(随规则存亡;一 IP 一桶,跨面共享)
 namespace
 {
-/// overlay 规则条目
-struct ZmOverlayRule
-{
-    enum Kind { None, Blocked, Allowed, Quota } kind = None;
-    size_t capacity = 0;
-    double timeSec = 0;
-};
-using ZmOverlayMap = std::unordered_map<string, ZmOverlayRule>;
-
-/// 进程级 overlay(COW):原子指针读、写时整体替换
-std::atomic<std::shared_ptr<const ZmOverlayMap>> s_overlayPtr{
-    std::make_shared<const ZmOverlayMap>()};
-std::mutex s_overlayWriteMtx;
-
-/**
- * @brief 写 overlay 规则(COW:复制当前表 → 修改 → 原子替换)
- *
- * 低频写路径,故直接整体复制;读侧因此可零锁取快照。
- *
- * @param ip        对端 IP 字面量
- * @param kind      规则类型(None = 删除该 IP 的规则)
- * @param capacity  额度桶容量(kind = Quota 时有效)
- * @param timeSec   额度时间单位秒(kind = Quota 时有效)
- */
-void OverlayWrite(const string& ip, ZmOverlayRule::Kind kind,
-                  size_t capacity, double timeSec)
-{
-    std::lock_guard lk(s_overlayWriteMtx);
-    auto cur = s_overlayPtr.load();
-    auto nxt = std::make_shared<ZmOverlayMap>(*cur);
-    if (kind == ZmOverlayRule::None)
-        nxt->erase(ip);
-    else
-        (*nxt)[ip] = ZmOverlayRule{kind, capacity, timeSec};
-    s_overlayPtr.store(nxt);
-}
-
 /**
  * @brief 构造线程安全的限流器(SafeRateLimiter 包装)
  *
@@ -4059,6 +4230,101 @@ drogon::RateLimiterPtr MakeSafeRateLimiter(drogon::RateLimiterType type,
         drogon::RateLimiter::newRateLimiter(
             type, capacity, std::chrono::duration<double>(timeSec)));
 }
+
+/// 专项额度槽:一个 IP 一条 Quota 规则对应一个槽,规则删除即随之释放
+class ZmQuotaSlot
+{
+public:
+    /**
+     * @brief 记录建桶参数(桶本身惰性建立)
+     * @param cap      时间单位内允许的次数
+     * @param timeSec  时间单位(秒)
+     */
+    ZmQuotaSlot(size_t cap, double timeSec) : m_cap(cap), m_timeSec(timeSec) {}
+
+    /**
+     * @brief 取本槽的桶(未建立则按 type 建立一次,此后复用同一桶)
+     *
+     * 算法 type 是逐实例配置而规则是进程级的,故由首个建桶者定型:同进程内给同一 IP
+     * 的额度配两套算法自相矛盾,先到先得即可。
+     *
+     * @param type  限流算法(仅首次建立时使用)
+     * @return 桶指针(线程安全包装,可跨事件循环线程使用)
+     */
+    drogon::RateLimiterPtr Get(drogon::RateLimiterType type)
+    {
+        if (auto lim = m_lim.load(std::memory_order_acquire))
+            return lim;
+        std::lock_guard lk(m_buildMtx);
+        if (auto lim = m_lim.load(std::memory_order_acquire))
+            return lim;   // 双检:并发首访只建一个桶
+        auto lim = MakeSafeRateLimiter(type, m_cap, m_timeSec);
+        m_lim.store(lim, std::memory_order_release);
+        return lim;
+    }
+
+private:
+    std::atomic<drogon::RateLimiterPtr> m_lim{nullptr};   ///< 已建立的桶(空 = 未建立)
+    size_t     m_cap = 0;        ///< 时间单位内允许的次数
+    double     m_timeSec = 0;    ///< 时间单位(秒)
+    std::mutex m_buildMtx;       ///< 仅首次建立桶时进入
+};
+
+/// overlay 规则条目
+struct ZmOverlayRule
+{
+    enum Kind { None, Blocked, Allowed, Quota } kind = None;
+    size_t capacity = 0;
+    double timeSec = 0;
+    /// 专项额度桶槽:kind == Quota 时必非空(由 OverlayWrite 保证);随规则存亡
+    std::shared_ptr<ZmQuotaSlot> quota;
+};
+using ZmOverlayMap = std::unordered_map<string, ZmOverlayRule>;
+
+/// 进程级 overlay(COW):原子指针读、写时整体替换
+std::atomic<std::shared_ptr<const ZmOverlayMap>> s_overlayPtr{
+    std::make_shared<const ZmOverlayMap>()};
+std::mutex s_overlayWriteMtx;
+
+/**
+ * @brief 写 overlay 规则(COW:复制当前表 → 修改 → 原子替换)
+ *
+ * 低频写路径,故直接整体复制;读侧因此可零锁取快照。
+ * 专项额度槽的生死与规则一致:删除规则即释放槽(份额状态不残留),参数未变的
+ * Quota 改写则沿用原槽(额度状态跨改写延续)。
+ *
+ * @param ip        对端 IP 字面量
+ * @param kind      规则类型(None = 删除该 IP 的规则)
+ * @param capacity  额度桶容量(kind = Quota 时有效)
+ * @param timeSec   额度时间单位秒(kind = Quota 时有效)
+ */
+void OverlayWrite(const string& ip, ZmOverlayRule::Kind kind,
+                  size_t capacity, double timeSec)
+{
+    std::lock_guard lk(s_overlayWriteMtx);
+    auto cur = s_overlayPtr.load();
+    auto nxt = std::make_shared<ZmOverlayMap>(*cur);
+    if (kind == ZmOverlayRule::None)
+    {
+        nxt->erase(ip);   // 槽随条目一并释放(最后一份快照释放时桶析构)
+    }
+    else
+    {
+        ZmOverlayRule rule{kind, capacity, timeSec, nullptr};
+        if (kind == ZmOverlayRule::Quota)
+        {
+            auto old = cur->find(ip);
+            if (old != cur->end() && old->second.kind == ZmOverlayRule::Quota &&
+                old->second.capacity == capacity && old->second.timeSec == timeSec)
+                rule.quota = old->second.quota;   // 参数未变 → 沿用(状态延续)
+            if (!rule.quota)
+                rule.quota = std::make_shared<ZmQuotaSlot>(capacity, timeSec);
+        }
+        (*nxt)[ip] = std::move(rule);
+    }
+    s_overlayPtr.store(nxt);
+}
+
 }  // namespace
 
 /**
@@ -4131,6 +4397,8 @@ bool ZmHttpServer::IsRateRuleHit(const string& ip)
 
 // ----------------------------------------------------------------------------
 // ZmIpRateLimiter:逐 IP 桶协调器(每个 IP 独立桶;有界 + 插入序驱逐)
+//   默认桶:key = 来访 IP(攻击者可控)→ 必须有界,故按插入序驱逐
+//   专项桶:key = 有 Quota 规则的 IP(管理动作可控)→ 挂在规则上,随规则存亡
 // ----------------------------------------------------------------------------
 struct ZmHttpServer::ZmIpRateLimiter::Impl
 {
@@ -4142,10 +4410,8 @@ struct ZmHttpServer::ZmIpRateLimiter::Impl
     std::mutex mtx;   // 短临界:桶查找/创建/驱逐(仅事件循环线程批;耗时微秒级)
     std::unordered_map<string, drogon::RateLimiterPtr> buckets;
     std::deque<string> order;   // 插入序(驱逐队头)
-    // 专项额度桶(参数随规则;变更时重建)
-    struct QuotaEntry { size_t cap = 0; double timeSec = 0; drogon::RateLimiterPtr lim; };
-    std::unordered_map<string, QuotaEntry> quotaBuckets;
-    size_t quotaCount = 0;      // 与 maxEntries 共用上限
+    // 注:专项额度桶不在本容器 —— 它挂在 overlay 规则上(见 ZmQuotaSlot),
+    //     条目数恒等于 Quota 规则数,不需要也不该有驱逐(驱逐 = 重置额度 = 放行一波)
 
     /**
      * @brief 取(或惰性创建)某 IP 的默认桶
@@ -4238,21 +4504,8 @@ bool ZmHttpServer::ZmIpRateLimiter::Check(const drogon::HttpRequestPtr& req,
             return true;
         case ZmOverlayRule::Quota:
         {
-            // 专项额度:独立缓存桶(状态延续;参数变更 → 重建)
-            drogon::RateLimiterPtr lim;
-            {
-                std::lock_guard lk(m_impl->mtx);
-                auto& q = m_impl->quotaBuckets[ip];
-                if (!q.lim || q.cap != it->second.capacity ||
-                    q.timeSec != it->second.timeSec)
-                {
-                    q.cap = it->second.capacity;
-                    q.timeSec = it->second.timeSec;
-                    q.lim = MakeSafeRateLimiter(m_impl->type, q.cap, q.timeSec);
-                }
-                lim = q.lim;
-            }
-            if (lim->isAllowed())
+            // 专项额度:桶挂在规则上(进程内一 IP 一桶,稳态零锁)
+            if (it->second.quota->Get(m_impl->type)->isAllowed())
                 return true;
             resp = ErrorResponse(429, "rate limited");
             return false;

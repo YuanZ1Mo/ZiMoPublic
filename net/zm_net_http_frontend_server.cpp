@@ -6,6 +6,7 @@
 #include <filesystem>
 
 #include <zm_util_logger.h>
+#include <zm_util_str.h>   // ZmString::UTF8_To_Unicode(路径 UTF-8 → wide 转换)
 
 using namespace drogon;
 using std::string;
@@ -82,7 +83,16 @@ void ZmHttpFrontendServer::SetDocumentRoot(const string& docRoot)
  */
 void ZmHttpFrontendServer::SetNotFoundPage(const string& file)
 {
-    if (!std::filesystem::exists(file))
+    // filesystem 的窄串按 ANSI 码页解码,UTF-8 路径必错 → 先 UTF-8 → wide 再进 filesystem
+    // (与基类 FetchFileMeta 同款;drogon 读文件自身经 toNativePath 转 wide,故此处校验通过即可)
+    const std::wstring wfile = ZmString::UTF8_To_Unicode(file);
+    if (wfile.empty() && !file.empty())
+    {
+        PUBLIC_LOG_ERROR("SetNotFoundPage: 路径转换失败: {}", file);
+        return;
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(std::filesystem::path(wfile), ec) || ec)
     {
         // 页面缺失时不接管：保持框架默认 404，避免把坏路径设成 404 页
         PUBLIC_LOG_ERROR("SetNotFoundPage: 页面不存在: {}", file);

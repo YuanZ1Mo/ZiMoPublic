@@ -101,7 +101,7 @@ public:
      * @brief 设置自定义 404 页（仅前端）
      *
      * 勿用 setImplicitPage —— 其语义为"目录解析"而非页面回落。
-     * @param file  404 页面文件路径（不存在则记 ERROR 并忽略）
+     * @param file  404 页面文件路径（UTF-8 编码；不存在则记 ERROR 并忽略）
      */
     void SetNotFoundPage(const std::string& file);
 

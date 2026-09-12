@@ -54,6 +54,7 @@ public:
      * @brief 注册 method 处理器（启动期，首个 Open 前调用）
      *
      * 重复注册覆盖旧处理器并记 WARN。处理器在工作线程之外、事件循环上被调用。
+     * 首个 Open 之后调用会被拒绝并记 ERROR（运行期 method 表只读，读取侧无锁）。
      *
      * @param name     方法名（对应请求的 method 字段）
      * @param handler  处理器：成功写 result 并返回 true；失败写 error 并返回 false
@@ -97,7 +98,8 @@ private:
     void GateAdvice(const drogon::HttpRequestPtr& req, drogon::AdviceCallback&& cb,
                     drogon::AdviceChainCallback&& cc);
 
-    /// 方法名 → 处理器（Phase1 只写、运行期只读，故无需加锁）
+    /// 方法名 → 处理器（Phase1 只写、运行期只读；RegisterMethod 有 run 后拒绝守卫
+    /// 保证写入只发生在启动期，故无需加锁）
     std::map<std::string, ZmJrpcMethodHandler> m_methods;
 };
 
