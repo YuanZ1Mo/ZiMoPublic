@@ -1,12 +1,10 @@
 #include "zm_net_http_jsonrpc_server.h"
 
-#include <drogon/HttpRequest.h>
-#include <drogon/HttpResponse.h>
+#include "../util/zm_util_json.h"   // ZMJSON = nlohmann::ordered_json
+#include "../util/zm_util_logger.h"
 
-
-#include "zm_util_json.h"   // ZMJSON = nlohmann::ordered_json
-
-#include <zm_util_logger.h>
+#include <../drogon/include/drogon/HttpRequest.h>
+#include <../drogon/include/drogon/HttpResponse.h>
 
 using namespace drogon;
 using std::string;

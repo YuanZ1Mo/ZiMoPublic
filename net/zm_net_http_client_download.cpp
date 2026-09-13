@@ -1,22 +1,22 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-// 头顺序铁律:trantor 先行,后 windows.h(否则 winsock.h 先于 winsock2.h 报重定义)
-#include <trantor/net/EventLoop.h>
-#include <trantor/net/EventLoopThread.h>
-#include <trantor/net/InetAddress.h>
-#include <trantor/net/Resolver.h>
-#include <trantor/net/TcpClient.h>
-#include <trantor/net/TcpConnection.h>
-#include <trantor/net/TLSPolicy.h>
-#include <trantor/utils/MsgBuffer.h>
-#include <drogon/utils/coroutine.h>
-
-#include "zm_net_http_client.h"
 #include "zm_net_http_client_download.h"
+#include "zm_net_http_client.h"
 
-#include <zm_util_json.h>
-#include <zm_util_logger.h>
+#include "../util/zm_util_json.h"
+#include "../util/zm_util_logger.h"
+
+// 头顺序铁律:trantor 先行,后 windows.h(否则 winsock.h 先于 winsock2.h 报重定义)
+#include <../drogon/include/trantor/net/EventLoop.h>
+#include <../drogon/include/trantor/net/EventLoopThread.h>
+#include <../drogon/include/trantor/net/InetAddress.h>
+#include <../drogon/include/trantor/net/Resolver.h>
+#include <../drogon/include/trantor/net/TcpClient.h>
+#include <../drogon/include/trantor/net/TcpConnection.h>
+#include <../drogon/include/trantor/net/TLSPolicy.h>
+#include <../drogon/include/trantor/utils/MsgBuffer.h>
+#include <../drogon/include/drogon/utils/coroutine.h>
 
 #include <windows.h>
 
@@ -37,12 +37,10 @@
 using std::string;
 
 // ============================================================================
-// 流式下载通道(设计二期 §15)
-//  单 EventLoopThread(自启自停)+ 每会话写线程 + 有界指令队列;dlLoop 零磁盘。
-//  会话状态机全堆对象,回调链推进;连接代数(epoch)守卫重连窗口。
-//  续传:.part 大小即起点;If-Range 变更检测;.part.meta 仅 {etag,lastModified} 一次写。
-//  线程纪律:除 Done(写线程)与 Shutdown 外的触碰均在 dlLoop 线程;
-//            文件打开/侧车读取提交客户端工作池执行(不占调用方线程)。
+//  流式下载通道 单 EventLoopThread(自启自停)+ 每会话写线程 + 有界指令队列;dlLoop 零磁盘.
+//  会话状态机全堆对象,回调链推进;连接代数(epoch)守卫重连窗口.
+//  续传:.part 大小即起点;If-Range 变更检测;.part.meta 仅 {etag,lastModified} 一次写.
+//  线程纪律:除 Done(写线程)与 Shutdown 外的触碰均在 dlLoop 线程; 文件打开/侧车读取提交客户端工作池执行(不占调用方线程).
 // ============================================================================
 namespace
 {
@@ -55,6 +53,7 @@ bool s_dlRunning = false;
 std::mutex s_sessMtx;
 std::set<std::shared_ptr<class ZmDownloadSession>> s_sessions;
 
+/// @return 当前 steady_clock 毫秒时戳(仅用于时间差)
 int64_t NowMs()
 {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -62,6 +61,7 @@ int64_t NowMs()
         .count();
 }
 
+/// @return s 的 ASCII 小写副本
 string ToLowerCopy(string s)
 {
     for (auto& c : s)
@@ -69,6 +69,7 @@ string ToLowerCopy(string s)
     return s;
 }
 
+/// @return 去掉首尾空白(空格/制表/CR/LF)的副本
 string Trim(const string& s)
 {
     size_t b = s.find_first_not_of(" \t\r\n");
@@ -108,6 +109,12 @@ struct ZmDownloadTarget
     string pathQuery;  // 恒以 '/' 开头;无 fragment
 };
 
+/**
+ * @brief 解析下载 URL(仅 http/https)
+ *
+ * @param raw 原始 URL(可含 userinfo 与 fragment;fragment 忽略)
+ * @return 解析结果;ok=false 表示 scheme/主机/端口不合法
+ */
 ZmDownloadTarget ParseDownloadUrl(const string& raw)
 {
     ZmDownloadTarget t;
@@ -191,8 +198,8 @@ bool IsSensitiveHeaderName(const string& name)
 /**
  * @brief 解析重定向位置,得到可再次请求的绝对 URL
  *
- * 支持绝对 URL、协议相对(`//host/path`)、根相对(`/path`)与普通相对路径(含 `.`/`..` 规范化);
- * 相对形态以 baseUrl 的目录部分为参照。
+ * 支持绝对 URL,协议相对(`//host/path`),根相对(`/path`)与普通相对路径(含 `.`/`..` 规范化);
+ * 相对形态以 baseUrl 的目录部分为参照.
  *
  * @param baseUrl 当前请求的绝对 URL
  * @param loc     Location 头原值(前后空白自动裁掉)
@@ -223,7 +230,7 @@ string ResolveRedirectUrl(const string& baseUrl, const string& loc)
     string dir = (lastSlash == string::npos || lastSlash == 0) ? "/" : path.substr(0, lastSlash + 1);
     string join = (l[0] == '/') ? l : dir + l;
 
-    // 逐段规范化:丢弃空段与 "."、遇 ".." 回退一段
+    // 逐段规范化:丢弃空段与 ".",遇 ".." 回退一段
     std::vector<string> segs;
     size_t i = 0;
     while (i <= join.size())
@@ -267,8 +274,8 @@ bool IsSafeRequestBytes(const string& s)
 /**
  * @brief 头值白名单:仅拒绝能造成请求注入的字符
  *
- * 空格与水平制表符是合法头值内容(Accept: text/html、charset=utf-8 等),
- * 误拒会让同一份头配置"普通通道能发、下载通道全挂";高位字节按 obs-text 放行。
+ * 空格与水平制表符是合法头值内容(Accept: text/html,charset=utf-8 等),
+ * 误拒会让同一份头配置"普通通道能发,下载通道全挂";高位字节按 obs-text 放行.
  *
  * @param s 待校验的头值
  * @return true 可安全拼进请求;false 含 CR/LF/NUL 等控制字符
@@ -284,8 +291,7 @@ bool IsSafeHeaderValue(const string& s)
 }
 
 // ----------------------------------------------------------------------------
-// 单次下载会话(设计二期 §15)
-//   dlLoop:解析/编排/指令入队;写线程:唯一盘上执行者;Done 恰一次(写线程)。
+// 单次下载会话 dlLoop:解析/编排/指令入队;写线程:唯一盘上执行者;Done 恰一次(写线程).
 // ----------------------------------------------------------------------------
 class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
 {
@@ -295,7 +301,7 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
     /**
      * @brief 构造会话:解析 URL → 打开 .part(定起点/截断)→ 读侧车 → 起写线程
      *
-     * 全程磁盘操作,须在客户端工作池线程执行(不得占用事件循环线程)。
+     * 全程磁盘操作,须在客户端工作池线程执行(不得占用事件循环线程).
      *
      * @param url      下载源(仅 http/https)
      * @param destPath 目标文件路径(过程文件为 destPath + ".part")
@@ -303,7 +309,7 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
      * @param done     终态回调(写线程调用,恰一次)
      * @param loop     本会话所在的下载通道 loop(固化到会话,不读后续全局状态)
      * @param err      失败原因回填
-     * @return 会话对象;失败返回 nullptr(不注册、不起写线程)
+     * @return 会话对象;失败返回 nullptr(不注册,不起写线程)
      */
     static std::shared_ptr<ZmDownloadSession> Create(const string& url, const string& destPath,
                                                      ZmHttpClient::ZmHttpRequestOptionsPtr opts,
@@ -313,18 +319,18 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
         const auto& def = ZmHttpClient::GetOptions();
         auto s = std::shared_ptr<ZmDownloadSession>(
             new ZmDownloadSession(url, destPath, std::move(opts), std::move(done)));
-        s->loop_ = loop;
-        s->chunkBytes_ = def.downloadChunkBytes > 0 ? def.downloadChunkBytes : 1024 * 1024;
-        s->stallAbortMs_ = def.downloadStallAbortMs > 0 ? (int64_t)def.downloadStallAbortMs : 120000;
-        s->qCap_ = def.downloadQueueMaxBytes > 0 ? def.downloadQueueMaxBytes : 64ULL * 1024 * 1024;
+        s->m_loop = loop;
+        s->m_chunkBytes = def.downloadChunkBytes > 0 ? def.downloadChunkBytes: 1024 * 1024;
+        s->m_stallAbortMs = def.downloadStallAbortMs > 0 ? (int64_t)def.downloadStallAbortMs: 120000;
+        s->m_qCap = def.downloadQueueMaxBytes > 0 ? def.downloadQueueMaxBytes: 64ULL * 1024 * 1024;
 
-        s->tgt_ = ParseDownloadUrl(url);
-        if (!s->tgt_.ok)
+        s->m_tgt = ParseDownloadUrl(url);
+        if (!s->m_tgt.ok)
         {
             err = "url 解析失败";
             return nullptr;
         }
-        if (!IsSafeRequestBytes(s->tgt_.pathQuery))
+        if (!IsSafeRequestBytes(s->m_tgt.pathQuery))
         {
             err = "path 含裸空格/控制字符";
             return nullptr;
@@ -342,9 +348,9 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
                 return nullptr;
             }
         }
-        if (s->opts_)
+        if (s->m_opts)
         {
-            for (const auto& kv : s->opts_->headers)
+            for (const auto& kv: s->m_opts->headers)
             {
                 if (!IsSafeRequestBytes(kv.first))
                 {
@@ -361,18 +367,18 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
 
         // 打开 .part:N = 现有大小(唯一事实源);N=0 截断
         std::wstring part = ToW(destPath + ".part");
-        s->file_ = CreateFileW(part.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
+        s->m_file = CreateFileW(part.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
                                FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (s->file_ == INVALID_HANDLE_VALUE)
+        if (s->m_file == INVALID_HANDLE_VALUE)
         {
             err = "打开 .part 失败: " + destPath + ".part";
             return nullptr;
         }
         LARGE_INTEGER sz{};
-        if (!GetFileSizeEx(s->file_, &sz) || sz.QuadPart < 0)
+        if (!GetFileSizeEx(s->m_file, &sz) || sz.QuadPart < 0)
         {
-            CloseHandle(s->file_);
-            s->file_ = INVALID_HANDLE_VALUE;
+            CloseHandle(s->m_file);
+            s->m_file = INVALID_HANDLE_VALUE;
             err = "查询 .part 大小失败: " + destPath + ".part";
             return nullptr;
         }
@@ -381,27 +387,27 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
             // 续传:起点 = 现有大小;读侧车(If-Range 校验值)
             LARGE_INTEGER li;
             li.QuadPart = sz.QuadPart;
-            if (!SetFilePointerEx(s->file_, li, nullptr, FILE_BEGIN))
+            if (!SetFilePointerEx(s->m_file, li, nullptr, FILE_BEGIN))
             {
-                CloseHandle(s->file_);
-                s->file_ = INVALID_HANDLE_VALUE;
+                CloseHandle(s->m_file);
+                s->m_file = INVALID_HANDLE_VALUE;
                 err = "定位 .part 续写点失败: " + destPath + ".part";
                 return nullptr;
             }
-            s->resumedFrom_ = (uint64_t)sz.QuadPart;
-            s->cursor_ = s->resumedFrom_;
+            s->m_resumedFrom = (uint64_t)sz.QuadPart;
+            s->m_cursor = s->m_resumedFrom;
             s->ReadSidecar();
         }
         else
         {
-            SetFilePointer(s->file_, 0, nullptr, FILE_BEGIN);
-            SetEndOfFile(s->file_);
+            SetFilePointer(s->m_file, 0, nullptr, FILE_BEGIN);
+            SetEndOfFile(s->m_file);
         }
-        s->lastActivityMs_ = NowMs();
-        s->lastWriteMs_ = s->lastActivityMs_;
+        s->m_lastActivityMs = NowMs();
+        s->m_lastWriteMs = s->m_lastActivityMs;
 
-        // 写线程(成员声明序保证:writer_ 为最后成员,~session 先于其析构 join)
-        s->writer_ = std::thread([raw = s.get()]() { raw->WriterLoop(); });
+        // 写线程(成员声明序保证:m_writer 为最后成员,~session 先于其析构 join)
+        s->m_writer = std::thread([raw = s.get()]() { raw->WriterLoop(); });
         return s;
     }
 
@@ -415,29 +421,29 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
     void RequestShutdown()
     {
         {
-            std::lock_guard lk(qMtx_);
-            writerStop_ = true;
+            std::lock_guard lk(m_qMtx);
+            m_writerStop = true;
         }
-        qCv_.notify_all();
+        m_qCv.notify_all();
         CancelPendingFileIo();
     }
 
-    /// 析构上下文自检:写线程自毁路径(hold 析构)detach 自己;其余线程等写线程退出。
-    /// 写线程终态(Deliver)先摘登记再回执,故正常路径下此处 joinable 已为 false。
+    /// 析构上下文自检:写线程自毁路径(hold 析构)detach 自己;其余线程等写线程退出.
+    /// 写线程终态(Deliver)先摘登记再回执,故正常路径下此处 joinable 已为 false.
     /// (dtor 必须 public:shared_ptr 删除器需可 delete)
     ~ZmDownloadSession()
     {
-        if (writer_.joinable())
+        if (m_writer.joinable())
         {
-            if (writer_.get_id() == std::this_thread::get_id())
-                writer_.detach();  // 线程即将自然退出,仅释放句柄
+            if (m_writer.get_id() == std::this_thread::get_id())
+                m_writer.detach();  // 线程即将自然退出,仅释放句柄
             else
-                writer_.join();
+                m_writer.join();
         }
     }
 
   private:
-    // 指令(设计 §15.2)
+    // 指令
     struct ZmDlAction
     {
         enum class Kind
@@ -455,256 +461,281 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
 
     ZmDownloadSession(string url, const string destPath,
                       ZmHttpClient::ZmHttpRequestOptionsPtr opts, ZmDoneFn done)
-        : url_(std::move(url)), destPath_(destPath), opts_(std::move(opts)), done_(std::move(done))
+       : m_url(std::move(url)), m_destPath(destPath), m_opts(std::move(opts)), m_done(std::move(done))
     {
     }
 
-    // —— 状态(dlLoop 侧) ——
-    string url_;
-    string destPath_;
-    ZmHttpClient::ZmHttpRequestOptionsPtr opts_;
-    ZmDoneFn done_;
+    // -- 状态(dlLoop 侧) --
+    string m_url;
+    string m_destPath;
+    ZmHttpClient::ZmHttpRequestOptionsPtr m_opts;
+    ZmDoneFn m_done;
 
-    ZmDownloadTarget tgt_;
-    trantor::EventLoop* loop_ = nullptr;  // 本会话的下载 loop(创建时固化,不读全局)
-    std::shared_ptr<trantor::Resolver> resolver_;
-    std::shared_ptr<trantor::TcpClient> client_;
-    trantor::TcpConnectionPtr conn_;
-    uint64_t epoch_ = 0;         // 连接代数:重连窗口内旧连接回调一律忽略
-    bool guardStarted_ = false;  // 停滞看护链只起一次
+    ZmDownloadTarget m_tgt;
+    trantor::EventLoop* m_loop = nullptr;  // 本会话的下载 loop(创建时固化,不读全局)
+    std::shared_ptr<trantor::Resolver> m_resolver;
+    std::shared_ptr<trantor::TcpClient> m_client;
+    trantor::TcpConnectionPtr m_conn;
+    uint64_t m_epoch = 0;         // 连接代数:重连窗口内旧连接回调一律忽略
+    bool m_guardStarted = false;  // 停滞看护链只起一次
 
-    size_t chunkBytes_ = 1024 * 1024;
-    int64_t stallAbortMs_ = 120000;
-    int64_t lastActivityMs_ = 0;
-    uint64_t qCap_ = 64ULL * 1024 * 1024;
+    size_t m_chunkBytes = 1024 * 1024;
+    int64_t m_stallAbortMs = 120000;
+    int64_t m_lastActivityMs = 0;
+    uint64_t m_qCap = 64ULL * 1024 * 1024;
 
     // 续传/游标
-    uint64_t resumedFrom_ = 0;  // 本次起点(0 = 全新)
-    uint64_t cursor_ = 0;       // 当前响应已交付写线程的落盘偏移
-    string metaEtag_, metaLm_;  // 请求侧车值(发 If-Range)
-    string respEtag_, respLm_;  // 当前响应头值(写侧车)
-    bool restartOnceUsed_ = false;
-    int redirectsUsed_ = 0;        // 已跟随的重定向次数(上限走全局 maxRedirects)
-    bool stripSensitive_ = false;  // 跨目标跳转后剥除 Authorization/Cookie
+    uint64_t m_resumedFrom = 0;  // 本次起点(0 = 全新)
+    uint64_t m_cursor = 0;       // 当前响应已交付写线程的落盘偏移
+    string m_metaEtag, m_metaLm;  // 请求侧车值(发 If-Range)
+    string m_respEtag, m_respLm;  // 当前响应头值(写侧车)
+    bool m_restartOnceUsed = false;
+    int m_redirectsUsed = 0;        // 已跟随的重定向次数(上限走全局 maxRedirects)
+    bool m_stripSensitive = false;  // 跨目标跳转后剥除 Authorization/Cookie
 
     // 响应解析(fail-closed)
-    bool headerDone_ = false;
-    int statusCode_ = 0;
-    bool chunked_ = false;
-    bool hasContentLength_ = false;
-    uint64_t contentLength_ = 0;
-    bool hasContentRange_ = false;
-    uint64_t contentRangeFirst_ = 0;
-    string respLocation_;  // Location 头(3xx 跟随用;随响应解析重置)
-    uint64_t recvBody_ = 0;
-    uint64_t chunkPendingSize_ = UINT64_MAX;
-    bool chunkTerminated_ = false;
-    string pendingBuf_;
+    bool m_headerDone = false;
+    int m_statusCode = 0;
+    bool m_chunked = false;
+    bool m_hasContentLength = false;
+    uint64_t m_contentLength = 0;
+    bool m_hasContentRange = false;
+    uint64_t m_contentRangeFirst = 0;
+    string m_respLocation;  // Location 头(3xx 跟随用;随响应解析重置)
+    uint64_t m_recvBody = 0;
+    uint64_t m_chunkPendingSize = UINT64_MAX;
+    bool m_chunkTerminated = false;
+    string m_pendingBuf;
 
-    std::atomic<bool> finished_{false};  // 终态门:此后 dlLoop 不再入队/回调
+    std::atomic<bool> m_finished{false};  // 终态门:此后 dlLoop 不再入队/回调
 
-    // —— 写线程侧 ——
-    HANDLE file_ = INVALID_HANDLE_VALUE;
-    std::thread writer_;          // 最后成员(先于其余成员析构)
-    std::mutex qMtx_;
-    std::condition_variable qCv_;
-    std::deque<ZmDlAction> q_;
-    uint64_t qBytes_ = 0;
-    bool writerStop_ = false;
-    int64_t lastWriteMs_ = 0;  // 写线程最后取走指令的时刻(停滞看护的写侧判据;受 qMtx_ 保护)
+    // -- 写线程侧 --
+    HANDLE m_file = INVALID_HANDLE_VALUE;
+    std::thread m_writer;          // 最后成员(先于其余成员析构)
+    std::mutex m_qMtx;
+    std::condition_variable m_qCv;
+    std::deque<ZmDlAction> m_q;
+    uint64_t m_qBytes = 0;
+    bool m_writerStop = false;
+    int64_t m_lastWriteMs = 0;  // 写线程最后取走指令的时刻(停滞看护的写侧判据;受 m_qMtx 保护)
 
     // -------------------------------------------------- dlLoop 流程
     void BeginConnect()
     {
-        if (finished_.load())
+        if (m_finished.load())
             return;
-        ++epoch_;
-        const uint64_t ep = epoch_;
-        if (!resolver_)
-            resolver_ = trantor::Resolver::newResolver(loop_, 30);
+        ++m_epoch;
+        const uint64_t ep = m_epoch;
+        if (!m_resolver)
+            m_resolver = trantor::Resolver::newResolver(m_loop, 30);
         std::weak_ptr<ZmDownloadSession> weak = shared_from_this();
-        resolver_->resolve(tgt_.host, [weak, ep](const trantor::InetAddress& addr) {
+        m_resolver->resolve(m_tgt.host, [weak, ep](const trantor::InetAddress& addr) {
             auto self = weak.lock();
-            if (!self || self->epoch_ != ep || self->finished_.load())
-                return;
-            trantor::InetAddress a = addr;
-            a.setPortNetEndian(htons(self->tgt_.port));  // Resolver 回传端口恒 0,须回填
-            self->OnResolved(a, ep);
+            if (self && self->Alive(ep))
+                self->OnResolvedGuarded(ep, addr);
         });
     }
 
+/// 解析完成:建连接客户端并挂四个回调(持弱引用 + 代数守卫)
+/// @param ep 本次连接的代数
     void OnResolved(const trantor::InetAddress& addr, uint64_t ep)
     {
-        // 四个回调一律持弱引用:锁不上即会话已终结,直接丢弃。
-        // (强引用会与 client_ 成员形成引用环,令会话连同写线程永久泄漏)
+        // 四个回调一律持弱引用:锁不上即会话已终结,直接丢弃.
+        // (强引用会与 m_client 成员形成引用环,令会话连同写线程永久泄漏)
         std::weak_ptr<ZmDownloadSession> weak = shared_from_this();
-        client_ = std::make_shared<trantor::TcpClient>(loop_, addr, "zm-download");
-        client_->setMessageCallback([weak, ep](const trantor::TcpConnectionPtr& c,
+        m_client = std::make_shared<trantor::TcpClient>(m_loop, addr, "zm-download");
+        m_client->setMessageCallback([weak, ep](const trantor::TcpConnectionPtr& c,
                                                trantor::MsgBuffer* buf) {
             auto self = weak.lock();
-            if (!self || self->epoch_ != ep || self->finished_.load())
-                return;
-            self->OnRecv(c, buf);
+            if (self && self->Alive(ep))
+                self->OnRecv(c, buf);
         });
-        client_->setConnectionCallback([weak, ep](const trantor::TcpConnectionPtr& conn) {
+        m_client->setConnectionCallback([weak, ep](const trantor::TcpConnectionPtr& conn) {
             auto self = weak.lock();
-            if (!self || self->epoch_ != ep || self->finished_.load())
-                return;
-            if (conn->connected())
-                self->OnConnected(conn);
-            else
-                self->OnDisconnect();
+            if (self && self->Alive(ep))
+                self->OnConnResult(conn);
         });
-        client_->setConnectionErrorCallback([weak, ep]() {
+        m_client->setConnectionErrorCallback([weak, ep]() {
             auto self = weak.lock();
-            if (!self || self->epoch_ != ep || self->finished_.load())
-                return;
-            self->OnConnectError();
+            if (self && self->Alive(ep))
+                self->OnConnectError();
         });
-        client_->setSSLErrorCallback([weak, ep](trantor::SSLError) {
+        m_client->setSSLErrorCallback([weak, ep](trantor::SSLError) {
             auto self = weak.lock();
-            if (!self || self->epoch_ != ep || self->finished_.load())
-                return;
-            self->OnSslError();
+            if (self && self->Alive(ep))
+                self->OnSslError();
         });
 
         // TLS 先于 connect;策略与普通 lane 同源(全局 Options)
         const auto& def = ZmHttpClient::GetOptions();
-        if (tgt_.ssl)
+        if (m_tgt.ssl)
         {
-            auto policy = trantor::TLSPolicy::defaultClientPolicy(tgt_.host);
+            auto policy = trantor::TLSPolicy::defaultClientPolicy(m_tgt.host);
             policy->setValidate(def.validateCert);
             if (!def.trustCA.empty())
                 policy->setCaPath(def.trustCA);
             if (!def.clientCert.empty() && !def.clientKey.empty())
                 policy->setCertPath(def.clientCert).setKeyPath(def.clientKey);
-            client_->enableSSL(std::move(policy));
+            m_client->enableSSL(std::move(policy));
         }
-        client_->connect();
+        m_client->connect();
     }
 
+    /// 连接代数守卫:代数不符或会话已终结 → 该回调一律丢弃(重连窗口内的旧连接回调)
+    /// @param ep 回调注册时的连接代数
+    /// @return true 仍应处理该回调
+    bool Alive(uint64_t ep) const
+    {
+        return m_epoch == ep && !m_finished.load();
+    }
+
+    /// 解析回调入口(守卫通过后):回填端口再建连接
+    /// @param ep   回调注册时的连接代数
+    /// @param addr 解析结果(端口恒 0,须按目标回填)
+    void OnResolvedGuarded(uint64_t ep, const trantor::InetAddress& addr)
+    {
+        if (!Alive(ep))
+            return;
+        trantor::InetAddress a = addr;
+        a.setPortNetEndian(htons(m_tgt.port));  // Resolver 回传端口恒 0,须回填
+        OnResolved(a, ep);
+    }
+
+    /// 连接结果分派(守卫通过后按 connected 走向)
+    void OnConnResult(const trantor::TcpConnectionPtr& conn)
+    {
+        if (conn->connected())
+            OnConnected(conn);
+        else
+            OnDisconnect();
+    }
+
+/// 连接建立:发送 GET(Host/UA/Range/If-Range/公共头)并起停滞看护
     void OnConnected(const trantor::TcpConnectionPtr& conn)
     {
-        conn_ = conn;
-        lastActivityMs_ = NowMs();
+        m_conn = conn;
+        m_lastActivityMs = NowMs();
         const auto& def = ZmHttpClient::GetOptions();
 
-        string req = "GET " + tgt_.pathQuery + " HTTP/1.1\r\n";
-        req += "Host: " + BracketHost(tgt_.host) +
-               (tgt_.port == (tgt_.ssl ? 443 : 80) ? "" : (":" + std::to_string(tgt_.port))) + "\r\n";
+        string req = "GET " + m_tgt.pathQuery + " HTTP/1.1\r\n";
+        req += "Host: " + BracketHost(m_tgt.host) +
+               (m_tgt.port == (m_tgt.ssl ? 443: 80) ? "": (":" + std::to_string(m_tgt.port))) + "\r\n";
         req += "User-Agent: " + def.userAgent + "\r\n";
-        if (resumedFrom_ > 0)
+        if (m_resumedFrom > 0)
         {
-            req += "Range: bytes=" + std::to_string(resumedFrom_) + "-\r\n";
-            if (!metaEtag_.empty())
-                req += "If-Range: " + metaEtag_ + "\r\n";
-            else if (!metaLm_.empty())
-                req += "If-Range: " + metaLm_ + "\r\n";
+            req += "Range: bytes=" + std::to_string(m_resumedFrom) + "-\r\n";
+            if (!m_metaEtag.empty())
+                req += "If-Range: " + m_metaEtag + "\r\n";
+            else if (!m_metaLm.empty())
+                req += "If-Range: " + m_metaLm + "\r\n";
             else
                 PUBLIC_LOG_WARN("ZmHttpClient 下载续传无 If-Range 校验值(降级为仅 "
                                 "Content-Range 起点校验): {}",
-                                destPath_);
+                                m_destPath);
         }
         req += "Connection: close\r\n";
         req += "Accept-Encoding: identity\r\n";
         for (const auto& kv : def.commonHeaders)
         {
-            if (stripSensitive_ && IsSensitiveHeaderName(kv.first))
+            if (m_stripSensitive && IsSensitiveHeaderName(kv.first))
                 continue;
             req += kv.first + ": " + kv.second + "\r\n";
         }
-        if (opts_)
-            for (const auto& kv : opts_->headers)
+        if (m_opts)
+            for (const auto& kv: m_opts->headers)
             {
-                if (stripSensitive_ && IsSensitiveHeaderName(kv.first))
+                if (m_stripSensitive && IsSensitiveHeaderName(kv.first))
                     continue;
                 req += kv.first + ": " + kv.second + "\r\n";
             }
         req += "\r\n";
         conn->send(req);
 
-        // 停滞看护(仅一次;自链 timer,finished_ 后自止)
-        if (!guardStarted_)
+        // 停滞看护(仅一次;自链 timer,m_finished 后自止)
+        if (!m_guardStarted)
         {
-            guardStarted_ = true;
+            m_guardStarted = true;
             std::weak_ptr<ZmDownloadSession> weak = shared_from_this();
-            loop_->runAfter(0.25, [weak]() {
+            m_loop->runAfter(0.25, [weak]() {
                 if (auto self = weak.lock())
                     self->OnGuard();
             });
         }
     }
 
+/// 连接断开:按是否已收全决定完成或失败(Connection: close 定界)
     void OnDisconnect()
     {
-        conn_.reset();
-        if (finished_.load())
+        m_conn.reset();
+        if (m_finished.load())
             return;
-        if (!headerDone_)
+        if (!m_headerDone)
         {
             Fail(drogon::ReqResult::NetworkFailure, 0, "连接中断(未收到响应头)");
             return;
         }
-        if (chunked_ && !chunkTerminated_)
+        if (m_chunked && !m_chunkTerminated)
         {
-            Fail(drogon::ReqResult::BadResponse, statusCode_, "chunked 未终结即断开");
+            Fail(drogon::ReqResult::BadResponse, m_statusCode, "chunked 未终结即断开");
             return;
         }
-        if (hasContentLength_ && recvBody_ < contentLength_)
+        if (m_hasContentLength && m_recvBody < m_contentLength)
         {
-            Fail(drogon::ReqResult::BadResponse, statusCode_, "响应体未收全即断开");
+            Fail(drogon::ReqResult::BadResponse, m_statusCode, "响应体未收全即断开");
             return;
         }
         Complete();  // Connection: close 定界完成
     }
 
+/// 连接失败/被拒 → BadServerAddress 终结
     void OnConnectError()
     {
         Fail(drogon::ReqResult::BadServerAddress, 0, "连接失败/拒绝");
     }
 
+/// TLS 握手/证书失败 → HandshakeError 终结
     void OnSslError()
     {
         Fail(drogon::ReqResult::HandshakeError, 0, "TLS 握手/证书失败");
     }
 
-    // —— 停滞看护:读侧无收包且写侧无进展(队列空,或写线程久未取走指令)→ 放弃 ——
-    // 写侧判据须能独立成立:写线程挂在网络盘上时队列恒非空,只看"队列空"会让会话永挂。
+    // -- 停滞看护:读侧无收包且写侧无进展(队列空,或写线程久未取走指令)→ 放弃 --
+    // 写侧判据须能独立成立:写线程挂在网络盘上时队列恒非空,只看"队列空"会让会话永挂.
     void OnGuard()
     {
-        if (finished_.load())
+        if (m_finished.load())
             return;
         int64_t now = NowMs();
         uint64_t qb = 0;
         int64_t lastWrite = 0;
         {
-            std::lock_guard lk(qMtx_);
-            qb = qBytes_;
-            lastWrite = lastWriteMs_;
+            std::lock_guard lk(m_qMtx);
+            qb = m_qBytes;
+            lastWrite = m_lastWriteMs;
         }
-        bool readStalled = (now - lastActivityMs_ > stallAbortMs_);
-        bool writeStalled = (qb == 0) || (now - lastWrite > stallAbortMs_);
+        bool readStalled = (now - m_lastActivityMs > m_stallAbortMs);
+        bool writeStalled = (qb == 0) || (now - lastWrite > m_stallAbortMs);
         if (readStalled && writeStalled)
         {
-            Fail(drogon::ReqResult::Timeout, statusCode_, "对端停滞(超时无进展)");
+            Fail(drogon::ReqResult::Timeout, m_statusCode, "对端停滞(超时无进展)");
             return;
         }
         std::weak_ptr<ZmDownloadSession> weak = shared_from_this();
-        loop_->runAfter(0.25, [weak]() {
+        m_loop->runAfter(0.25, [weak]() {
             if (auto self = weak.lock())
                 self->OnGuard();
         });
     }
 
-    // —— 接收:头部累积 + fail-closed 解析 + body 切块入队 ——
+    // -- 接收:头部累积 + fail-closed 解析 + body 切块入队 --
     void OnRecv(const trantor::TcpConnectionPtr& conn, trantor::MsgBuffer* msg)
     {
-        lastActivityMs_ = NowMs();
+        m_lastActivityMs = NowMs();
         size_t len = msg->readableBytes();
         if (len == 0)
             return;
 
-        if (!headerDone_)
+        if (!m_headerDone)
         {
             const char* data = msg->peek();
             string entire(data, len);
@@ -717,9 +748,9 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
             }
             ProcessHeaderData(data, headerEnd + 4);
             msg->retrieve(headerEnd + 4);
-            if (finished_.load())
+            if (m_finished.load())
                 return;
-            if (!headerDone_)
+            if (!m_headerDone)
                 return;  // 1xx 跳过,重入等待
             size_t rest = msg->readableBytes();
             if (rest > 0)
@@ -733,12 +764,12 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
             HandleBodyData(msg->peek(), len);
             msg->retrieveAll();
         }
-        if (finished_.load())
+        if (m_finished.load())
             return;
         CheckComplete();
     }
 
-    // 状态行严格解析:"HTTP/<digit>.<digit> <3位数字> ..."
+    // 状态行严格解析:"HTTP/<digit>.<digit> <3位数字>..."
     bool ParseStatusLine(const string& statusLine)
     {
         if (statusLine.compare(0, 5, "HTTP/") != 0)
@@ -755,11 +786,12 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
             if (!isdigit((unsigned char)statusLine[sp + i]))
                 return false;
         }
-        statusCode_ = (statusLine[sp + 1] - '0') * 100 + (statusLine[sp + 2] - '0') * 10 +
+        m_statusCode = (statusLine[sp + 1] - '0') * 100 + (statusLine[sp + 2] - '0') * 10 +
                       (statusLine[sp + 3] - '0');
         return true;
     }
 
+/// @return s 非空且全为数字
     static bool AllDigits(const string& s)
     {
         if (s.empty())
@@ -788,6 +820,15 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
         return true;
     }
 
+/**
+ * @brief 解析响应头并按分支表推进会话
+ *
+ * fail-closed:状态行/Content-Length/Content-Range 畸形,重复 CL,CL 与 TE 冲突,
+ * 响应编码非 identity 一律当场终结;随后按 200/206/3xx/412/416 决定续写,跟随或重连.
+ *
+ * @param data 头部起始指针
+ * @param len  头部字节数(含结尾空行)
+ */
     void ProcessHeaderData(const char* data, size_t len)
     {
         string head(data, len);
@@ -798,8 +839,8 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
             Fail(drogon::ReqResult::BadResponse, 0, "状态行畸形");
             return;
         }
-        if (statusCode_ == 100)
-            return;  // 1xx:消费后继续等正式头(headerDone_ 仍 false)
+        if (m_statusCode == 100)
+            return;  // 1xx:消费后继续等正式头(m_headerDone 仍 false)
 
         // 逐行解析(fail-closed:冲突即终结)
         int clCount = 0;
@@ -826,13 +867,13 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
                         Fail(drogon::ReqResult::BadResponse, 0, "Content-Length 非法");
                         return;
                     }
-                    contentLength_ = strtoull(val.c_str(), nullptr, 10);
-                    hasContentLength_ = true;
+                    m_contentLength = strtoull(val.c_str(), nullptr, 10);
+                    m_hasContentLength = true;
                 }
                 else if (key == "transfer-encoding")
                 {
                     tePresent = true;
-                    chunked_ = (ToLowerCopy(val).find("chunked") != string::npos);
+                    m_chunked = (ToLowerCopy(val).find("chunked") != string::npos);
                 }
                 else if (key == "content-encoding")
                 {
@@ -840,7 +881,7 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
                     string enc = ToLowerCopy(val);
                     if (!enc.empty() && enc != "identity")
                     {
-                        Fail(drogon::ReqResult::BadResponse, statusCode_,
+                        Fail(drogon::ReqResult::BadResponse, m_statusCode,
                              "响应体被压缩(Content-Encoding: " + val + ")");
                         return;
                     }
@@ -848,20 +889,20 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
                 else if (key == "content-range")
                 {
                     uint64_t f = 0;
-                    hasContentRange_ = ParseContentRangeFirst(val, f);
-                    contentRangeFirst_ = f;
+                    m_hasContentRange = ParseContentRangeFirst(val, f);
+                    m_contentRangeFirst = f;
                 }
                 else if (key == "etag")
                 {
-                    respEtag_ = val;
+                    m_respEtag = val;
                 }
                 else if (key == "last-modified")
                 {
-                    respLm_ = val;
+                    m_respLm = val;
                 }
                 else if (key == "location")
                 {
-                    respLocation_ = val;
+                    m_respLocation = val;
                 }
             }
             pos = lineEnd + 2;
@@ -871,35 +912,35 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
             Fail(drogon::ReqResult::BadResponse, 0, "重复 Content-Length");
             return;
         }
-        if (hasContentLength_ && chunked_)
+        if (m_hasContentLength && m_chunked)
         {
-            Fail(drogon::ReqResult::BadResponse, statusCode_, "Content-Length 与 Transfer-Encoding 冲突");
+            Fail(drogon::ReqResult::BadResponse, m_statusCode, "Content-Length 与 Transfer-Encoding 冲突");
             return;
         }
-        headerDone_ = true;
+        m_headerDone = true;
 
         // 分支表:206 校验首字节;200 原连接续读+就地截断;3xx 换目标重连;异常重连一次
-        if (statusCode_ == 200)
+        if (m_statusCode == 200)
         {
-            if (resumedFrom_ > 0)
+            if (m_resumedFrom > 0)
             {
                 // 200 = 全量表示:原连接续读,写线程按序就地截断(不重连)
                 EnqueueTruncate();
-                cursor_ = 0;
+                m_cursor = 0;
             }
             EnqueueWriteMeta();
         }
-        else if (statusCode_ == 206)
+        else if (m_statusCode == 206)
         {
-            if (!hasContentRange_ || !hasContentLength_)
+            if (!m_hasContentRange || !m_hasContentLength)
             {
-                Fail(drogon::ReqResult::BadResponse, statusCode_, "206 缺 Content-Range/Content-Length");
+                Fail(drogon::ReqResult::BadResponse, m_statusCode, "206 缺 Content-Range/Content-Length");
                 return;
             }
-            if (contentRangeFirst_ == resumedFrom_)
+            if (m_contentRangeFirst == m_resumedFrom)
             {
                 EnqueueWriteMeta();
-                cursor_ = resumedFrom_;
+                m_cursor = m_resumedFrom;
             }
             else
             {
@@ -907,261 +948,268 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
                 return;
             }
         }
-        else if (statusCode_ == 412 || statusCode_ == 416)
+        else if (m_statusCode == 412 || m_statusCode == 416)
         {
-            RestartOnce("Range/If 冲突(" + std::to_string(statusCode_) + ")");
+            RestartOnce("Range/If 冲突(" + std::to_string(m_statusCode) + ")");
             return;
         }
-        else if (statusCode_ >= 300 && statusCode_ < 400)
+        else if (m_statusCode >= 300 && m_statusCode < 400)
         {
             FollowRedirect();
             return;
         }
-        else if (statusCode_ < 200 || statusCode_ >= 300)
+        else if (m_statusCode < 200 || m_statusCode >= 300)
         {
-            Fail(drogon::ReqResult::BadResponse, statusCode_, "非 2xx 响应");
+            Fail(drogon::ReqResult::BadResponse, m_statusCode, "非 2xx 响应");
             return;
         }
     }
 
-    /// 重置"当前响应"的解析状态(续传基线 resumedFrom_/cursor_ 不在此列)
+    /// 重置"当前响应"的解析状态(续传基线 m_resumedFrom/m_cursor 不在此列)
     void ResetResponseState()
     {
-        headerDone_ = false;
-        chunked_ = false;
-        hasContentLength_ = false;
-        contentLength_ = 0;
-        hasContentRange_ = false;
-        recvBody_ = 0;
-        chunkPendingSize_ = UINT64_MAX;
-        chunkTerminated_ = false;
-        pendingBuf_.clear();
-        respEtag_.clear();
-        respLm_.clear();
-        respLocation_.clear();
+        m_headerDone = false;
+        m_chunked = false;
+        m_hasContentLength = false;
+        m_contentLength = 0;
+        m_hasContentRange = false;
+        m_recvBody = 0;
+        m_chunkPendingSize = UINT64_MAX;
+        m_chunkTerminated = false;
+        m_pendingBuf.clear();
+        m_respEtag.clear();
+        m_respLm.clear();
+        m_respLocation.clear();
     }
 
-    /// 200 截断从头 / 206 不符、412、416:断开 → 截断 → 重连一次(发普通 GET)
+    /// 200 截断从头 / 206 不符,412,416:断开 → 截断 → 重连一次(发普通 GET)
     void RestartOnce(const string& why)
     {
-        if (restartOnceUsed_)
+        if (m_restartOnceUsed)
         {
-            Fail(drogon::ReqResult::BadResponse, statusCode_, why + "(二次不符)");
+            Fail(drogon::ReqResult::BadResponse, m_statusCode, why + "(二次不符)");
             return;
         }
-        restartOnceUsed_ = true;
+        m_restartOnceUsed = true;
         ResetResponseState();
-        metaEtag_.clear();  // 重连发普通 GET,不带 Range/If-Range
-        metaLm_.clear();
+        m_metaEtag.clear();  // 重连发普通 GET,不带 Range/If-Range
+        m_metaLm.clear();
         EnqueueTruncate();
-        resumedFrom_ = 0;
-        cursor_ = 0;
-        if (client_)
-            client_->disconnect();  // 旧连接回调被 epoch 守卫忽略
-        conn_.reset();
+        m_resumedFrom = 0;
+        m_cursor = 0;
+        if (m_client)
+            m_client->disconnect();  // 旧连接回调被 epoch 守卫忽略
+        m_conn.reset();
         BeginConnect();
     }
 
     /**
      * @brief 跟随 3xx:解析 Location → 换目标重连(仅 dlLoop 线程调用)
      *
-     * 续传语义保留:Range/If-Range 照发,由对端以 200(全量,就地截断)或 206 收敛。
-     * 跨目标跳转后剥除敏感头;`opts.followRedirect=false`、Location 非法或次数超限时按失败终结。
+     * 续传语义保留:Range/If-Range 照发,由对端以 200(全量,就地截断)或 206 收敛.
+     * 跨目标跳转后剥除敏感头;`opts.followRedirect=false`,Location 非法或次数超限时按失败终结.
      */
     void FollowRedirect()
     {
-        if (statusCode_ == 304)
+        if (m_statusCode == 304)
         {
-            Fail(drogon::ReqResult::BadResponse, statusCode_, "304 无响应体(未发条件请求)");
+            Fail(drogon::ReqResult::BadResponse, m_statusCode, "304 无响应体(未发条件请求)");
             return;
         }
-        if (opts_ && !opts_->followRedirect)
+        if (m_opts && !m_opts->followRedirect)
         {
-            Fail(drogon::ReqResult::BadResponse, statusCode_,
-                 std::to_string(statusCode_) + " 重定向未跟随(followRedirect=false)");
+            Fail(drogon::ReqResult::BadResponse, m_statusCode,
+                 std::to_string(m_statusCode) + " 重定向未跟随(followRedirect=false)");
             return;
         }
-        string nextUrl = ResolveRedirectUrl(url_, respLocation_);
+        string nextUrl = ResolveRedirectUrl(m_url, m_respLocation);
         ZmDownloadTarget next = nextUrl.empty() ? ZmDownloadTarget() : ParseDownloadUrl(nextUrl);
         if (!next.ok)
         {
-            Fail(drogon::ReqResult::BadResponse, statusCode_, "重定向 Location 缺失或非法");
+            Fail(drogon::ReqResult::BadResponse, m_statusCode, "重定向 Location 缺失或非法");
             return;
         }
         const auto& def = ZmHttpClient::GetOptions();
         int maxRed = def.maxRedirects > 0 ? def.maxRedirects : 5;
-        if (redirectsUsed_ >= maxRed)
+        if (m_redirectsUsed >= maxRed)
         {
-            Fail(drogon::ReqResult::BadResponse, statusCode_, "重定向次数超限");
+            Fail(drogon::ReqResult::BadResponse, m_statusCode, "重定向次数超限");
             return;
         }
-        ++redirectsUsed_;
-        if (next.ssl != tgt_.ssl || next.host != tgt_.host || next.port != tgt_.port)
-            stripSensitive_ = true;  // 跨目标:此后不再外发 Authorization/Cookie
-        tgt_ = next;
-        url_ = nextUrl;
+        ++m_redirectsUsed;
+        if (next.ssl != m_tgt.ssl || next.host != m_tgt.host || next.port != m_tgt.port)
+            m_stripSensitive = true;  // 跨目标:此后不再外发 Authorization/Cookie
+        m_tgt = next;
+        m_url = nextUrl;
         ResetResponseState();
-        if (client_)
-            client_->disconnect();  // 旧连接回调被 epoch 守卫忽略
-        conn_.reset();
+        if (m_client)
+            m_client->disconnect();  // 旧连接回调被 epoch 守卫忽略
+        m_conn.reset();
         BeginConnect();
     }
 
+/// body 处理:chunked 严格解析,或按 Content-Length 聚合到分块粒度入队
     void HandleBodyData(const char* data, size_t len)
     {
-        if (len == 0 || finished_.load())
+        if (len == 0 || m_finished.load())
             return;
-        if (chunked_)
+        if (m_chunked)
         {
-            // 严格 chunked:size 行全 hex(§15.3);数据切块入队;0 终结
-            pendingBuf_.append(data, len);
+            // 严格 chunked:size 行全 hex,数据块后必须 CRLF;数据切块入队;0 终结
+            m_pendingBuf.append(data, len);
             for (;;)
             {
-                if (chunkPendingSize_ == UINT64_MAX)
+                if (m_chunkPendingSize == UINT64_MAX)
                 {
-                    size_t lineEnd = pendingBuf_.find("\r\n");
+                    size_t lineEnd = m_pendingBuf.find("\r\n");
                     if (lineEnd == string::npos)
                     {
-                        if (pendingBuf_.size() > 128)
-                            Fail(drogon::ReqResult::BadResponse, statusCode_, "chunk size 行畸形");
+                        if (m_pendingBuf.size() > 128)
+                            Fail(drogon::ReqResult::BadResponse, m_statusCode, "chunk size 行畸形");
                         return;
                     }
-                    string sizeLine = pendingBuf_.substr(0, lineEnd);
+                    string sizeLine = m_pendingBuf.substr(0, lineEnd);
                     size_t semi = sizeLine.find(';');
                     if (semi != string::npos)
                         sizeLine = sizeLine.substr(0, semi);  // 去扩展
                     if (sizeLine.empty())
                     {
-                        Fail(drogon::ReqResult::BadResponse, statusCode_, "chunk size 为空");
+                        Fail(drogon::ReqResult::BadResponse, m_statusCode, "chunk size 为空");
                         return;
                     }
                     for (char c : sizeLine)
                     {
                         if (!isdigit((unsigned char)c) && !isxdigit((unsigned char)c))
                         {
-                            Fail(drogon::ReqResult::BadResponse, statusCode_, "chunk size 非 hex");
+                            Fail(drogon::ReqResult::BadResponse, m_statusCode, "chunk size 非 hex");
                             return;
                         }
                     }
                     uint64_t sz = strtoull(sizeLine.c_str(), nullptr, 16);
-                    if (sz > qCap_)
+                    if (sz > m_qCap)
                     {
-                        Fail(drogon::ReqResult::BadResponse, statusCode_, "chunk 超过队列上限");
+                        Fail(drogon::ReqResult::BadResponse, m_statusCode, "chunk 超过队列上限");
                         return;
                     }
-                    chunkPendingSize_ = sz;
-                    pendingBuf_.erase(0, lineEnd + 2);
+                    m_chunkPendingSize = sz;
+                    m_pendingBuf.erase(0, lineEnd + 2);
                 }
-                if (chunkPendingSize_ == 0)
+                if (m_chunkPendingSize == 0)
                 {
-                    pendingBuf_.clear();  // 忽略 trailer
-                    chunkTerminated_ = true;
+                    m_pendingBuf.clear();  // 忽略 trailer
+                    m_chunkTerminated = true;
                     return;
                 }
-                if (pendingBuf_.size() < (size_t)chunkPendingSize_ + 2)
+                if (m_pendingBuf.size() < (size_t)m_chunkPendingSize + 2)
                     return;  // 等 CRLF+数据
-                if (pendingBuf_[(size_t)chunkPendingSize_] != '\r' ||
-                    pendingBuf_[(size_t)chunkPendingSize_ + 1] != '\n')
+                if (m_pendingBuf[(size_t)m_chunkPendingSize] != '\r' ||
+                    m_pendingBuf[(size_t)m_chunkPendingSize + 1] != '\n')
                 {
-                    Fail(drogon::ReqResult::BadResponse, statusCode_, "chunk 数据块后无 CRLF");
+                    Fail(drogon::ReqResult::BadResponse, m_statusCode, "chunk 数据块后无 CRLF");
                     return;
                 }
                 {
-                    size_t remain = (size_t)chunkPendingSize_;
+                    size_t remain = (size_t)m_chunkPendingSize;
                     size_t off = 0;
                     while (remain > 0)
                     {
-                        size_t n = std::min(remain, chunkBytes_);
-                        if (!EnqueueWrite(pendingBuf_.data() + off, n))
+                        size_t n = std::min(remain, m_chunkBytes);
+                        if (!EnqueueWrite(m_pendingBuf.data() + off, n))
                             return;
-                        if (finished_.load())
+                        if (m_finished.load())
                             return;
                         off += n;
                         remain -= n;
                     }
-                    recvBody_ += (size_t)chunkPendingSize_;
+                    m_recvBody += (size_t)m_chunkPendingSize;
                 }
-                pendingBuf_.erase(0, (size_t)chunkPendingSize_ + 2);  // + CRLF
-                chunkPendingSize_ = UINT64_MAX;
+                m_pendingBuf.erase(0, (size_t)m_chunkPendingSize + 2);  // + CRLF
+                m_chunkPendingSize = UINT64_MAX;
             }
         }
         else
         {
-            recvBody_ += len;
-            if (hasContentLength_ && recvBody_ > contentLength_)
+            m_recvBody += len;
+            if (m_hasContentLength && m_recvBody > m_contentLength)
             {
-                Fail(drogon::ReqResult::BadResponse, statusCode_, "响应体超出 Content-Length");
+                Fail(drogon::ReqResult::BadResponse, m_statusCode, "响应体超出 Content-Length");
                 return;
             }
             // 块粒度聚合入队
-            pendingBuf_.append(data, len);
-            while (pendingBuf_.size() >= chunkBytes_)
+            m_pendingBuf.append(data, len);
+            while (m_pendingBuf.size() >= m_chunkBytes)
             {
-                if (!EnqueueWrite(pendingBuf_.data(), chunkBytes_))
+                if (!EnqueueWrite(m_pendingBuf.data(), m_chunkBytes))
                     return;
-                if (finished_.load())
+                if (m_finished.load())
                     return;
-                pendingBuf_.erase(0, chunkBytes_);
+                m_pendingBuf.erase(0, m_chunkBytes);
             }
         }
     }
 
+/// 完成判定:chunked 终结标记或收满 Content-Length → Complete()
     void CheckComplete()
     {
-        if (finished_.load())
+        if (m_finished.load())
             return;
-        if (chunked_)
+        if (m_chunked)
         {
-            if (chunkTerminated_)
+            if (m_chunkTerminated)
                 Complete();
         }
-        else if (hasContentLength_)
+        else if (m_hasContentLength)
         {
-            if (recvBody_ >= contentLength_)
+            if (m_recvBody >= m_contentLength)
                 Complete();
         }
         // 无 CL:等连接关闭定界(Connection: close 已声明)
     }
 
+/// 正常收尾:残余字节入队 → 断开 → 入队 FINISH(游标即最终大小)
     void Complete()
     {
-        if (finished_.load())
+        if (m_finished.load())
             return;
-        // 收尾:残余未达块粒度的字节先入队(杜绝"残余未落盘")。
-        // ⚠ 必须在置位 finished_ 之前入队——终态门会拒绝非终结指令。
-        if (!pendingBuf_.empty())
+        // 收尾:残余未达块粒度的字节先入队(杜绝"残余未落盘").
+        // ⚠ 必须在置位 m_finished 之前入队--终态门会拒绝非终结指令.
+        if (!m_pendingBuf.empty())
         {
-            cursor_ += pendingBuf_.size();  // 残余计入游标(result.written 准确性)
+            m_cursor += m_pendingBuf.size();  // 残余计入游标(result.written 准确性)
             ZmDlAction w;
             w.kind = ZmDlAction::Kind::Write;
-            w.data = std::move(pendingBuf_);
-            pendingBuf_.clear();
+            w.data = std::move(m_pendingBuf);
+            m_pendingBuf.clear();
             EnqueueAction(std::move(w), true);
         }
-        if (finished_.exchange(true))
+        if (m_finished.exchange(true))
             return;
-        if (client_)
-            client_->disconnect();
+        if (m_client)
+            m_client->disconnect();
         ZmDlAction fin;
         fin.kind = ZmDlAction::Kind::Finish;
-        fin.number = cursor_;
+        fin.number = m_cursor;
         EnqueueAction(std::move(fin), true);
     }
 
+/// 终态失败:记日志 → 断连 → 回填原因并解除写阻塞 → 入队 ABORT(保留 .part/.meta)
+/// @param err    网络层错误分类
+/// @param status HTTP 状态码(0 = 无响应)
+/// @param why    失败原因(回执给调用方)
     void Fail(drogon::ReqResult err, int status, const string& why)
     {
-        if (finished_.exchange(true))
+        if (m_finished.exchange(true))
             return;
         PUBLIC_LOG_WARN("ZmHttpClient 下载失败(err={},status={},url={},why={})", (int)err, status,
-                        url_, why);
-        if (client_)
-            client_->disconnect();
-        // 回填须早于解除写阻塞:被 CancelIoEx 唤醒的写线程会立刻读 failWhy_ 回执,
-        // 晚于取消就只剩"下载中止"。赋值放进锁内,读取方(写线程)也在同一把锁上取
+                        m_url, why);
+        if (m_client)
+            m_client->disconnect();
+        // 回填须早于解除写阻塞:被 CancelIoEx 唤醒的写线程会立刻读 m_failWhy 回执,
+        // 晚于取消就只剩"下载中止".赋值放进锁内,读取方(写线程)也在同一把锁上取
         {
-            std::lock_guard lk(qMtx_);
-            failStatus_ = status;
-            failWhy_ = why;
+            std::lock_guard lk(m_qMtx);
+            m_failStatus = status;
+            m_failWhy = why;
         }
         CancelPendingFileIo();  // 解除写线程慢盘阻塞(否则 ABORT 永不执行)
         ZmDlAction ab;
@@ -1169,30 +1217,31 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
         EnqueueAction(std::move(ab), true);
     }
 
-    // —— 指令入队(dlLoop 专用) ——
-    // force=true:绕过队列上限;Abort/Finish 恒绕过 finished_ 终态门(Fail/Complete 刚置位)。
-    // writerStop_(通道关闭)期间一切入队被拒,写线程以"通道关闭"回执。
+    // -- 指令入队(dlLoop 专用) --
+    // force=true:绕过队列上限;Abort/Finish 恒绕过 m_finished 终态门(Fail/Complete 刚置位).
+    // m_writerStop(通道关闭)期间一切入队被拒,写线程以"通道关闭"回执.
     bool EnqueueAction(ZmDlAction&& a, bool force)
     {
         size_t sz = a.data.size();
         {
-            std::lock_guard lk(qMtx_);
-            if (writerStop_)
+            std::lock_guard lk(m_qMtx);
+            if (m_writerStop)
                 return false;
             const bool terminal = (a.kind == ZmDlAction::Kind::Abort ||
                                    a.kind == ZmDlAction::Kind::Finish);
-            if (finished_.load() && !terminal)
+            if (m_finished.load() && !terminal)
                 return false;
-            if (!force && !terminal && qBytes_ + sz > qCap_)
+            if (!force && !terminal && m_qBytes + sz > m_qCap)
                 return false;
-            qBytes_ += sz;
-            q_.push_back(std::move(a));
+            m_qBytes += sz;
+            m_q.push_back(std::move(a));
         }
-        qCv_.notify_one();
-        lastActivityMs_ = NowMs();
+        m_qCv.notify_one();
+        m_lastActivityMs = NowMs();
         return true;
     }
 
+/// @return true 已入队(游标随之推进);false 队列触顶(已按积压超限终结)
     bool EnqueueWrite(const char* data, size_t n)
     {
         ZmDlAction a;
@@ -1200,14 +1249,15 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
         a.data.assign(data, n);
         if (!EnqueueAction(std::move(a), false))
         {
-            if (!finished_.load())
+            if (!m_finished.load())
                 Fail(drogon::ReqResult::NetworkFailure, 0, "写侧积压超限");
             return false;
         }
-        cursor_ += n;
+        m_cursor += n;
         return true;
     }
 
+/// @return true 已入队截断指令
     bool EnqueueTruncate()
     {
         ZmDlAction a;
@@ -1215,22 +1265,23 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
         return EnqueueAction(std::move(a), true);
     }
 
-    /// 侧车一次写:仅 {etag,lastModified},无 offset(设计 §15.1)
+    /// 侧车一次写:仅 {etag,lastModified},无 offset
     void EnqueueWriteMeta()
     {
         ZMJSON j;
-        j["etag"] = respEtag_;
-        j["lastModified"] = respLm_;
+        j["etag"] = m_respEtag;
+        j["lastModified"] = m_respLm;
         ZmDlAction a;
         a.kind = ZmDlAction::Kind::WriteMeta;
         a.data = j.dump();
         EnqueueAction(std::move(a), true);
     }
 
+/// 读 .part.meta 取 If-Range 校验值(缺失/损坏按无处理,仅退化为不做变更检测)
     void ReadSidecar()
     {
         // 路径 UTF-8 契约:窄串直接进 fstream 在中文路径下静默失败(丢失 If-Range 校验值)
-        std::ifstream f(ToW(destPath_ + ".part.meta").c_str(), std::ios::binary);
+        std::ifstream f(ToW(m_destPath + ".part.meta").c_str(), std::ios::binary);
         if (!f)
             return;
         string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -1239,9 +1290,9 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
         if (!err.empty())
             return;
         if (j.contains("etag") && j["etag"].is_string())
-            metaEtag_ = j["etag"].get<string>();
+            m_metaEtag = j["etag"].get<string>();
         if (j.contains("lastModified") && j["lastModified"].is_string())
-            metaLm_ = j["lastModified"].get<string>();
+            m_metaLm = j["lastModified"].get<string>();
     }
 
     // -------------------------------------------------- 写线程(唯一盘上执行者)
@@ -1251,21 +1302,21 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
         {
             ZmDlAction a;
             {
-                std::unique_lock lk(qMtx_);
-                qCv_.wait(lk, [&] { return writerStop_ || !q_.empty(); });
-                if (writerStop_)
+                std::unique_lock lk(m_qMtx);
+                m_qCv.wait(lk, [&] { return m_writerStop || !m_q.empty(); });
+                if (m_writerStop)
                     break;
-                qBytes_ -= q_.front().data.size();
-                a = std::move(q_.front());
-                q_.pop_front();
-                lastWriteMs_ = NowMs();  // 写线程存活证据(停滞看护据此判写侧无进展)
+                m_qBytes -= m_q.front().data.size();
+                a = std::move(m_q.front());
+                m_q.pop_front();
+                m_lastWriteMs = NowMs();  // 写线程存活证据(停滞看护据此判写侧无进展)
             }
             switch (a.kind)
             {
                 case ZmDlAction::Kind::Write:
                 {
                     DWORD written = 0;
-                    BOOL ok = WriteFile(file_, a.data.data(), (DWORD)a.data.size(), &written,
+                    BOOL ok = WriteFile(m_file, a.data.data(), (DWORD)a.data.size(), &written,
                                         nullptr);
                     if (!ok || written != a.data.size())
                     {
@@ -1276,9 +1327,9 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
                             bool stopping = false;
                             string why;
                             {
-                                std::lock_guard lk(qMtx_);
-                                stopping = writerStop_;  // 通道关闭取消的写
-                                why = failWhy_;          // Fail 已回填的中止原因
+                                std::lock_guard lk(m_qMtx);
+                                stopping = m_writerStop;  // 通道关闭取消的写
+                                why = m_failWhy;          // Fail 已回填的中止原因
                             }
                             if (stopping)
                                 WriterFail("通道关闭");
@@ -1295,7 +1346,7 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
                 {
                     LARGE_INTEGER zero;
                     zero.QuadPart = 0;
-                    if (!SetFilePointerEx(file_, zero, nullptr, FILE_BEGIN) || !SetEndOfFile(file_))
+                    if (!SetFilePointerEx(m_file, zero, nullptr, FILE_BEGIN) || !SetEndOfFile(m_file))
                     {
                         WriterFail("就地截断失败");
                         return;
@@ -1305,7 +1356,7 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
                 case ZmDlAction::Kind::WriteMeta:
                 {
                     // 侧车写失败不中断下载(仅丧失下次续传能力)
-                    std::wstring mp = ToW(destPath_ + ".part.meta");
+                    std::wstring mp = ToW(m_destPath + ".part.meta");
                     HANDLE mf = CreateFileW(mp.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
                     if (mf != INVALID_HANDLE_VALUE)
@@ -1317,7 +1368,7 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
                     else
                     {
                         PUBLIC_LOG_WARN("ZmHttpClient 下载侧车写入失败(续传能力丧失): {}",
-                                        destPath_ + ".part.meta");
+                                        m_destPath + ".part.meta");
                     }
                     break;
                 }
@@ -1328,17 +1379,17 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
                 }
                 case ZmDlAction::Kind::Abort:
                 {
-                    AbortPath(failWhy_.empty() ? "下载中止" : failWhy_);
+                    AbortPath(m_failWhy.empty() ? "下载中止": m_failWhy);
                     return;
                 }
             }
         }
-        // writerStop_ 退出:中止并回执(在飞数据丢弃,.part 保留)
+        // m_writerStop 退出:中止并回执(在飞数据丢弃,.part 保留)
         WriterFail("通道关闭");
     }
 
-    /// 终态收尾:摘除登记 → 回执。hold 保活至本函数退出(~session 若在此触发,
-    /// 析构自检会 detach 写线程自身,线程随后自然退出)。
+    /// 终态收尾:摘除登记 → 回执.hold 保活至本函数退出(~session 若在此触发,
+    /// 析构自检会 detach 写线程自身,线程随后自然退出).
     void Deliver(ZmHttpClient::ZmDownloadResult&& r)
     {
         std::shared_ptr<ZmDownloadSession> hold;
@@ -1351,93 +1402,96 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
                 s_sessions.erase(it);
             }
         }
-        if (done_)
+        if (m_done)
         {
-            ZmDoneFn d = std::move(done_);
-            done_ = nullptr;
+            ZmDoneFn d = std::move(m_done);
+            m_done = nullptr;
             d(std::move(r));  // 最后触碰外部;hold 保活至本函数退出
         }
     }
 
+/// 成功收尾:关句柄 → 改名覆盖目标 → 删侧车 → 回执(改名失败按错误回执并保留 .part)
     void FinishOk(uint64_t finalWritten)
     {
-        finished_.store(true);  // writer 侧终态先置位:dlLoop 侧 Fail 不再入队/取消(句柄随即将关)
+        m_finished.store(true);  // writer 侧终态先置位:dlLoop 侧 Fail 不再入队/取消(句柄随即将关)
         ClosePartFile();
         // 覆写目标:Windows 用 MoveFileExW(REPLACE;.part 与目标同目录保证同卷)
-        std::wstring part = ToW(destPath_ + ".part");
-        std::wstring dst = ToW(destPath_);
+        std::wstring part = ToW(m_destPath + ".part");
+        std::wstring dst = ToW(m_destPath);
         bool renamed = MoveFileExW(part.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
         // 不做"删目标重试"的退路:删成功而改名再失败,会同时丢掉用户既有文件与本次结果
         if (!renamed)
         {
-            PUBLIC_LOG_WARN("ZmHttpClient 下载改名失败(.part→目标),url={}", url_);
+            PUBLIC_LOG_WARN("ZmHttpClient 下载改名失败(.part→目标),url={}", m_url);
             ZmHttpClient::ZmDownloadResult r;
             r.ok = false;
-            r.status = statusCode_;
-            r.resumedFrom = resumedFrom_;
+            r.status = m_statusCode;
+            r.resumedFrom = m_resumedFrom;
             r.error = "最后改名失败(.part→目标)";
             Deliver(std::move(r));  // .part 保留
             return;
         }
-        DeleteFileW(ToW(destPath_ + ".part.meta").c_str());
+        DeleteFileW(ToW(m_destPath + ".part.meta").c_str());
         ZmHttpClient::ZmDownloadResult r;
         r.ok = true;
-        r.status = statusCode_;
+        r.status = m_statusCode;
         r.written = finalWritten;
-        r.resumedFrom = resumedFrom_;
+        r.resumedFrom = m_resumedFrom;
         Deliver(std::move(r));
     }
 
+/// 中止收尾:关句柄(保留 .part/.meta 供续传)→ 回执
     void AbortPath(const string& why)
     {
-        finished_.store(true);
-        ClosePartFile();  // abort 语义:保留 .part/.meta 供续传(设计 §15.2)
+        m_finished.store(true);
+        ClosePartFile();  // abort 语义:保留 .part/.meta 供续传
         ZmHttpClient::ZmDownloadResult r;
         r.ok = false;
-        r.status = failStatus_;
-        r.resumedFrom = resumedFrom_;
+        r.status = m_failStatus;
+        r.resumedFrom = m_resumedFrom;
         r.error = why;
         Deliver(std::move(r));
     }
 
+/// 写侧失败收尾:关句柄保留过程文件 → 回执
     void WriterFail(const string& why)
     {
-        finished_.store(true);
+        m_finished.store(true);
         ClosePartFile();  // 保留 .part/.meta
         ZmHttpClient::ZmDownloadResult r;
         r.ok = false;
-        r.status = statusCode_;
-        r.resumedFrom = resumedFrom_;
+        r.status = m_statusCode;
+        r.resumedFrom = m_resumedFrom;
         r.error = why;
         Deliver(std::move(r));
     }
 
-    /// 关闭 .part 句柄(写线程终态)。qMtx_ 与 CancelPendingFileIo 互斥,
-    /// 保证"读句柄→CancelIoEx"期间句柄不可能被并发关闭/复用。
+    /// 关闭 .part 句柄(写线程终态).m_qMtx 与 CancelPendingFileIo 互斥,
+    /// 保证"读句柄→CancelIoEx"期间句柄不可能被并发关闭/复用.
     void ClosePartFile()
     {
-        std::lock_guard lk(qMtx_);
-        if (file_ != INVALID_HANDLE_VALUE)
+        std::lock_guard lk(m_qMtx);
+        if (m_file != INVALID_HANDLE_VALUE)
         {
-            CloseHandle(file_);
-            file_ = INVALID_HANDLE_VALUE;
+            CloseHandle(m_file);
+            m_file = INVALID_HANDLE_VALUE;
         }
     }
 
-    /// 取消句柄上全部未决 I/O(含写线程阻塞中的同步 WriteFile)。
-    /// 持 qMtx_ 横跨取消调用:彻底封死"句柄已关/已被复用"竞态
-    /// (仅锁内取值或原子化 HANDLE 均不充分——读与取消之间句柄仍可被关)。
-    /// 写线程从不持 qMtx_ 阻塞在 WriteFile 上(出锁后执行动作),此处等待有界。
+    /// 取消句柄上全部未决 I/O(含写线程阻塞中的同步 WriteFile).
+    /// 持 m_qMtx 横跨取消调用:彻底封死"句柄已关/已被复用"竞态
+    /// (仅锁内取值或原子化 HANDLE 均不充分--读与取消之间句柄仍可被关).
+    /// 写线程从不持 m_qMtx 阻塞在 WriteFile 上(出锁后执行动作),此处等待有界.
     void CancelPendingFileIo()
     {
-        std::lock_guard lk(qMtx_);
-        if (file_ != INVALID_HANDLE_VALUE)
-            CancelIoEx(file_, nullptr);
+        std::lock_guard lk(m_qMtx);
+        if (m_file != INVALID_HANDLE_VALUE)
+            CancelIoEx(m_file, nullptr);
     }
 
     // Fail 的回执补充(入队 ABORT 后写线程读取;mutex 提供可见性)
-    int failStatus_ = 0;
-    string failWhy_;
+    int m_failStatus = 0;
+    string m_failWhy;
 };
 
 // ----------------------------------------------------------------------------
@@ -1476,10 +1530,59 @@ bool WaitSessionsDrained(int spinMax)
     return false;
 }
 
+/**
+ * @brief 受理一次下载:构造会话 → 登记 → 复查通道状态 → 投递首跳
+ *
+ * 在工作池线程执行(打开 .part,读侧车,起写线程都是磁盘操作);
+ * 会话级失败经 m_done 回执;通道已停时自行叫停,写线程醒来走失败路径.
+ */
+struct ZmAcceptDownload
+{
+    std::string m_url;                               ///< 下载源
+    std::string m_destPath;                          ///< 目标文件路径
+    ZmHttpClient::ZmHttpRequestOptionsPtr m_opts;    ///< 逐请求选项(可空 = 全默认)
+    ZmHttpDownloadChannel::DoneFn m_done;            ///< 终态回调(恰一次)
+    trantor::EventLoop* m_loop = nullptr;            ///< 下载通道 loop(受理时固化)
+
+    void operator()() const;
+};
+
+void ZmAcceptDownload::operator()() const
+{
+    string localErr;
+    auto session = ZmDownloadSession::Create(m_url, m_destPath, m_opts, m_done, m_loop, localErr);
+    if (!session)
+    {
+        if (m_done)
+        {
+            ZmHttpClient::ZmDownloadResult r;
+            r.ok = false;
+            r.error = localErr.empty() ? "下载未受理": localErr;
+            m_done(std::move(r));
+        }
+        return;
+    }
+    {
+        std::lock_guard lk(s_sessMtx);
+        s_sessions.insert(session);
+    }
+    // 受理后通道已停(与 Shutdown 的竞态窗口):自行叫停,写线程醒来走失败路径
+    {
+        std::lock_guard lock(s_dlMtx);
+        if (!s_dlRunning)
+        {
+            session->RequestShutdown();
+            return;
+        }
+        // 入队须与 s_dlRunning 检查同锁域:出锁后 Shutdown 可能已把 loop 连同线程销毁
+        m_loop->runInLoop([session]() { session->StartOnLoop(); });
+    }
+}
+
 }  // namespace
 
 // ============================================================================
-// 通道静态(设计二期 §15.4;Start/Shutdown 幂等)
+// 通道静态(Start/Shutdown 幂等)
 // ============================================================================
 
 bool ZmHttpDownloadChannel::Start()
@@ -1554,38 +1657,9 @@ bool ZmHttpDownloadChannel::StartDownload(const std::string& url, const std::str
         loop = s_dlLoop;
     }
     // 打开 .part/读侧车/起写线程都是磁盘操作:提交客户端工作池执行,不占调用方线程
-    // (调用方通常是服务器事件循环线程)。受理结果同步返回;会话级失败经 done 回执。
-    auto optsHold = std::move(opts);
-    bool submitted = ZmHttpClient::SubmitBlockingTask([=]() {
-        string localErr;
-        auto session = ZmDownloadSession::Create(url, destPath, optsHold, done, loop, localErr);
-        if (!session)
-        {
-            if (done)
-            {
-                ZmHttpClient::ZmDownloadResult r;
-                r.ok = false;
-                r.error = localErr.empty() ? "下载未受理" : localErr;
-                done(std::move(r));
-            }
-            return;
-        }
-        {
-            std::lock_guard lk(s_sessMtx);
-            s_sessions.insert(session);
-        }
-        // 受理后通道已停(与 Shutdown 的竞态窗口):自行叫停,写线程醒来走失败路径
-        {
-            std::lock_guard lock(s_dlMtx);
-            if (!s_dlRunning)
-            {
-                session->RequestShutdown();
-                return;
-            }
-            // 入队须与 s_dlRunning 检查同锁域:出锁后 Shutdown 可能已把 loop 连同线程销毁
-            loop->runInLoop([session]() { session->StartOnLoop(); });
-        }
-    });
+    // (调用方通常是服务器事件循环线程).受理结果同步返回;会话级失败经 done 回执.
+    ZmAcceptDownload accept{url, destPath, std::move(opts), std::move(done), loop};
+    bool submitted = ZmHttpClient::SubmitBlockingTask(accept);
     if (!submitted && err)
         *err = "下载通道未运行(工作池已停)";
     return submitted;
@@ -1607,33 +1681,35 @@ class ZmDownloadAwaiter
 {
   public:
     ZmDownloadAwaiter(string url, string destPath, ZmHttpClient::ZmHttpRequestOptionsPtr opts)
-        : ctx_(std::make_shared<ZmDownloadCtx>()),
-          resumeLoop_(opts ? opts->resumeLoop : nullptr)
+       : m_ctx(std::make_shared<ZmDownloadCtx>()),
+          m_resumeLoop(opts ? opts->resumeLoop: nullptr)
     {
-        ctx_->url = std::move(url);
-        ctx_->destPath = std::move(destPath);
-        ctx_->opts = std::move(opts);
+        m_ctx->url = std::move(url);
+        m_ctx->destPath = std::move(destPath);
+        m_ctx->opts = std::move(opts);
     }
 
+/// @return true 不挂起(未初始化/通道未启用,直接给错误结果)
     bool await_ready() noexcept
     {
         if (!ZmHttpClient::IsReady())
         {
-            ctx_->result.error = "ZmHttpClient 未初始化";
+            m_ctx->result.error = "ZmHttpClient 未初始化";
             return true;
         }
         if (!ZmHttpDownloadChannel::IsRunning())
         {
-            ctx_->result.error = "下载通道未启用(Options.enableDownload)";
+            m_ctx->result.error = "下载通道未启用(Options.enableDownload)";
             return true;
         }
         return false;
     }
 
+/// 提交下载;未受理则同步收尾(resume 为该语句块最后一步)
     void await_suspend(std::coroutine_handle<> h)
     {
-        resumeH_ = h;
-        auto ctx = ctx_;
+        m_resumeH = h;
+        auto ctx = m_ctx;
         string err;
         bool accepted = ZmHttpDownloadChannel::StartDownload(
             ctx->url, ctx->destPath, ctx->opts,
@@ -1652,27 +1728,29 @@ class ZmDownloadAwaiter
         }
     }
 
+/// @return 下载结果
     ZmHttpClient::ZmDownloadResult await_resume()
     {
-        return std::move(ctx_->result);
+        return std::move(m_ctx->result);
     }
 
   private:
+    /// 恰一次唤醒协程(经 resumeLoop 回环);resume 为最后一步,之后不得触碰本桥成员
     void Deliver(const std::shared_ptr<ZmDownloadCtx>& ctx)
     {
         if (ctx->delivered)
             return;
         ctx->delivered = true;
         // resume 为该语句块最后一步(不得在 resume 后触碰本桥成员)
-        if (resumeLoop_ && !resumeLoop_->isInLoopThread())
-            resumeLoop_->queueInLoop([h = resumeH_]() { h.resume(); });
+        if (m_resumeLoop && !m_resumeLoop->isInLoopThread())
+            m_resumeLoop->queueInLoop([h = m_resumeH]() { h.resume(); });
         else
-            resumeH_.resume();
+            m_resumeH.resume();
     }
 
-    std::shared_ptr<ZmDownloadCtx> ctx_;   // 值对象唯一次元(堆;帧内仅指针对齐)
-    trantor::EventLoop* resumeLoop_ = nullptr;
-    std::coroutine_handle<> resumeH_{};
+    std::shared_ptr<ZmDownloadCtx> m_ctx;   // 值对象唯一次元(堆;帧内仅指针对齐)
+    trantor::EventLoop* m_resumeLoop = nullptr;
+    std::coroutine_handle<> m_resumeH{};
 };
 
 // ----------------------------------------------------------------------------

@@ -20,21 +20,21 @@
  * 设计：ZiMoService docs/designs/2026-08-30-drogon-httpserver-base-design.md
  */
 
-#include <drogon/HttpAppFramework.h>
-#include <drogon/HttpRequest.h>
-#include <drogon/HttpResponse.h>
-#include <drogon/HttpTypes.h>
-#include <drogon/RequestStream.h>
-#include <drogon/RateLimiter.h>
-#include <drogon/utils/FunctionTraits.h>
-#include <drogon/utils/coroutine.h>
-#include <drogon/WebSocketConnection.h>
+#include "../util/zm_util_thread.h"
+#include "../util/zm_util_json.h"
+#include "../util/zm_util_logger.h"
 
-#include <trantor/net/EventLoop.h>
+#include <../drogon/include/drogon/HttpAppFramework.h>
+#include <../drogon/include/drogon/HttpRequest.h>
+#include <../drogon/include/drogon/HttpResponse.h>
+#include <../drogon/include/drogon/HttpTypes.h>
+#include <../drogon/include/drogon/RequestStream.h>
+#include <../drogon/include/drogon/RateLimiter.h>
+#include <../drogon/include/drogon/utils/FunctionTraits.h>
+#include <../drogon/include/drogon/utils/coroutine.h>
+#include <../drogon/include/drogon/WebSocketConnection.h>
 
-#include <zm_util_thread.h>
-#include <zm_util_json.h>
-#include <zm_util_logger.h>
+#include <../drogon/include/trantor/net/EventLoop.h>
 
 #include <atomic>
 #include <cstdint>

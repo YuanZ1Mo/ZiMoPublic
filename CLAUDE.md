@@ -68,6 +68,10 @@ uint16_t GetPort() const;
 * 协议字段、魔法数的取值来由要写（如 `ctx.status == 2` 表示账号停用）；
 * 自明行不加；不要在体内重复函数 `@brief` 的内容。
 
+### 1.5 标点符号规范
+
+注释使用半角标点符号
+
 ---
 
 ## 2. 不留历史痕迹
@@ -203,13 +207,21 @@ RegisterPreRouting([this](const HttpRequestPtr& req, AdviceCallback&& cb,
 
 ## 8. 头文件包含规范
 
-同一文件内的 include 顺序，优先级由上到下：
+公共库(ZiMoPublic)的同一文件内的 include 顺序，优先级由上到下：
 
 1. 尽量使用前向声明
-2. 对应的头文件（foo.cpp → foo.h）
-3. 本项目其他头文件
-4. 第三方库头文件
-5. 标准库头文件
+2. 对应的头文件, 使用""号（foo.cpp → include "foo.h"）
+3. 本项目其他头文件, 使用相对目录和""号(include "../util/util_logger.h")
+4. 第三方库头文件, 使用相对目录和<>号(include <../spdlog/spdlog.h>)
+5. 标准库头文件, 使用<>号(include <iostream>)
+
+工程(ZiMoService)的同一文件内的 include 顺序，优先级由上到下：
+
+1. 尽量使用前向声明
+2. 对应的头文件, 使用""号（foo.cpp → include "foo.h"）
+3. 本项目其他头文件, 使用相对目录和""号(include "../modules/module_db.h")
+4. 公共库头文件, 使用""号(include "util_logger.h")
+5. 标准库头文件, 使用<>号(include <iostream>)
 
 ---
 

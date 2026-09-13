@@ -9,34 +9,37 @@
  *  - 生命周期为**进程级静态**状态机(Uninit→Initialized→Closed):
  *      ZmHttpClient::Init(opts)  一次性注入全局参数并创建客户端双 lane
  *      ZmHttpClient::Close()     全局唯一关闭(三步序:先下载通道后普通 lane);幂等;Closed 为终态
- *    与服务器 ZmHttpServer 完全解耦:服务器未 Open/已 Close 均不影响客户端可用性。
+ *    与服务器 ZmHttpServer 完全解耦:服务器未 Open/已 Close 均不影响客户端可用性.
  *  - 普通请求(HTTP/HTTPS)经 drogon HttpClient + per-target 连接池(HttpClient-Loop,Lane A);
- *    大文件下载走 trantor TcpClient 自研直写盘通道(HttpClient-DL,Lane B,见设计 §10)。
- *  - 三种调用形态:协程(推荐)/异步回调/同步(仅业务线程);统一返回 ZmHttpResult,
- *    业务不接触 drogon 请求类型(仅结果泊接 HttpResponsePtr)。
- *  - TLS 参数为 client 级创建时固化,仅 Options 可配,**无逐请求覆盖**(设计 §8)。
+ *    大文件下载走 trantor TcpClient 自研通道(HttpClient-DL,Lane B).
+ *  - 三种调用形态:协程(推荐)/异步回调/同步(仅业务线程);统一返回 ZmHttpResult,业务不接触 drogon 请求类型(仅结果泊接 HttpResponsePtr).
+ *  - TLS 参数为 client 级创建时固化,仅 Options 可配,**无逐请求覆盖**.
  *
  * 设计:ZiMoService docs/designs/2026-09-01-drogon-httpclient-design.md
  */
 
-#include <drogon/HttpTypes.h>
-#include <drogon/HttpRequest.h>
-#include <drogon/HttpResponse.h>
-#include <drogon/HttpClient.h>
-#include <drogon/utils/coroutine.h>
+#include "../util/zm_util_json.h"
+#include "../util/zm_util_thread.h"
 
-#include <trantor/net/EventLoop.h>
-
-#include <zm_util_json.h>
-#include <zm_util_thread.h>
+#include <../drogon/include/drogon/HttpTypes.h>
+#include <../drogon/include/drogon/HttpRequest.h>
+#include <../drogon/include/drogon/HttpResponse.h>
+#include <../drogon/include/drogon/HttpClient.h>
+#include <../drogon/include/drogon/utils/coroutine.h>
 
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <string>
 
+// 本文件只用 EventLoop 的指针(形参与成员),前向声明即可
+namespace trantor
+{
+class EventLoop;
+}
+
 // ----------------------------------------------------------------------------
-// 公共类型(设计 §5)
+// 公共类型
 // ----------------------------------------------------------------------------
 
 /// 单次请求运行时选项(每请求覆盖全局默认)
@@ -77,7 +80,7 @@ struct ZmHttpResult
 class ZmHttpClient
 {
 public:
-    // ── 全局运行参数(client 级创建时固化;TLS 唯一开关,无逐请求覆盖;设计 §5/§8) ──
+    // ── 全局运行参数(client 级创建时固化;TLS 唯一开关,无逐请求覆盖) ──
     struct Options
     {
         size_t normalLoopThreads = 1;   ///< 普通请求 lane 事件循环线程数(1..8;>1 时按 target 哈希绑定 loop)
@@ -93,13 +96,13 @@ public:
         bool   autoRedirect = true;     ///< 跟随重定向
         int    maxRedirects = 5;
         bool   validateCert = true;     ///< 全局 TLS 校验(**唯一开关**,client 级固化无逐请求覆盖;应急关闭须日志告警)
-        std::string trustCA;            ///< 追加信任根 PEM(内网自签);实现路径见设计 §8;空 = 系统信任
+        std::string trustCA;            ///< 追加信任根 PEM(内网自签);空 = 系统信任
         std::string clientCert, clientKey;  ///< mTLS 客户端证书(可选;普通 lane 经 setCertPath,下载通道经 TLSPolicy)
         std::string userAgent = "ZiMoClient/1.0";
         std::map<std::string, std::string> commonHeaders;  ///< 全量附加头(日志脱敏字段豁免)
-        size_t maxBodyBytes = 100ULL * 1024 * 1024;  ///< 普通请求整包缓冲护栏(100MB 默认;**业务护栏**非内存保护,设计 §12)
+        size_t maxBodyBytes = 100ULL * 1024 * 1024;  ///< 普通请求整包缓冲护栏(100MB 默认;**业务护栏**非内存保护)
         bool   outboundAccessLog = true;   ///< 出站访问日志开关
-        // —— 流式下载通道 ——
+        // -- 流式下载通道 --
         bool   enableDownload = true;      ///< 是否创建下载通道
         size_t downloadChunkBytes = 1 * 1024 * 1024;  ///< 读回调单次写盘分块
         size_t downloadStallAbortMs = 120 * 1000;     ///< 读侧停滞放弃(无收包且写队列已空)
@@ -107,13 +110,13 @@ public:
     };
 
     // ── 静态生命周期(进程级一次;状态机 Uninit→Initialized→Closed,独立于 ZmHttpServer) ──
-    /// 一次性初始化:注入全局参数(校验 1..8 lane / 工作池非 0);只能调用一次。
-    /// Init 即创建客户端双 lane(普通请求池 loop;下载通道,见设计 §4.1)。
+    /// 一次性初始化:注入全局参数(校验 1..8 lane / 工作池非 0);只能调用一次.
+    /// Init 即创建客户端双 lane(普通请求池 loop;下载通道).
     static bool Init(const Options& opts);
     /// 已初始化且未 Close
     static bool IsReady();
-    /// 全局唯一关闭(三步序:①下载通道 ②普通 lane ③置 Closed);幂等;终态。
-    /// 严禁在任一已登记 loop 线程内调用(自锁)。
+    /// 全局唯一关闭(三步序:①下载通道 ②普通 lane ③置 Closed);幂等;终态.
+    /// 严禁在任一已登记 loop 线程内调用(自锁).
     static void Close();
 
     // ── 协程(推荐;resume 线程默认 = 客户端 lane loop,可经 opts.resumeLoop 回环) ──
@@ -126,17 +129,17 @@ public:
     static drogon::Task<ZmHttpResult> PostFormCoro(const std::string& url,
         const std::map<std::string, std::string>& fields, const ZmHttpRequestOptions& opts = {});
     static drogon::Task<ZmHttpResult> UploadCoro(const std::string& url,
-        const std::string& filePath, const std::string& field, const ZmHttpRequestOptions& opts = {});  // multipart 手拼(设计 §9)
+        const std::string& filePath, const std::string& field, const ZmHttpRequestOptions& opts = {});  // multipart 手拼
 
     // ── 回调(异步兼容) ──
     static void SendAsync(drogon::HttpMethod m, const std::string& url, const ZMJSON& body,
         std::function<void(ZmHttpResult)> cb, const ZmHttpRequestOptions& opts = {});
 
-    // ── 同步(仅限业务线程/客户端自持工作池;所有已登记 loop 线程一律拒绝,设计 §12) ──
+    // ── 同步(仅限业务线程/客户端自持工作池;所有已登记 loop 线程一律拒绝) ──
     static ZmHttpResult SendSync(drogon::HttpMethod m, const std::string& url,
         const ZMJSON& body = {}, const ZmHttpRequestOptions& opts = {});
 
-    // ── 流式下载(本期;大文件边收边落盘,Range 续传走 .part/.meta,设计 §10) ──
+    // ── 流式下载(大文件边收边落盘,Range 续传走 .part/.meta) ──
     struct ZmDownloadResult
     {
         bool ok = false;          ///< 是否整体成功
@@ -146,13 +149,13 @@ public:
         std::string error;        ///< 失败原因(ok=false 时)
     };
     static drogon::Task<ZmDownloadResult> DownloadCoro(const std::string& url,
-        const std::string& destPath, const ZmHttpRequestOptions& opts = {});  // 断点续传:起点恒 = .part 现有大小,If-Range 校验,不符回退 0(设计二期 §15.1)
+        const std::string& destPath, const ZmHttpRequestOptions& opts = {});  // 断点续传:起点恒 =.part 现有大小,If-Range 校验,不符回退 0
 
     // ── 内部:编排实现(唯一实现;公共形态一律薄壳转发,避免 Task 层数膨胀) ──
-    // 设计约束:编排不在协程帧内——重试/重定向/多尝试循环 = 堆上 ZmSendMachine 回调状态机
+    // 设计约束:编排不在协程帧内--重试/重定向/多尝试循环 = 堆上 ZmSendMachine 回调状态机
     // (见 .cpp 匿名字空间);协程侧仅 ZmMachineAwaiter 薄桥,帧内成员仅指针对齐
     // (shared_ptr<ZmMachineCtx>/EventLoop*/coroutine_handle),值对象全部堆化;
-    // opts 一律以 shared_ptr 飞行,且不得为空。
+    // opts 一律以 shared_ptr 飞行,且不得为空.
     using ZmHttpRequestOptionsPtr = std::shared_ptr<const ZmHttpRequestOptions>;
     static drogon::Task<ZmHttpResult> SendPayload(drogon::HttpMethod m,
                                                   const std::string& url, ZMJSON jsonBody,
@@ -164,8 +167,8 @@ public:
     static std::string DumpStats();   ///< per-target: 请求数/错误分类/字节/重试率
     static void ResetStats();
 
-    // ── loop 登记表(设计 §4.3/§12;SendSync 拒绝与 Close 自锁保护的地基) ──
-    /// 登记需要在 SendSync 被调用前完成(幂等);服务器各 loop 与客户端自身 lane loop 都应登记。
+    // ── loop 登记表(SendSync 拒绝与 Close 自锁保护的地基) ──
+    /// 登记需要在 SendSync 被调用前完成(幂等);服务器各 loop 与客户端自身 lane loop 都应登记.
     static void RegisterLoop(trantor::EventLoop* loop);
     static void UnregisterLoop(trantor::EventLoop* loop);
     /// 当前线程是否任一已登记 loop 线程
