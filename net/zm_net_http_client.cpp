@@ -17,14 +17,18 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <ctime>
 #include <fstream>
 #include <future>
+#include <iomanip>
 #include <memory>
 #include <mutex>
 #include <random>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -74,7 +78,10 @@ std::mutex s_poolMtx;
 std::unordered_map<string, std::shared_ptr<ZmPoolEntry>> s_pools;
 uint64_t s_poolCreateSeq = 0;
 trantor::EventLoopThreadPool* s_lanePool = nullptr;
-ZmThreadPool* s_workPool = nullptr;   // 客户端自持阻塞工作池(设计 §4.3;multipart 组装/上传读盘)
+// 客户端自持阻塞工作池(multipart 组装/上传读盘/下载通道的磁盘段)。
+// 原子指针:Close 置空与各提交点读取跨线程并发,普通指针是未同步读写。
+// 对象本身有意不析构,故读到旧的非空指针仍指向存活对象,仅"读到空"表示已停。
+std::atomic<ZmThreadPool*> s_workPool{nullptr};
 
 // 统计(设计 §11;第一版为全局计数,per-target 明细留 P5)
 std::atomic<uint64_t> s_statRequests{0};
@@ -324,7 +331,19 @@ bool IsIdempotentMethod(drogon::HttpMethod m)
     }
 }
 
-/// 退避毫秒:Retry-After(整秒,与 cap 取 min)优先;否则 base·2^n(+-jitter),封顶 cap
+/**
+ * @brief 计算下一次重试前的等待毫秒数
+ *
+ * Retry-After 优先(整秒或 HTTP-date 两种格式,与 capMs 取 min);
+ * 无该头或格式不可解析时用 base·2^n 加 ±jitter,封顶 capMs。
+ *
+ * @param resp       上一次响应(可空)
+ * @param retryIndex 已重试次数(0 起)
+ * @param baseMs     指数退避基数(毫秒)
+ * @param capMs      退避上限(毫秒)
+ * @param jitter     抖动幅度(0 = 不加抖动)
+ * @return 等待毫秒数
+ */
 double RetryDelayMs(const drogon::HttpResponsePtr& resp, int retryIndex,
                     double baseMs, double capMs, double jitter)
 {
@@ -337,6 +356,20 @@ double RetryDelayMs(const drogon::HttpResponsePtr& resp, int retryIndex,
             double v = std::strtod(ra.c_str(), &end);
             if (end != ra.c_str() && v > 0)
                 return std::min(v * 1000.0, capMs);
+            // HTTP-date 形态(RFC 7231 IMF-fixdate):"Sun, 06 Nov 1994 08:49:37 GMT"
+            std::tm tm{};
+            std::istringstream ss(ra);
+            ss >> std::get_time(&tm, "%a, %d %b %Y %H:%M:%S GMT");
+            if (!ss.fail())
+            {
+                time_t target = _mkgmtime(&tm);
+                if (target > 0)
+                {
+                    double ms = (double)(target - std::time(nullptr)) * 1000.0;
+                    if (ms > 0)
+                        return std::min(ms, capMs);
+                }
+            }
         }
     }
     double d = std::min(baseMs * (double)(1ULL << std::min(retryIndex, 30)), capMs);
@@ -420,13 +453,14 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
 
         if (prelude)
         {
-            if (!s_workPool)
+            ZmThreadPool* pool = s_workPool.load();  // 取一次即用,避免"查后再取"读两遍
+            if (!pool)
             {
                 FinishErr(drogon::ReqResult::NetworkFailure, 0);  // Close 竞态窄窗(工作池已停)
                 return;
             }
             auto self = shared_from_this();
-            s_workPool->Submit([self]() {
+            pool->Submit([self]() {
                 try
                 {
                     std::string err;
@@ -558,8 +592,9 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
         int status = attemptResult.status;
         bool netRetriable = (attemptResult.err == drogon::ReqResult::Timeout ||
                              attemptResult.err == drogon::ReqResult::NetworkFailure);
-        bool statusRetriable = (attemptResult.err == drogon::ReqResult::Ok && status >= 500 &&
-                                status <= 599);
+        // 5xx 与 429(限流)可重试;429 的 Retry-After 由 RetryDelayMs 优先尊重
+        bool statusRetriable = (attemptResult.err == drogon::ReqResult::Ok &&
+                                ((status >= 500 && status <= 599) || status == 429));
         bool methodRetriable = IsIdempotentMethod(curMethod) || opts->idempotent;
         bool handled = false;
 
@@ -1038,13 +1073,20 @@ string MakeMultipartBoundary(const string& fileData, const string& field, const 
     return "ZiMoFormBoundaryFailback";  // 理论不可达;兜底仍可写
 }
 
-/// multipart filename 转义(设计二期 §16.5):剔除控制字符,quoted-string 转义 " 与 \,
-/// 与服务端 MakeContentDisposition 同源姿势
-string EscapeMultipartFileName(const string& name)
+/**
+ * @brief quoted-string 转义:剔除控制字符,转义 " 与 \
+ *
+ * 表单字段名与文件名共用(与服务端 MakeContentDisposition 同源姿势);
+ * 不转义则字段名里的 CRLF 或引号能伪造出额外的 part 头。
+ *
+ * @param s 原值(UTF-8,非 ASCII 原样保留)
+ * @return 可安全放进 name="..."/filename="..." 的字符串
+ */
+string EscapeMultipartQuoted(const string& s)
 {
     string out;
-    out.reserve(name.size());
-    for (unsigned char c : name)
+    out.reserve(s.size());
+    for (unsigned char c : s)
     {
         if (c < 0x20 || c == 0x7F)
             continue;
@@ -1095,7 +1137,15 @@ bool LoadUploadFile(const string& filePath, size_t maxBytes, string& outData, st
     return true;
 }
 
-/// 单文件 multipart 组装(in-memory;文件名/扩展名推断 MIME)
+/**
+ * @brief 组装单文件 multipart body(内存内拼装;按文件扩展名推断 MIME)
+ *
+ * @param fileData 文件内容
+ * @param fileName 已转义的文件名(EscapeMultipartQuoted)
+ * @param field    已转义的表单字段名(EscapeMultipartQuoted)
+ * @param boundary 分隔串(须已校验与 body 无碰撞)
+ * @return multipart body 字节
+ */
 string AssembleMultipart(const string& fileData, const string& fileName, const string& field,
                          const string& boundary)
 {
@@ -1205,7 +1255,10 @@ bool ZmHttpClient::Init(const Options& opts)
         if (!lp)
         {
             PUBLIC_LOG_ERROR("ZmHttpClient::Init 事件循环池启动超时");
-            // 失败回滚(设计二期 §16.4):拒绝"假 Initialized"砖化,允许重新 Init
+            // 失败回滚:拒绝"假 Initialized"砖化,允许重新 Init。
+            // 已登记的 loop 随池销毁即成悬空指针,必须先出表(否则 IsLoopThread 解引用悬空)
+            for (auto* registered : s_lanePool->getLoops())
+                UnregisterLoop(registered);
             delete s_lanePool;
             s_lanePool = nullptr;
             std::lock_guard lock(s_stateMtx);
@@ -1256,7 +1309,7 @@ void ZmHttpClient::Close()
         std::lock_guard lock(s_poolMtx);
         s_pools.clear();  // 在飞请求按取消语义终止(回调随 loop 退出丢弃,进程退出兜底)
     }
-    if (s_workPool)
+    if (s_workPool.load())
     {
         // s_workPool 有意不 delete(设计二期 §16.2):析构会丢弃未执行任务并使在飞
         // Submit 构成 UAF;进程级终态对象随进程回收,指针置空令后续 Submit 走拒绝路径
@@ -1285,14 +1338,15 @@ void ZmHttpClient::Close()
 //   协程帧不持有任何复杂值对象(设计约束,见状态机节)。
 // ----------------------------------------------------------------------------
 
-/// 编排核心(设计 §7):薄壳——把入参移交状态机;帧内仅 POD 与 shared_ptr。
-/// opts 以 shared_ptr 飞行(帧内仅指针计数拷贝;见头文件注)
+/// 编排核心:薄壳——把入参移交状态机;帧内仅 POD 与 shared_ptr。
+/// opts 以 shared_ptr 飞行(帧内仅指针计数拷贝;见头文件注),调用方不得传空
 drogon::Task<ZmHttpResult> ZmHttpClient::SendPayload(drogon::HttpMethod m,
                                                      const std::string& url, ZMJSON jsonBody,
                                                      const string* rawBody,
                                                      const string& rawContentType,
                                                      ZmHttpRequestOptionsPtr opts)
 {
+    assert(opts);  // 状态机全程按非空解引用;三种公开形态均以 make_shared 构造,空指针属调用错误
     co_return co_await ZmMachineAwaiter(
         m, url, std::move(jsonBody), rawBody ? *rawBody : string(), rawContentType,
         rawBody != nullptr, std::move(opts));
@@ -1346,8 +1400,11 @@ drogon::Task<ZmHttpResult> ZmHttpClient::UploadCoro(const std::string& url,
         if (!LoadUploadFile(filePath, effMax, fileData, errMsg))
             return false;
         string fileName = filePath.substr(filePath.find_last_of("/\\") + 1);
-        string boundary = MakeMultipartBoundary(fileData, field, fileName);
-        mach.curRaw = AssembleMultipart(fileData, EscapeMultipartFileName(fileName), field, boundary);
+        // 先转义再查碰撞:boundary 校验必须针对最终上线的字节
+        string fieldEsc = EscapeMultipartQuoted(field);
+        string fileEsc = EscapeMultipartQuoted(fileName);
+        string boundary = MakeMultipartBoundary(fileData, fieldEsc, fileEsc);
+        mach.curRaw = AssembleMultipart(fileData, fileEsc, fieldEsc, boundary);
         mach.curContentType = "multipart/form-data; boundary=" + boundary;
         return true;
     };
@@ -1398,10 +1455,18 @@ ZmHttpResult ZmHttpClient::SendSync(drogon::HttpMethod m, const std::string& url
                    std::make_shared<const ZmHttpRequestOptions>(opts), {},
                    [promPtr](ZmHttpResult&& r) { promPtr->set_value(std::move(r)); });
 
-    // 兜底超时:Close()/异常下状态机可能永不回调(在飞被丢弃语义,见设计 §4.1)——
-    // 业务线程绝不能因此永挂:超时 = 请求消耗时间上限(总超时 或 不超时请求取 60s)+ 余量
+    // 兜底超时:Close()/异常下状态机可能永不回调(在飞被丢弃语义)——业务线程绝不能因此永挂。
+    // 上限必须覆盖真实最坏耗时(尝试数 × 单次超时 + 退避),否则同步形态会比协程/异步更早
+    // 报超时,同一请求三种形态结论不一致。
+    const auto& def = ZmHttpClient::GetOptions();
+    int retryBudget = (opts.retryCount >= 0) ? opts.retryCount : def.retryMax;
+    int attempts = 1 + (retryBudget > 0 ? retryBudget : 0);
+    int attemptCap = def.maxTotalAttempts > 0 ? def.maxTotalAttempts : 8;
+    if (attempts > attemptCap)
+        attempts = attemptCap;  // 重试与重定向共用同一尝试预算
     double t = ResolveTimeout(opts);
-    double hardLimit = (t > 0 ? t : 60.0) + 10.0;
+    double hardLimit =
+        (t > 0 ? t : 60.0) * attempts + (def.retryCapMs / 1000.0) * attempts + 10.0;
     if (fut.wait_for(std::chrono::duration<double>(hardLimit)) != std::future_status::ready)
     {
         PUBLIC_LOG_ERROR("ZmHttpClient::SendSync 等待超时({}s),url={} —— 状态机未回调(坠飞/Close)",
@@ -1469,6 +1534,30 @@ bool ZmHttpClient::IsLoopThread()
             return true;
     }
     return false;
+}
+
+// ----------------------------------------------------------------------------
+// 离核任务(客户端自持工作池)
+// ----------------------------------------------------------------------------
+
+/**
+ * @brief 提交可能阻塞的任务到客户端工作池
+ *
+ * 磁盘 IO 等阻塞任务不得占用事件循环线程(服务器 loop 被拖住会连带停服)。
+ * 工作池对象是进程级终态(Close 只置空指针、不析构),故已受理的任务必然执行。
+ *
+ * @param task 任务体(工作池线程执行;须自持所需状态,不得捕获栈上引用)
+ * @return true 已受理;false 未就绪或工作池已停(Close 竞态,任务不执行)
+ */
+bool ZmHttpClient::SubmitBlockingTask(std::function<void()> task)
+{
+    if (!task || !IsReady())
+        return false;
+    ZmThreadPool* pool = s_workPool.load();  // Close 竞态:读到旧指针仍可提交,读到空则拒绝
+    if (!pool)
+        return false;
+    pool->Submit(std::move(task));
+    return true;
 }
 
 // ----------------------------------------------------------------------------

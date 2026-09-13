@@ -152,7 +152,7 @@ public:
     // 设计约束:编排不在协程帧内——重试/重定向/多尝试循环 = 堆上 ZmSendMachine 回调状态机
     // (见 .cpp 匿名字空间);协程侧仅 ZmMachineAwaiter 薄桥,帧内成员仅指针对齐
     // (shared_ptr<ZmMachineCtx>/EventLoop*/coroutine_handle),值对象全部堆化;
-    // opts 一律以 shared_ptr 飞行。详见设计文档 §4.3 帧隔离纪律。
+    // opts 一律以 shared_ptr 飞行,且不得为空。
     using ZmHttpRequestOptionsPtr = std::shared_ptr<const ZmHttpRequestOptions>;
     static drogon::Task<ZmHttpResult> SendPayload(drogon::HttpMethod m,
                                                   const std::string& url, ZMJSON jsonBody,
@@ -170,6 +170,12 @@ public:
     static void UnregisterLoop(trantor::EventLoop* loop);
     /// 当前线程是否任一已登记 loop 线程
     static bool IsLoopThread();
+
+    // ── 离核任务(客户端自持工作池;磁盘 IO 等阻塞任务不得占用事件循环线程) ──
+    /// 提交可能阻塞的任务到客户端工作池
+    /// @param task 任务体(工作池线程执行;须自持所需状态,不得捕获栈上引用)
+    /// @return true 已受理;false 未就绪或工作池已停(Close 竞态,任务不执行)
+    static bool SubmitBlockingTask(std::function<void()> task);
 
     /// 全局运行参数(须已 Init;供内部组件与测试读取)
     static const Options& GetOptions();

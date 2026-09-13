@@ -45,12 +45,12 @@ ZiMo 生态的 C++ 公共基础库，为 ZiMoService 及其他上层项目提供
 
 | 文件                                   | 说明                                                                                                  |
 | ------------------------------------ | --------------------------------------------------------------------------------------------------- |
-| `zm_net_http_server.h/.cpp`          | Drogon 1.9.13 HTTP 服务器基类:进程级静态生命周期(Init/Open/Close)、三面公共底座、文件传输(Range/304)、流式收发、协程路由、限流、`RunOnPool` |
-| `zm_net_http_frontend_server.h`      | 前端服务器面(80/443):静态 + SPA 回落 + 自定义 404 + 页面路由 + 80→443 重定向                                            |
+| `zm_net_http_server.h/.cpp`          | Drogon 1.9.13 HTTP 服务器基类:进程级静态生命周期(Init/Open/Close)、三面公共底座、路由归属校验与门禁、协程路由(含路径参数守卫)、文件传输(Range/304、整读/流式)、流式落盘、限流、请求 ID/访问日志、`RunOnPool` |
+| `zm_net_http_frontend_server.h`      | 前端服务器面(80/443):docroot 静态文件 + 自定义 404 + per-port 门禁 + 80→443 重定向(页面/SPA 由业务层 advice 承载)            |
 | `zm_net_http_jsonrpc_server.h`       | JSON-RPC 2.0 服务器面(39440):协议校验与信封(HTTP 恒 200,错误见信封 `error.code`)                                     |
 | `zm_net_http_restful_server.h`       | 业务 API 服务器面(39441 /zimo/api)                                                                        |
-| `zm_net_http_client.h/.cpp`          | 出站 HTTP/HTTPS 客户端门面(进程级静态):协程/异步回调/同步三种调用形态                                                         |
-| `zm_net_http_client_download.h/.cpp` | `ZmHttpDownloadChannel` 流式下载通道:trantor 直写盘、断点续传、TLS 校验                                              |
+| `zm_net_http_client.h/.cpp`          | 出站 HTTP/HTTPS 客户端门面(进程级静态):协程/异步回调/同步三形态、per-target 连接池、重试与重定向、JSON/表单/multipart 上传、TLS、出站日志   |
+| `zm_net_http_client_download.h/.cpp` | `ZmHttpDownloadChannel` 流式下载通道:每会话写线程直写盘、Range 续传(If-Range)、3xx 跟随、队列背压与停滞看护、TLS 校验                       |
 | `zm_net_broadcast_base.h`            | 广播模块公共定义:状态枚举、消息/客户端结构体、帧协议编解码                                                                      |
 | `zm_net_broadcast_server.h`          | TCP 广播服务端:握手/心跳/Tag 订阅/每客户端队列/踢出                                                                    |
 | `zm_net_broadcast_client.h`          | TCP 广播客户端:自动握手/心跳/订阅/消息回调                                                                           |
@@ -114,9 +114,9 @@ msbuild LibZiMoPublic.sln /p:Configuration=Release /p:Platform=x64
 - **回调模式**：`std::function` 回调集合，业务不接触底层类型——`BcClientCallbacks`/`BcServerCallbacks`（`onConnected`/`onMessage` 等）、HTTP 协程 handler（`ZmHttpCoroHandler`/`ZmHttpStreamHandler`/`ZmJrpcMethodHandler`）、传输进度回调（`ZmHttpSendFileOptions::onProgress`）
 
 - **单事件循环线程内零锁**：跨线程操作一律投递到事件循环线程执行。
-  libevent 侧经 `event_base_once`（一次性投递）/ `event_active`（持久 dispatch 事件唤醒）——如 `ZmBroadcastClient::ScheduleTask` 入队后 `event_active` 唤醒 dispatch 事件、`ZmEvBaseRunLoop::Control` 经 `event_active` 唤醒控制事件；drogon/trantor 侧经 `queueInLoop`——如 `ZmHttpServer` 的回复控制/协程恢复、`RunOnPool` 工作线程回执、`ZmHttpClient`/`ZmHttpDownloadChannel` 的协程恢复
+  libevent 侧经 `event_base_once`（一次性投递）/ `event_active`（持久 dispatch 事件唤醒）——如 `ZmBroadcastClient::ScheduleTask` 入队后 `event_active` 唤醒 dispatch 事件、`ZmEvBaseRunLoop::Control` 经 `event_active` 唤醒控制事件；drogon/trantor 侧经 `queueInLoop`——如 `ZmHttpServer` 的回复控制/协程恢复、`RunOnPool` 工作线程回执、`ZmHttpClient`/`ZmHttpDownloadChannel` 的协程恢复。**状态机归属其连接所属事件循环**：流式发送（定时器链）与流式落盘的回执、定时器、进度/完成回调都投回请求所属 loop，状态与连接计数（如 `TcpConnection::bytesSent`，非原子）因此只被单一线程读写——既无跨线程读写，也不把并发传输挤到主 loop
 
-- **阻塞/磁盘 I/O 离核（事件循环线程绝不读盘）**：下载读盘走专用 I/O 线程池（`ZmHttpServer::HttpIoPool`，读线程仅 `queueInLoop` 回执、由事件循环发送），阻塞任务经 `RunOnPool` 提交共享工作池（`CallbackAwaiter` 桥回事件循环），上传写盘走每连接写线程；`ZmHttpDownloadChannel` 为定向豁免（专属 loop 直写盘，单次写超阈值即 abort 止损）
+- **阻塞/磁盘 I/O 离核（事件循环线程绝不读盘）**：下载读盘走专用 I/O 线程池（`ZmHttpServer::HttpIoPool`，读线程仅 `queueInLoop` 回执、由事件循环发送），阻塞任务经 `RunOnPool` 提交共享工作池（`CallbackAwaiter` 桥回事件循环），上传写盘走每连接写线程；`ZmHttpDownloadChannel` 同样离核——磁盘只在**每会话写线程**（写盘/截断/侧车）与**客户端自持工作池**（打开 `.part`、读侧车）执行，通道 loop 零磁盘，写侧积压由队列字节上限收敛。异常一律留痕：读失败/提前读到文件尾（含"文件被写者独占而打不开"）与写盘失败都有 `PUBLIC_LOG_*` 记录——这两类失败按"发完"收尾，响应本身不报错，日志是唯一线索
 
 ## 提交规范
 
@@ -125,9 +125,9 @@ feat: 新功能（feature）
 用于提交新功能。
 例如：feat: 增加用户注册功能
 
-fix: 修复 bug
+bugfix: 修复 bug
 用于提交 bug 修复。
-例如：fix: 修复登录页面崩溃的问题
+例如：bugfix: 修复登录页面崩溃的问题
 
 docs: 文档变更
 用于提交仅文档相关的修改。

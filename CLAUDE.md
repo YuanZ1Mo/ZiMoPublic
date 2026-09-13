@@ -188,7 +188,7 @@ RegisterPreRouting([this](const HttpRequestPtr& req, AdviceCallback&& cb,
 | 类型 | 用途 | 示例 |
 | --- | --- | --- |
 | `feat` | 新功能（feature） | `feat: 增加用户注册功能` |
-| `fix` | 修复 bug | `fix: 修复登录页面崩溃的问题` |
+| `bugfix` | 修复 bug | `bugfix: 修复登录页面崩溃的问题` |
 | `docs` | 文档变更 | `docs: 更新README文件` |
 | `style` | 代码风格变动（不影响代码逻辑） | `style: 删除多余的空行` |
 | `refactor` | 代码重构（既不是新增功能也不是修复bug） | `refactor: 重构用户验证逻辑` |
