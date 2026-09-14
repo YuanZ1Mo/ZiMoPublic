@@ -46,7 +46,7 @@
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
-      <AdditionalIncludeDirectories>.;$(ProjectDir)\libevent\include;$(ProjectDir)\define;$(ProjectDir)\json;$(ProjectDir)\net;$(ProjectDir)\service;$(ProjectDir)\spdlog;$(ProjectDir)\util;$(ProjectDir)\libopus\include;$(ProjectDir)\drogon\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>.;$(ProjectDir)\libevent\include;$(ProjectDir)\define;$(ProjectDir)\json;$(ProjectDir)\net;$(ProjectDir)\service;$(ProjectDir)\spdlog;$(ProjectDir)\util;$(ProjectDir)\libopus\include;$(ProjectDir)\drogon\include;$(ProjectDir)\minizip-ng\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <Optimization>Disabled</Optimization>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
@@ -1302,6 +1302,27 @@
     <ClInclude Include="libopus\include\opus.h" />
     <ClInclude Include="libopus\include\opus_defines.h" />
     <ClInclude Include="libopus\include\opus_types.h" />
+    <ClInclude Include="minizip-ng\include\bzlib.h" />
+    <ClInclude Include="minizip-ng\include\lzma.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\ioapi.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_crypt.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_os.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_buf.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_bzip.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_lzma.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_mem.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_os.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_pkcrypt.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_split.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_wzaes.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_zlib.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_zstd.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_zip.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_zip_rw.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\unzip.h" />
+    <ClInclude Include="minizip-ng\include\minizip-ng\zip.h" />
     <ClInclude Include="net\zm_net_broadcast_base.h" />
     <ClInclude Include="net\zm_net_broadcast_client.h" />
     <ClInclude Include="net\zm_net_broadcast_server.h" />
@@ -1427,7 +1448,6 @@
     <ClInclude Include="util\zm_util_sys.h" />
     <ClInclude Include="util\zm_util_thread.h" />
     <ClInclude Include="util\zm_util_win_os.h" />
-    <ClInclude Include="util\zm_util_zipfile.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="net\zm_net_broadcast_base.cpp" />
@@ -1451,7 +1471,6 @@
     <ClCompile Include="util\zm_util_sys.cpp" />
     <ClCompile Include="util\zm_util_thread.cpp" />
     <ClCompile Include="util\zm_util_win_os.cpp" />
-    <ClCompile Include="util\zm_util_zipfile.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

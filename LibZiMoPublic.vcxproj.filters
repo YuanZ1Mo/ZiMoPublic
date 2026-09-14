@@ -259,6 +259,15 @@
     <Filter Include="头文件\drogon\include\postgresql\server\tsearch\dicts">
       <UniqueIdentifier>{f9f6a2a8-c456-4885-ad5e-0364cb9a507e}</UniqueIdentifier>
     </Filter>
+    <Filter Include="头文件\minizip-ng">
+      <UniqueIdentifier>{0aec79d9-0894-4bb7-a3a4-cacc7bd51a91}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="头文件\minizip-ng\include">
+      <UniqueIdentifier>{b7062123-3a02-4111-b8c5-e8d7471656ea}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="头文件\minizip-ng\include\minizip-ng">
+      <UniqueIdentifier>{af2d4205-c0b5-4cac-b271-ef7e495bd0f8}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="define\zm_simple_define.h">
@@ -4335,9 +4344,6 @@
     <ClInclude Include="drogon\include\postgresql\server\utils\xml.h">
       <Filter>头文件\drogon\include\postgresql\server\utils</Filter>
     </ClInclude>
-    <ClInclude Include="util\zm_util_zipfile.h">
-      <Filter>头文件\util</Filter>
-    </ClInclude>
     <ClInclude Include="net\zm_net_http_server.h">
       <Filter>头文件\net</Filter>
     </ClInclude>
@@ -4358,6 +4364,69 @@
     </ClInclude>
     <ClInclude Include="util\zm_util_evbase_runloop.h">
       <Filter>头文件\util</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\bzlib.h">
+      <Filter>头文件\minizip-ng\include</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\lzma.h">
+      <Filter>头文件\minizip-ng\include</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\ioapi.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_crypt.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_os.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_buf.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_bzip.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_lzma.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_mem.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_os.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_pkcrypt.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_split.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_wzaes.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_zlib.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_strm_zstd.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_zip.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\mz_zip_rw.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\unzip.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
+    </ClInclude>
+    <ClInclude Include="minizip-ng\include\minizip-ng\zip.h">
+      <Filter>头文件\minizip-ng\include\minizip-ng</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -4398,9 +4467,6 @@
       <Filter>源文件\util</Filter>
     </ClCompile>
     <ClCompile Include="util\zm_util_win_os.cpp">
-      <Filter>源文件\util</Filter>
-    </ClCompile>
-    <ClCompile Include="util\zm_util_zipfile.cpp">
       <Filter>源文件\util</Filter>
     </ClCompile>
     <ClCompile Include="net\zm_net_http_frontend_server.cpp">
