@@ -96,6 +96,41 @@ class DROGON_EXPORT ResponseStream
         return asyncStream_->send(oss.str());
     }
 
+    /**
+     * @brief 原始字节发送:不做分块编码(本地补丁)
+     *
+     * 上游的 send() 把数据包成 chunked 分帧,只适用于分块传输;而"自带
+     * Content-Length 的流式下载"需要零分帧的推送模式,故补此入口。
+     * 仅新增方法、不改类布局,无需重编 drogon.lib。
+     *
+     * @param data 待发送字节
+     * @param len  字节数
+     * @return true 已排入发送缓冲;false 连接已关闭
+     */
+    bool sendRaw(const char *data, size_t len)
+    {
+        if (!asyncStream_)
+        {
+            return false;
+        }
+        return asyncStream_->send(data, len);
+    }
+
+    /**
+     * @brief 原始收尾:关闭流但不写分块终止帧(本地补丁)
+     *
+     * 与 close() 的唯一区别是不发送 "0\r\n\r\n"(那是 chunked 的结束标记);
+     * 调用后析构里的 close() 自动成为空操作。
+     */
+    void closeRaw()
+    {
+        if (asyncStream_)
+        {
+            asyncStream_->close();
+            asyncStream_.reset();
+        }
+    }
+
     void close()
     {
         if (asyncStream_)

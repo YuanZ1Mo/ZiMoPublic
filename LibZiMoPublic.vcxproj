@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Release|x64">
@@ -1442,6 +1442,7 @@
     <ClInclude Include="util\zm_util_evbase_runloop.h" />
     <ClInclude Include="util\zm_util_file.h" />
     <ClInclude Include="util\zm_util_json.h" />
+    <ClInclude Include="util\zm_util_sqlite.h" />
     <ClInclude Include="util\zm_util_libevent.h" />
     <ClInclude Include="util\zm_util_logger.h" />
     <ClInclude Include="util\zm_util_str.h" />
@@ -1465,6 +1466,7 @@
     <ClCompile Include="util\zm_util_evbase_runloop.cpp" />
     <ClCompile Include="util\zm_util_file.cpp" />
     <ClCompile Include="util\zm_util_json.cpp" />
+    <ClCompile Include="util\zm_util_sqlite.cpp" />
     <ClCompile Include="util\zm_util_libevent.cpp" />
     <ClCompile Include="util\zm_util_logger.cpp" />
     <ClCompile Include="util\zm_util_str.cpp" />

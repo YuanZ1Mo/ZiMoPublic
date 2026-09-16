@@ -741,6 +741,9 @@
     <ClInclude Include="util\zm_util_json.h">
       <Filter>头文件\util</Filter>
     </ClInclude>
+    <ClInclude Include="util\zm_util_sqlite.h">
+      <Filter>头文件\util</Filter>
+    </ClInclude>
     <ClInclude Include="util\zm_util_logger.h">
       <Filter>头文件\util</Filter>
     </ClInclude>
@@ -4446,6 +4449,9 @@
       <Filter>源文件\service</Filter>
     </ClCompile>
     <ClCompile Include="util\zm_util_json.cpp">
+      <Filter>源文件\util</Filter>
+    </ClCompile>
+    <ClCompile Include="util\zm_util_sqlite.cpp">
       <Filter>源文件\util</Filter>
     </ClCompile>
     <ClCompile Include="util\zm_util_logger.cpp">

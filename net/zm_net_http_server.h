@@ -72,6 +72,12 @@ using ZmHttpCoroHandler = std::function<
 struct ZmHttpSendFileOptions
 {
     size_t chunkSize      = 1 * 1024 * 1024;   ///< 分块粒度
+    /// true = 原始字节模式：响应自带 Content-Length、正文不做 chunked 分帧
+    /// （分块传输与 Content-Length 互斥；下载类接口要"能显示大小 / 能续传"时用本模式）
+    bool   raw            = false;
+    /// 发送结束回调（可选）：发完 / 客户端断开 / 读失败 / 对端停滞 时各调用一次（仅一次），
+    /// 供调用方回收并发名额等资源（在事件循环线程执行）
+    std::function<void()> onFinish;
     /// 块间定时器间隔（定时器链节流，内存有界）；0 → 发完即调度
     /// （自适应，吞吐 = 排水速率，快客户端不设限）
     size_t interBlockMs   = 50;
@@ -693,12 +699,15 @@ public:
                  const std::string& attachmentName = "");
 
     /**
-     * @brief 流式发送文件（定时器链分块，内存有界；大文件/慢客户端用）
+     * @brief 流式发送文件（定时器链分块，读盘在专用 I/O 池、内存有界；大文件/慢客户端用）
+     *
+     * opts.raw = true 时走原始字节模式：响应带 Content-Length、正文不做 chunked 分帧，
+     * 供"要先知道大小、要能续传"的下载接口使用。
      *
      * @param req             请求
      * @param path            文件路径
      * @param attachmentName  非空 = 以附件下载
-     * @param opts            分块/节流/停滞放弃参数（见 ZmHttpSendFileOptions）
+     * @param opts            分块/节流/停滞放弃/原始模式/结束回调（见 ZmHttpSendFileOptions）
      * @return 响应（200/206/304/404/416）
      */
     virtual drogon::Task<drogon::HttpResponsePtr>

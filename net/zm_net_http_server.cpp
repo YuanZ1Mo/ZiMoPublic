@@ -189,6 +189,10 @@ private:
     bool m_fini = false;
     int m_inFlight = 0;   // 在途异步读计数(仅事件循环线程访问)
     bool m_closed = false;
+    /// 本响应起点的连接累计发送字节(水位判定的排水量基准)
+    uint64_t m_baseConnSent = 0;
+    /// 被水位挡住时的下一轮延后(毫秒;1 起步翻倍到 250 封顶,排水恢复即归零)
+    int64_t m_idleMs = 0;
 };
 
 /**
@@ -301,7 +305,10 @@ void ZmStreamLoopState::Run()
     }
     // 停滞判定基准:以连接累计发送字节为"对端真实消费"信号
     if (auto c = connWk.lock())
-        lastConnSent = c->bytesSent();
+    {
+        lastConnSent  = c->bytesSent();
+        m_baseConnSent = lastConnSent;   // 水位基准:本响应起点
+    }
     lastSentMs = NowMs();
     Next();
 }
@@ -341,7 +348,18 @@ void ZmStreamLoopState::Next()
             Finish();
             return;
         }
+        // 软件水位:trantor 不暴露输出缓冲长度,故用"连接已实发字节相对本响应起点的增量"
+        // 近似排水量。已提交字节领先排水量超过水位 = 对端吃得慢,延后下一块 ——
+        // 否则慢客户端会把整份文件堆进内存(实测 2GB 文件 + 3MB/s 客户端曾涨到 3.5GB)。
+        if (opts.watermarkBytes > 0 && sent > (sentNow - m_baseConnSent) + opts.watermarkBytes)
+        {
+            m_idleMs = m_idleMs == 0 ? 1 : std::min<int64_t>(m_idleMs * 2, 250);
+            m_loop->runAfter(static_cast<double>(m_idleMs) / 1000.0,
+                             [st = shared_from_this()]() { st->Next(); });
+            return;
+        }
     }
+    m_idleMs = 0;   // 排水跟得上:恢复常规调度
 
     size_t want = static_cast<size_t>(
         std::min<uint64_t>(remaining, opts.chunkSize ? opts.chunkSize : 1));
@@ -373,7 +391,11 @@ void ZmStreamLoopState::OnReadDone(std::shared_ptr<std::string> buf, bool ok)
         return;
     }
 
-    if (!stream->send(*buf))
+    // raw 模式:直接写原始字节(响应自带 Content-Length,不做 chunked 分帧);
+    // 默认模式:交给 ResponseStream 做分块编码
+    const bool sendOk = opts.raw ? stream->sendRaw(buf->data(), buf->size())
+                                 : stream->send(*buf);
+    if (!sendOk)
     {
         // trantor 契约:send 返回 false = 连接已关闭
         Finish();
@@ -431,9 +453,19 @@ void ZmStreamLoopState::DoClose()
     }
     if (stream)
     {
-        // ResponseStream::close() 发送终止分块并关闭(线程安全)
-        stream->close();
+        // raw 模式:关闭流但不写 chunked 终止帧(Content-Length 已界定正文长度)
+        if (opts.raw)
+            stream->closeRaw();
+        else
+            stream->close();   // 发送终止分块并关闭(线程安全)
         stream.reset();
+    }
+    // 结束回调:发完 / 断连 / 读失败 / 停滞 四条路径都汇到 DoClose(m_closed 保证仅一次),
+    // 调用方据此回收并发名额等资源
+    if (opts.onFinish)
+    {
+        auto cb = opts.onFinish;   // 拷贝后调用:回调内可能析构本状态机
+        cb();
     }
 }
 
@@ -3895,9 +3927,14 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoroImpl(
         },
         true);
 
-    // ④ 响应头:断点续传声明 + MIME(方案乙无 Content-Length,chunked 编码)
+    // ④ 响应头:断点续传声明 + MIME
+    //    默认(分块)模式无 Content-Length,走 chunked 编码;
+    //    raw 模式由本函数显式写 content-length 界定正文长度(drogon 见到该头就不再加 chunked)
     resp->addHeader("Accept-Ranges", "bytes");
     resp->addHeader("Content-Type", MimeForExt(path));
+    if (opts.raw)
+        resp->addHeader("content-length",
+                        std::to_string(r.partial ? r.length : fileSize));
     // ⑤ 缓存头(与 304 一致;大文件下载客户端亦可条件续用)
     resp->addHeader("Last-Modified", cacheHeaders.first);
     resp->addHeader("ETag", cacheHeaders.second);
