@@ -232,3 +232,11 @@ RegisterPreRouting([this](const HttpRequestPtr& req, AdviceCallback&& cb,
 若要编写临时脚本, 需要放到上层ZiMoAiscript目录中, 不要随意创建到别的目录下
 
 若服务进程需要验证, 先备份我的工作环境, 在ZiMoTest构建测试工作环境进行测试(复制我的工作环境即可)
+
+---
+
+## 10. 子Agent
+
+开启子Agent前需要我确认, 否则不要启动子Agent
+
+不要开启超过三个子Agent

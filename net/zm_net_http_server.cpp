@@ -3372,8 +3372,14 @@ ZmHttpServer::RangeInfo ZmHttpServer::ParseRange(const HttpRequestPtr& req,
     if (range.rfind("bytes=", 0) != 0)
         return r;                                    // 不认识的 unit → MUST ignore
     string body = range.substr(6);
-    if (body.find(',') != string::npos)
-        return r;                                    // 多段不支持 → ignore(200,下载器友好)
+    // 多段只服务首段:回 200 全文件会让续传客户端拿不到区间(且多段响应体需 multipart 封装)
+    size_t comma = body.find(',');
+    if (comma != string::npos)
+    {
+        body = body.substr(0, comma);
+        while (!body.empty() && std::isspace(static_cast<unsigned char>(body.back())))
+            body.pop_back();
+    }
     size_t dash = body.find('-');
     if (dash == string::npos)
         return r;                                    // 语法非法 → ignore
@@ -3619,8 +3625,12 @@ ZmHttpServer::ZmFileMeta ZmHttpServer::FetchFileMeta(const string& path)
  */
 pair<string, string> ZmHttpServer::CacheHeaders(const ZmFileMeta& m)
 {
-    return {HttpDateStr(m.mtimeSec),
-            "\"" + std::to_string(m.size) + "-" + std::to_string(m.mtimeSec) + "\""};
+    // ETag 前缀(如条目 id):区分 size/mtime 恰好相同的不同条目
+    string etag = "\"";
+    if (!m.key.empty())
+        etag += m.key + "-";
+    etag += std::to_string(m.size) + "-" + std::to_string(m.mtimeSec) + "\"";
+    return {HttpDateStr(m.mtimeSec), std::move(etag)};
 }
 
 /**
@@ -3732,6 +3742,19 @@ drogon::HttpResponsePtr ZmHttpServer::Maybe304(const HttpRequestPtr& req,
     return nullptr;
 }
 
+bool ZmHttpServer::IfRangeAllowsPartial(const HttpRequestPtr& req,
+                                        const pair<string, string>& cacheHeaders)
+{
+    string v = req->getHeader("If-Range");
+    if (v.empty())
+        return true;   // 未带 If-Range:Range 照常处理
+    // 强 ETag 形态(带引号)才按 ETag 比;弱 ETag(W/"…")按 RFC 不得用于 If-Range,
+    // 落到日期分支必然不等 → 判为不匹配,符合规范意图
+    if (v.size() >= 2 && v.front() == '"' && v.back() == '"')
+        return v == cacheHeaders.second;
+    return v == cacheHeaders.first;
+}
+
 // ── SendFileCoro —— 文件下载"方案甲": ──
 //   直接使用 drogon::HttpResponse::newFileResponse(内部为 trantor sendFile,
 //   零拷贝分段读盘入发送缓冲),Range/206/Content-Length/Accept-Ranges 语义由框架兜底。
@@ -3795,9 +3818,12 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileCoroImpl(const HttpRequestPt
     if (auto notMod = Maybe304(req, m, cacheHeaders))
         co_return notMod;
 
-    // ② 解析 Range 头(共用解析器):合法单段 → partial 区间(206);合法但越界
-    //    → unsatisfiable(416);语法非法/多段 → ignore(200 全文件,RFC 7233 )
+    // ② 解析 Range 头(共用解析器):合法区间 → partial(206);合法但越界
+    //    → unsatisfiable(416);语法非法 → ignore(200 全文件,RFC 7233 )
     RangeInfo r = ParseRange(req, fileSize);
+    // If-Range 不匹配 → 整个 Range 作废,按整份发(否则旧副本的区间会拼到新内容上)
+    if (!IfRangeAllowsPartial(req, cacheHeaders))
+        r = RangeInfo{};
     if (r.unsatisfiable)
     {
         co_return Range416Response(true, fileSize);
@@ -3896,13 +3922,17 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoroImpl(
     ZmFileMeta m;
     m.size = fileSize;
     m.mtimeSec = mtimeSec;
+    m.key = opts.etagKey;   // 可选:让 ETag 带上条目身份,避免跨条目碰撞
     auto cacheHeaders = CacheHeaders(m);
     if (auto notMod = Maybe304(req, m, cacheHeaders))
         co_return notMod;
 
-    // ② Range 解析(同方案甲共用):合法单段 → partial 区间;合法但越界 → 416;
-    //    语法非法/多段 → ignore(200 全文件,RFC 7233 )
+    // ② Range 解析(同方案甲共用):合法区间 → partial;合法但越界 → 416;
+    //    语法非法 → ignore(200 全文件,RFC 7233 )
     RangeInfo r = ParseRange(req, fileSize);
+    // If-Range 不匹配 → 整个 Range 作废,按整份发(同方案甲)
+    if (!IfRangeAllowsPartial(req, cacheHeaders))
+        r = RangeInfo{};
     if (r.unsatisfiable)
     {
         co_return Range416Response(true, fileSize);

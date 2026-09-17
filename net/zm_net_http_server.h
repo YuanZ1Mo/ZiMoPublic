@@ -86,6 +86,9 @@ struct ZmHttpSendFileOptions
 
     /// 进度回调（可选）：（已发送，总大小）
     std::function<void(uint64_t sent, uint64_t total)> onProgress;
+    /// ETag 前缀（可选，如条目 id）：非空时 ETag 为 "<etagKey>-<size>-<mtime>"，
+    /// 让 size/mtime 相同的不同条目各有各的 ETag（空 = 仅 size-mtime）
+    std::string etagKey;
 };
 
 /// 流式接收协程 handler（路径 B）：形参带 RequestStreamPtr 时被 drogon
@@ -1022,6 +1025,9 @@ protected:
         bool sizeFailed = false;  ///< 存在但取大小失败（否则 → 500）
         size_t size = 0;          ///< 文件字节数
         int64_t mtimeSec = 0;     ///< last_write_time → epoch 秒
+        /// 可选的 ETag 前缀(条目 id 等):非空时 ETag 形如 "<key>-<size>-<mtime>",
+        /// 使 size/mtime 相同的不同条目各有各的 ETag;空 = 仅用 size-mtime
+        std::string key;
     };
 
     /**
@@ -1049,6 +1055,20 @@ protected:
     static drogon::HttpResponsePtr Maybe304(const drogon::HttpRequestPtr& req,
                                             const ZmFileMeta& m,
                                             const std::pair<std::string, std::string>& cacheHeaders);
+
+    /**
+     * @brief If-Range 判定:带 Range 的请求是否允许按区间发送
+     *
+     * 语义(RFC 7233 3.2):If-Range 的值须与当前资源的强 ETag 或 Last-Modified 一致,
+     * 否则整个 Range 头作废、按整份 200 发送 —— 客户端拿旧副本的区间来续传新内容时,
+     * 若照旧回 206,拼出来的文件是两代内容的混合体。
+     *
+     * @param req           请求(读 If-Range)
+     * @param cacheHeaders  CacheHeaders 产出的 (Last-Modified, ETag) 对
+     * @return true 可继续 Range 流程;false 应忽略 Range 改发整份
+     */
+    static bool IfRangeAllowsPartial(const drogon::HttpRequestPtr& req,
+                                     const std::pair<std::string, std::string>& cacheHeaders);
 
 private:
 
