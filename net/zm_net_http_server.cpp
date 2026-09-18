@@ -3961,7 +3961,10 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoroImpl(
     //    默认(分块)模式无 Content-Length,走 chunked 编码;
     //    raw 模式由本函数显式写 content-length 界定正文长度(drogon 见到该头就不再加 chunked)
     resp->addHeader("Accept-Ranges", "bytes");
-    resp->addHeader("Content-Type", MimeForExt(path));
+    // 用 setContentTypeString 而非 addHeader:框架另有一个 contentType_ 成员也会输出
+    // content-type(默认 text/plain),只往 headers_ 里追加会出现两个 Content-Type ——
+    // 对 .zip 这类非文本文件会同时下发 text/plain 与 application/zip,客户端可能取错
+    resp->setContentTypeString(MimeForExt(path));
     if (opts.raw)
         resp->addHeader("content-length",
                         std::to_string(r.partial ? r.length : fileSize));
