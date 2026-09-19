@@ -449,6 +449,26 @@ public:
     /// @return 当前空闲的 worker 线程数
     uint16_t IdleCount() const;
 
+    /**
+     * @brief 等待已提交的立即任务全部执行完毕
+     *
+     * 排空口径:任务队列为空 且 所有 worker 空闲。等待期间仍可继续 Submit,
+     * 新提交的任务同样计入(即等待的是"持续排空",不是某一时刻的快照)。
+     * 典型用途:关停前确认在途任务已收尾 —— 任务若持有即将销毁的对象,不等就是悬空访问。
+     *
+     * @param timeoutMs 最长等待毫秒数;0 = 不限(一直等到排空)
+     * @return true 已排空;false 超时,或由本池 worker 线程调用(见下)
+     *
+     * @note 不得从本池的任务函数内调用:调用者自身计入"忙",排空条件永不成立。
+     *       该情形直接返回 false,不阻塞(避免自等挂死)。
+     * @note 口径只含立即任务(delayMs = 0);未到期的延迟任务未计入,
+     *       关停前若存在延迟任务,需自行 Cancel 或等其到期。
+     *
+     * @example
+     *   pool.WaitIdle(10000);   // 关停前最多等 10 秒
+     */
+    bool WaitIdle(uint32_t timeoutMs = 0);
+
     // --- 全局线程池接口 ---
 
     /**
@@ -533,6 +553,7 @@ private:
 
     mutable std::mutex m_taskMutex;                 ///< 保护 m_tasks 和 m_idleCount
     std::condition_variable m_taskCv;               ///< worker 等待此 CV 获取新任务
+    std::condition_variable m_idleCv;               ///< WaitIdle 等待此 CV 获知 worker 转空闲
     std::queue<std::function<void()>> m_tasks;
     std::atomic<uint16_t> m_idleCount{ 0 };         ///< 当前空闲 worker 数
 

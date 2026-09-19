@@ -3,18 +3,35 @@
 #include "../util/zm_util_libevent.h"
 #include "../util/zm_util_logger.h"
 #include "../util/zm_util_str.h"
-#include "../util/zm_util_sys.h"
 
 #include <../libevent/include/event2/dns.h>
 #include <../libevent/include/event2/event.h>
 
 enum { CONTROL_LOOP_SUCCESS = 0x0200, };
 
+/**
+ * @brief 武装/重臂一个定时器事件(改间隔后调用即按新间隔重新计时)
+ *
+ * 纯事件操作;调用方须持有 _mutex_ev,且不得同时持有 _mutex_loop
+ * (event_del 在回调执行中会阻塞等待,持 _mutex_loop 会与回调收尾互锁)。
+ *
+ * @param ev         定时器事件
+ * @param intervalMs 触发间隔毫秒(>0)
+ * @return true 已武装;false 武装失败
+ */
+static bool ArmEvent(event* ev, int64_t intervalMs)
+{
+    timeval tv = {};
+    tv.tv_sec  = static_cast<long>(intervalMs / 1000);
+    tv.tv_usec = static_cast<long>((intervalMs % 1000) * 1000);
+    event_del(ev);   // 幂等(未武装则空操作);已武装则改间隔重新计时
+    return event_add(ev, &tv) == 0;
+}
+
 ZmEvBaseRunLoop::ZmEvBaseRunLoop(const std::string& name): ZmThread(name)
 {
     _evbase     = nullptr;
     _eventCtrl  = nullptr;
-    _eventTimer = nullptr;
     _b_looped = false;
     _b_run_finished = false;
 }
@@ -27,16 +44,22 @@ void ZmEvBaseRunLoop::freeEventObjects()
 {
     PUBLIC_LOG_INFO("Free the event objects");
 
+    // 定时器事件挂在 base 上,先于 base 释放
+    // (调用方保证此刻没有并发的定时器操作:循环启动前,或循环退出后的持锁点)
+    for (auto& kv : _timers)
+    {
+        if (kv.second.ev)
+            event_free(kv.second.ev);
+    }
+    _timers.clear();
+    _retired.clear();
+    _runningTimerId = 0;
+    _nextTimerId    = 1;
+
     if (_eventCtrl)
     {
         event_free(_eventCtrl);
         _eventCtrl = nullptr;
-    }
-
-    if (_eventTimer)
-    {
-        event_free(_eventTimer);
-        _eventTimer = nullptr;
     }
 
     if (_evbase)
@@ -85,6 +108,198 @@ event_base* ZmEvBaseRunLoop::GetEventBase()
     return _evbase;
 }
 
+// ============================================================================
+// 定时器
+// ============================================================================
+
+ZmEvBaseRunLoop::TimerId ZmEvBaseRunLoop::AddTimer(int64_t intervalMs,
+                                                   std::function<void()> cb, bool repeat)
+{
+    if (intervalMs <= 0 || !cb)
+        return 0;   // 间隔非法或回调为空:没有意义,直接拒收
+
+    TimerEntry*        e    = nullptr;
+    TimerId            id   = 0;
+    struct event_base* base = nullptr;
+    {
+        // 新事件此刻还没有别的线程能看到,无需 _mutex_ev
+        std::lock_guard<std::mutex> lock(_mutex_loop);
+        if (!_b_looped || _evbase == nullptr)
+            return 0;   // 未启动/已退出
+
+        id = _nextTimerId++;
+        if (id == 0)
+            id = _nextTimerId++;   // 0 保留为"无效句柄",回绕时跳过
+
+        // 先登记、后建 event:回调参数取登记项地址。unordered_map 是节点式容器,
+        // 后续插入引发的 rehash 不搬动已有元素,故该地址在登记项被移除前一直有效
+        e             = &_timers[id];
+        e->owner      = this;
+        e->id         = id;
+        e->intervalMs = intervalMs;
+        e->repeat     = repeat;
+        e->retired    = false;
+        e->cb         = std::move(cb);
+        base          = _evbase;
+    }
+
+    e->ev = event_new(base, -1, repeat ? (EV_TIMEOUT | EV_PERSIST) : EV_TIMEOUT,
+                      &ZmEvBaseRunLoop::OnTimerDispatchCB, e);
+    if (e->ev == nullptr || !ArmEvent(e->ev, intervalMs))
+    {
+        if (e->ev != nullptr)
+            event_free(e->ev);
+        std::lock_guard<std::mutex> lock(_mutex_loop);
+        _timers.erase(id);
+        return 0;
+    }
+    return id;
+}
+
+bool ZmEvBaseRunLoop::StopTimer(TimerId id)
+{
+    std::lock_guard<std::mutex> evLock(_mutex_ev);
+    event*                      ev = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(_mutex_loop);
+        TimerEntry*                 e = findTimerLocked(id);
+        if (e == nullptr || e->ev == nullptr)
+            return false;
+        if (event_pending(e->ev, EV_TIMEOUT, nullptr) == 0)
+            return false;   // 本就停着
+        ev = e->ev;
+    }
+    // 锁外停表:非 loop 线程调用时 event_del 会等到该定时器的回调跑完,
+    // 而回调收尾要拿 _mutex_loop —— 持着它调用必与回调互锁
+    event_del(ev);
+    return true;
+}
+
+bool ZmEvBaseRunLoop::ArmTimer(TimerId id)
+{
+    std::lock_guard<std::mutex> evLock(_mutex_ev);
+    event*                      ev = nullptr;
+    int64_t                     ms = 0;
+    {
+        std::lock_guard<std::mutex> lock(_mutex_loop);
+        TimerEntry*                 e = findTimerLocked(id);
+        if (e == nullptr || e->ev == nullptr)
+            return false;
+        ev = e->ev;
+        ms = e->intervalMs;
+    }
+    // 锁外武装(同上:event_del 可能阻塞)
+    return ArmEvent(ev, ms);
+}
+
+bool ZmEvBaseRunLoop::SetTimerInterval(TimerId id, int64_t intervalMs)
+{
+    if (intervalMs <= 0)
+        return false;
+
+    std::lock_guard<std::mutex> evLock(_mutex_ev);
+    event*                      ev    = nullptr;
+    bool                        armed = false;
+    {
+        std::lock_guard<std::mutex> lock(_mutex_loop);
+        TimerEntry*                 e = findTimerLocked(id);
+        if (e == nullptr)
+            return false;
+        e->intervalMs = intervalMs;
+        ev            = e->ev;
+        armed         = (ev != nullptr) && event_pending(ev, EV_TIMEOUT, nullptr) != 0;
+    }
+    if (ev == nullptr || !armed)
+        return true;   // 停着的只更新登记,等 ArmTimer 时按新间隔生效
+    return ArmEvent(ev, intervalMs);
+}
+
+size_t ZmEvBaseRunLoop::StopAllTimers()
+{
+    std::vector<TimerId> ids;
+    {
+        std::lock_guard<std::mutex> lock(_mutex_loop);
+        for (const auto& kv : _timers)
+        {
+            if (!kv.second.retired)
+                ids.push_back(kv.first);
+        }
+    }
+    size_t n = 0;
+    for (TimerId id : ids)
+    {
+        if (StopTimer(id))
+            ++n;   // 本就停着的、期间被别处移除的不计
+    }
+    return n;
+}
+
+bool ZmEvBaseRunLoop::RemoveTimer(TimerId id)
+{
+    std::lock_guard<std::mutex> evLock(_mutex_ev);
+
+    event* ev      = nullptr;
+    bool   onStack = false;
+    {
+        std::lock_guard<std::mutex> lock(_mutex_loop);
+        auto                        it = _timers.find(id);
+        if (it == _timers.end() || it->second.retired)
+            return false;
+        it->second.retired = true;   // 即刻失效:查找与统计不再看到它
+        ev                 = it->second.ev;
+        onStack            = (_runningTimerId == id);   // 回调正跑在本线程栈上
+    }
+    if (ev != nullptr)
+    {
+        event_del(ev);   // 锁外:非 loop 线程调用时会等到回调结束
+        if (!onStack)
+            event_free(ev);
+    }
+    {
+        std::lock_guard<std::mutex> lock(_mutex_loop);
+        if (onStack && ev != nullptr)
+            _retired.push_back(id);   // 回调还在栈上:交给下一轮派发回收
+        else
+            _timers.erase(id);
+    }
+    return true;
+}
+
+size_t ZmEvBaseRunLoop::RemoveAllTimers()
+{
+    std::vector<TimerId> ids;
+    {
+        std::lock_guard<std::mutex> lock(_mutex_loop);
+        for (const auto& kv : _timers)
+        {
+            if (!kv.second.retired)
+                ids.push_back(kv.first);
+        }
+    }
+    size_t n = 0;
+    for (TimerId id : ids)
+    {
+        if (RemoveTimer(id))
+            ++n;
+    }
+    return n;
+}
+
+size_t ZmEvBaseRunLoop::TimerCount()
+{
+    std::lock_guard<std::mutex> lock(_mutex_loop);
+    size_t                      n = 0;
+    for (const auto& kv : _timers)
+    {
+        if (!kv.second.retired)
+            ++n;
+    }
+    return n;
+}
+
+// ============================================================================
+// 循环线程
+// ============================================================================
 
 void ZmEvBaseRunLoop::Run()
 {
@@ -104,8 +319,8 @@ void ZmEvBaseRunLoop::Run()
         event_add(_eventCtrl, 0);
         event_active(_eventCtrl, CONTROL_LOOP_SUCCESS, 0);
 
-        // 周期定时器不再随 Run 自动启动:由 StartTimer() 手动触发
-        // (EV_PERSIST 保证定时器循环触发,自动重臂,见 event_persist_closure)
+        // 定时器不随 Run 自动启动:全部由 AddTimer() 手动登记
+        // (EV_PERSIST 保证周期定时器触发后自动重臂,见 event_persist_closure)
 
         // #define EVLOOP_ONCE              0x01
         // #define EVLOOP_NONBLOCK          0x02
@@ -122,8 +337,10 @@ void ZmEvBaseRunLoop::Run()
         }
 
         // 等待者已收到通知，安全释放资源
-        // (持锁:与 StartTimer/StopTimer/Control 的成员访问互斥,防退出窗口内 event 被并发触碰)
+        // (持锁:与定时器接口/Control 的成员访问互斥,防退出窗口内 event 被并发触碰;
+        //  _mutex_ev 在前,与各定时器接口的取锁顺序一致)
         {
+            std::lock_guard<std::mutex> evLock(_mutex_ev);
             std::lock_guard<std::mutex> lock(_mutex_loop);
             freeEventObjects();
         }
@@ -172,60 +389,96 @@ void ZmEvBaseRunLoop::OnEventCtrlCB(evutil_socket_t fd, short what, void* arg)
     }
 }
 
-bool ZmEvBaseRunLoop::StartTimer(int64_t intervalSec)
-{
-    std::lock_guard<std::mutex> lock(_mutex_loop);
-    if (!_b_looped)
-        return false;   // 未启动/已退出
-    if (intervalSec <= 0)
-        return false;
+// ============================================================================
+// 定时器内部实现
+// ============================================================================
 
-    if (_eventTimer == nullptr)
+void ZmEvBaseRunLoop::OnTimerDispatchCB(evutil_socket_t fd, short what, void* arg)
+{
+    (void)fd;
+    (void)what;
+
+    TimerEntry* e = static_cast<TimerEntry*>(arg);
+    if (e == nullptr || e->owner == nullptr)
+        return;
+
+    ZmEvBaseRunLoop*      self = e->owner;
+    std::function<void()> cb;
+    bool                  once = false;
     {
-        // EV_PERSIST 保证定时器循环触发,自动重臂(见 event_persist_closure)
-        // 无捕获 lambda 可转 C 函数指针,arg=this 中转:
-        // 分发顺序:SetTimerCallback 设置的回调优先,否则虚函数 OnTimerCB(缺省心跳)
-        _eventTimer = event_new(_evbase, -1, EV_TIMEOUT | EV_PERSIST,
-            [](evutil_socket_t, short, void* arg) {
-                auto* self = static_cast<ZmEvBaseRunLoop*>(arg);
-                // 锁内拷贝(与 SetTimerCallback 互斥),锁外调用
-                // (用户回调可能重入 StartTimer/StopTimer,持锁调用会死锁)
-                std::function<void()> cb;
-                {
-                    std::lock_guard<std::mutex> lock(self->_mutex_loop);
-                    cb = self->_timerCb;
-                }
-                if (cb)
-                    cb();                   // SetTimerCallback 优先
-                else
-                    self->OnTimerCB();      // 缺省:虚函数(心跳)
-            }, this);
-        if (_eventTimer == nullptr)
-            return false;
+        // 锁内拷贝、锁外调用:回调会重入本类接口,持锁调用必死锁
+        std::lock_guard<std::mutex> lock(self->_mutex_loop);
+        self->drainRetiredLocked(e->id);
+        cb                    = e->cb;
+        once                  = !e->repeat;
+        self->_runningTimerId = e->id;
     }
-    timeval timer_second = { (long)intervalSec, 0 };
-    event_del(_eventTimer);            // 幂等(未挂起则空操作);已运行时调用 = 改间隔重臂
-    event_add(_eventTimer, &timer_second);
-    return true;
+
+    try
+    {
+        cb();
+    }
+    // 就地拦下异常:一旦击穿 libevent 的派发栈,整个循环线程就没了
+    catch (const std::exception& ex)
+    {
+        PUBLIC_LOG_ERROR("{}:timer callback threw, isolated: {}", self->GetName(), ex.what());
+    }
+    catch (...)
+    {
+        PUBLIC_LOG_ERROR("{}:timer callback threw unknown exception, isolated", self->GetName());
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(self->_mutex_loop);
+        if (once)
+        {
+            auto it = self->_timers.find(e->id);
+            if (it != self->_timers.end() && !it->second.retired)
+            {
+                it->second.retired = true;   // 一次性:响过即注销
+                if (it->second.ev != nullptr)
+                {
+                    // 一次性事件响过后不再武装,event_del 不会阻塞;而回调还在这条线程
+                    // 的栈上,event 只能交给下一轮派发回收
+                    event_del(it->second.ev);
+                    self->_retired.push_back(e->id);
+                }
+                else
+                {
+                    self->_timers.erase(it);
+                }
+            }
+        }
+        self->_runningTimerId = 0;
+    }
 }
 
-void ZmEvBaseRunLoop::StopTimer()
+ZmEvBaseRunLoop::TimerEntry* ZmEvBaseRunLoop::findTimerLocked(TimerId id)
 {
-    std::lock_guard<std::mutex> lock(_mutex_loop);
-    if (_eventTimer)
-        event_del(_eventTimer);
+    auto it = _timers.find(id);
+    if (it == _timers.end() || it->second.retired)
+        return nullptr;   // 已注销的视同不存在
+    return &it->second;
 }
 
-void ZmEvBaseRunLoop::SetTimerCallback(std::function<void()> cb)
+void ZmEvBaseRunLoop::drainRetiredLocked(TimerId runningId)
 {
-    std::lock_guard<std::mutex> lock(_mutex_loop);
-    _timerCb = std::move(cb);
-}
-
-void ZmEvBaseRunLoop::OnTimerCB()
-{
-    // 缺省实现:原心跳行为(仅诊断用;SetTimerCallback 未设置时生效)
-    char buf[32];
-    ZmSystem::CurrentTimeStr(buf, sizeof(buf));
-    PUBLIC_LOG_INFO("{}:{} HeartbeatTime:{}", GetName(), (void*)this, buf);
+    // 循环单线程逐个派发,此刻栈上最多只有 runningId 这一个定时器的回调;
+    // 其余待回收的都不在执行中,可以直接释放(event_free 内部的 event_del 不会阻塞)
+    std::vector<TimerId> keep;
+    for (TimerId id : _retired)
+    {
+        if (id == runningId)
+        {
+            keep.push_back(id);   // 还在派发它,留到下一轮
+            continue;
+        }
+        auto it = _timers.find(id);
+        if (it == _timers.end())
+            continue;
+        if (it->second.ev != nullptr)
+            event_free(it->second.ev);
+        _timers.erase(it);
+    }
+    _retired.swap(keep);
 }

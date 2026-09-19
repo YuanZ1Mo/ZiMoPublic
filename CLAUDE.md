@@ -203,6 +203,8 @@ RegisterPreRouting([this](const HttpRequestPtr& req, AdviceCallback&& cb,
 | `ci` | 持续集成配置的变更 | `ci: 修改GitHub Actions配置文件` |
 | `revert` | 回滚 | `revert: 回滚feat: 增加用户注册功能` |
 
+由你提交的commit不要添加署名
+
 ---
 
 ## 8. 头文件包含规范

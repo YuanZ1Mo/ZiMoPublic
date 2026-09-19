@@ -415,6 +415,35 @@ uint16_t ZmThreadPool::IdleCount() const
     return m_idleCount.load();
 }
 
+bool ZmThreadPool::WaitIdle(uint32_t timeoutMs)
+{
+    std::unique_lock lock(m_taskMutex);
+
+    // 自调用护栏: 调用者自身计入"忙", 排空条件永不成立, 直接返回避免自等挂死
+    std::thread::id self = std::this_thread::get_id();
+    for (auto& w : m_workers)
+    {
+        if (w.get_id() == self)
+            return false;
+    }
+
+    // 排空口径: 队列为空 且 无忙 worker。
+    // worker 被唤醒前仍计入 idle, 故必须同时判队列: 只看 m_idleCount 会在
+    // "任务已入队但 worker 尚未被调度"时误判为已排空
+    auto drained = [this]() {
+        return m_tasks.empty() && static_cast<size_t>(m_idleCount.load()) == m_workers.size();
+    };
+
+    if (timeoutMs == 0)
+    {
+        m_idleCv.wait(lock, drained);
+        return true;
+    }
+    // 谓词版 wait_until: 返回 false 即超时(超时前恰好排空仍返回 true)
+    return m_idleCv.wait_until(lock, std::chrono::steady_clock::now() +
+                                        std::chrono::milliseconds(timeoutMs), drained);
+}
+
 // --- 全局线程池接口 ---
 
 uint32_t ZmThreadPool::InvokeLater(std::function<void()> executor, uint32_t delayMs)
@@ -453,6 +482,10 @@ void ZmThreadPool::workerProc(std::stop_token st)
         {
             std::unique_lock lock(m_taskMutex);
             m_idleCount++;
+            // 通知 WaitIdle: 本 worker 已空闲。池由"有忙"转为"全空闲"只可能发生在
+            // 此处, 故仅在计数达到线程总数时通知(每个任务都通知会带来无谓唤醒)
+            if (static_cast<size_t>(m_idleCount.load()) == m_workers.size())
+                m_idleCv.notify_all();
             // 阻塞等待: 直到有新任务或收到停止信号
             m_taskCv.wait(lock, [&] {
                 return !m_tasks.empty() || st.stop_requested();
