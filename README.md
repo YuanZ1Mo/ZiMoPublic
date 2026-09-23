@@ -1,13 +1,13 @@
 # ZiMoPublic
 
-ZiMo 生态的 C++ 公共基础库，为 ZiMoService 及其他上层项目提供网络通信、Windows 服务框架、SSL/TLS 安全、日志、JSON 处理、SQLite、线程工具等通用能力。
+ZiMo 生态的 C++ 公共基础库，为 ZiMoService 及其他上层项目提供 HTTP 服务器三面(前端/JRPC/RESTful)、HTTP 客户端与流式下载、TCP 广播、Windows 服务框架、日志、JSON、SQLite 连接与事务、线程与事件循环等通用能力。
 
 ## 模块总览
 
 | 目录          | 模块            | 说明                                                             |
 | ----------- | ------------- | -------------------------------------------------------------- |
 | `define/`   | 基础定义          | 通用宏(取最值/睡眠/内存拷贝)、版本定义                                          |
-| `util/`     | 通用工具          | 线程/线程池、libevent 事件循环、日志、JSON、文件、字符串、容器、系统/OS、zip 写入            |
+| `util/`     | 通用工具          | 线程/线程池、libevent 事件循环、日志、JSON、文件、字符串、容器、系统/OS、SQLite 连接与事务         |
 | `net/`      | 网络层           | HTTP 服务器(基类 + 前端/JRPC/RESTful 三面)、HTTP 客户端(含流式下载)、TCP 广播、IP 工具 |
 | `service/`  | Windows 服务框架  | 服务注册/卸载/调试运行,SCM 回调驱动生命周期                                      |
 | `json/`     | nlohmann JSON | 单头 JSON 库(3.12.0)                                              |
@@ -15,6 +15,7 @@ ZiMo 生态的 C++ 公共基础库，为 ZiMoService 及其他上层项目提供
 | `libevent/` | libevent 事件库  | 事件驱动网络库(2.2.1)                                                 |
 | `libopus/`  | Opus 音频编解码    | 语音编码静态库                                                        |
 | `drogon/`   | drogon Web 框架 | drogon 1.9.13 + trantor + openssl/sqlite3/hiredis 等预编译静态库      |
+| `minizip-ng/` | zip 打包库     | minizip-ng 静态库(含 bz2/lzma/zstd 后端),供上层做 zip 打包               |
 
 ## 各模块详解
 
@@ -29,23 +30,23 @@ ZiMo 生态的 C++ 公共基础库，为 ZiMoService 及其他上层项目提供
 
 | 文件                         | 说明                                                                                                     |
 | -------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `zm_util_thread.h`         | `ZmThread`(C++20 jthread 封装,状态位掩码)、`ZmThreadPool` 线程池                                                  |
-| `zm_util_evbase_runloop.h` | `ZmEvBaseRunLoop` — libevent 事件循环线程(心跳定时器、跨线程投递)                                                       |
-| `zm_util_libevent.h`       | libevent 初始化(`zm_util_eventbase_init` 线程支持)与非阻塞 socket 工具                                              |
+| `zm_util_thread.h`         | `ZmThread`(C++20 jthread 封装,状态位掩码)、`ZmThreadPool` 线程池(含 `WaitIdle` 等待在途任务排空)                     |
+| `zm_util_evbase_runloop.h` | `ZmEvBaseRunLoop` — libevent 事件循环线程(多定时器增删/改间隔/一次性、跨线程投递,回调异常不外溢)                        |
+| `zm_util_libevent.h`       | libevent 初始化(`zm_util_eventbase_init` 线程支持)、`ZmEventBuffer` 事件缓冲与非阻塞 socket 工具                        |
 | `zm_util_logger.h`         | spdlog 封装:`RotatingLoggerBase` 轮转日志基类、`g_default_logger`/`g_public_logger`、`EnableConsoleSink` 控制台彩色输出 |
 | `zm_util_json.h`           | nlohmann 封装:`ZMJSON`(ordered\_json)、类型安全读取、嵌套路径、序列化/解析、合并                                              |
 | `zm_util_file.h`           | `ZmFile` 文件工具:读写/复制/删除/目录/路径解析/哈希(Win32)                                                               |
 | `zm_util_str.h`            | 字符串工具与 `String` 类型(Unicode 适配)                                                                         |
-| `zm_util_container.h`      | `ZmByteBuffer` 动态字节缓冲区等容器                                                                              |
+| `zm_util_container.h`      | 容器:`ZmByteBuffer` 动态字节缓冲区、`ZmArrayList`、`ZmObjectPool`、`ZmBinaryTable`                                |
 | `zm_util_sys.h`            | 系统工具:DLL 加载/符号查找宏等                                                                                     |
 | `zm_util_win_os.h`         | Windows OS 工具:版本号、电源操作等                                                                                |
-| `zm_util_zipfile.h`        | `ZipFileWriter` 流式 zip 写入器(内存有界、ZIP64)                                                                 |
+| `zm_util_sqlite.h`         | `ZmSqliteDb` — SQLite 连接与并发模型:写连接单条(可重入互斥)+ 读连接池、WAL + busy_timeout;协程接口经工作池离核,`WithTx` 提供事务,库表结构由各子类 DbModule 承担 |
 
 **net/ — 网络层**
 
 | 文件                                   | 说明                                                                                                  |
 | ------------------------------------ | --------------------------------------------------------------------------------------------------- |
-| `zm_net_http_server.h/.cpp`          | Drogon 1.9.13 HTTP 服务器基类:进程级静态生命周期(Init/Open/Close)、三面公共底座、路由归属校验与门禁、协程路由(含路径参数守卫)、文件传输(Range/304、整读/流式)、流式落盘、限流、请求 ID/访问日志、`RunOnPool` |
+| `zm_net_http_server.h/.cpp`          | Drogon 1.9.13 HTTP 服务器基类:进程级静态生命周期(Init/Open/Close)、三面公共底座、路由归属校验与门禁、协程路由(含路径参数守卫)、文件传输(Range/304、If-Range、ETag 前缀)、整读/流式/原始字节流式发送(软件水位兜内存)、流式落盘、限流、请求 ID/访问日志、`RunOnPool` |
 | `zm_net_http_frontend_server.h`      | 前端服务器面(80/443):docroot 静态文件 + 自定义 404 + per-port 门禁 + 80→443 重定向(页面/SPA 由业务层 advice 承载)            |
 | `zm_net_http_jsonrpc_server.h`       | JSON-RPC 2.0 服务器面(39440):协议校验与信封(HTTP 恒 200,错误见信封 `error.code`)                                     |
 | `zm_net_http_restful_server.h`       | 业务 API 服务器面(39441 /zimo/api)                                                                        |
@@ -62,7 +63,7 @@ ZiMo 生态的 C++ 公共基础库，为 ZiMoService 及其他上层项目提供
 | ------------------------ | ----------------------------------------------------------------------------- |
 | `zm_service_base.h/.cpp` | `ZmServiceBase` — 子类实现 `OnStart` 等虚函数,由 SCM 回调驱动生命周期;`Run()`/`RunDebugMode()` |
 
-**第三方依赖(随库内置,见"依赖关系")**:`json/`、`spdlog/`、`libevent/`、`libopus/`、`drogon/`。
+**第三方依赖(随库内置,见"依赖关系")**:`json/`、`spdlog/`、`libevent/`、`libopus/`、`drogon/`、`minizip-ng/`。
 
 ## 依赖关系
 
@@ -70,13 +71,14 @@ ZiMo 生态的 C++ 公共基础库，为 ZiMoService 及其他上层项目提供
 
 | 依赖               | 版本     | 位置                            | 用途                                                                                |
 | ---------------- | ------ | ----------------------------- | --------------------------------------------------------------------------------- |
-| drogon / trantor | 1.9.13 | `drogon/include`、`drogon/lib` | Web 框架;预编译静态库含 openssl/sqlite3/hiredis/mariadb/libpq/lz4/brotli/zlib/ecpg/cares 等 |
+| drogon / trantor | 1.9.13 | `drogon/include`、`drogon/lib/VC/x64/MT` | Web 框架;预编译静态库含 openssl/sqlite3/hiredis/mariadb/libpq/lz4/brotli/zlib/ecpg/cares 等 |
 | libevent         | 2.2.1  | `libevent/`                   | 事件驱动网络库(TCP 广播、事件循环线程)                                                            |
 | spdlog           | 1.17.0 | `spdlog/`                     | 日志库(header-only)                                                                  |
 | nlohmann json    | 3.12.0 | `json/`                       | JSON 解析(单头)                                                                       |
 | libopus          | —      | `libopus/`                    | Opus 音频编解码                                                                        |
+| minizip-ng       | —      | `minizip-ng/`                 | zip 打包;静态库 `minizip-ng.lib` + `bz2/lzma/zstd`                                    |
 
-> `drogon.lib` 约 267 MB,超过 GitHub 单文件 100 MB 限制,以分卷入库(`drogon.lib.part01~03`),克隆后需执行 `drogon_lib_merge.ps1` 合并还原(详见 `drogon/lib/README.md`)。
+> `drogon.lib` 约 267 MB,超过 GitHub 单文件 100 MB 限制,以分卷入库(`drogon.lib.part01~03`),克隆后需执行 `drogon/lib/VC/x64/MT/drogon_lib_merge.ps1` 合并还原(详见 `drogon/lib/VC/x64/MT/README.md`)。
 
 ## 构建与集成
 
@@ -90,9 +92,11 @@ msbuild LibZiMoPublic.sln /p:Configuration=Release /p:Platform=x64
 
 - 第三方依赖全部**静态链接**(MT 运行时),上层项目(ZiMoService)以同级目录 `..\ZiMoPublic\` 引用头文件与库即可,免 DLL 部署
 
-- 头文件包含目录(见 `LibZiMoPublic.vcxproj`):`libevent/include`、`define`、`json`、`net`、`service`、`spdlog`、`util`、`libopus/include`、`drogon/include`
+- 头文件包含目录(见 `LibZiMoPublic.vcxproj`):`libevent/include`、`define`、`json`、`net`、`service`、`spdlog`、`util`、`libopus/include`、`drogon/include`、`minizip-ng/include`
 
-- 库目录:`libevent/lib/VC/x64/MT`、`libopus/lib/VC/x64/MT`、`drogon/lib`
+- 库目录:`libevent/lib/VC/x64/MT`、`libopus/lib/VC/x64/MT`、`drogon/lib/VC/x64/MT`、`minizip-ng/lib/VC/x64/MT`
+
+- 上层工程需在自己的链接清单里列出所用静态库(本库不代为链接),`ZiMoService.vcxproj` 的 `AdditionalDependencies` 即这份清单:trantor/event/event_core/event_extra、opus、drogon、jsoncpp、cares、lz4、sqlite3、libssl/libcrypto、brotli*、mariadbclient、pq/hiredis/pg*、zs、minizip-ng/bz2/lzma/zstd 及系统库
 
 ## 设计原则
 
@@ -107,7 +111,7 @@ msbuild LibZiMoPublic.sln /p:Configuration=Release /p:Platform=x64
 
 - **代码组织**：public → protected → private，函数与成员变量分开
 
-- **RAII 资源管理**：如 `RotatingLoggerBase`（`CreateLogger`/`ReleaseLogger` 成对）、`ZmEventBuffer`、`ZmByteBuffer`、`ZipFileWriter`（fd 归调用方，writer 只写不关）、`ZmBroadcastClient`（析构自动断开）
+- **RAII 资源管理**：如 `RotatingLoggerBase`（`CreateLogger`/`ReleaseLogger` 成对）、`ZmEventBuffer`、`ZmByteBuffer`、`ZmSqliteDb`（`Init`/`Close` 成对，析构兜底关闭全部连接）、`ZmBroadcastClient`（析构自动断开）
 
 - **全局惰性服务**：日志管理器 `DefaultLogger`/`PublicLogger`（`RotatingLoggerBase` 子类）经 `Ensure()` 惰性初始化，暴露 `g_default_logger`/`g_public_logger` 全局句柄，`DEFAULT_LOG_*` 宏自动兜底初始化
 
@@ -120,60 +124,29 @@ msbuild LibZiMoPublic.sln /p:Configuration=Release /p:Platform=x64
 
 ## 提交规范
 
-```
-feat: 新功能（feature）
-用于提交新功能。
-例如：feat: 增加用户注册功能
+提交信息格式:`<类型>: <描述>`
 
-bugfix: 修复 bug
-用于提交 bug 修复。
-例如：bugfix: 修复登录页面崩溃的问题
+| 类型       | 用途            | 示例                      |
+| -------- | ------------- | ----------------------- |
+| `feat`   | 新功能           | `feat: 增加用户注册功能`        |
+| `bugfix` | 修复 bug        | `bugfix: 修复登录页面崩溃的问题`   |
+| `docs`   | 文档变更          | `docs: 更新README文件`      |
+| `style`  | 代码风格变动(不影响逻辑) | `style: 删除多余的空行`        |
+| `refactor` | 代码重构        | `refactor: 重构用户验证逻辑`    |
+| `perf`   | 性能优化          | `perf: 优化图片加载速度`        |
+| `test`   | 添加或修改测试       | `test: 增加用户模块的单元测试`     |
+| `chore`  | 杂项(构建过程或辅助工具) | `chore: 更新依赖库`          |
+| `build`  | 构建系统或外部依赖变更   | `build: 升级webpack到版本5`  |
+| `ci`     | 持续集成配置变更      | `ci: 修改GitHub Actions配置文件` |
+| `revert` | 回滚            | `revert: 回滚feat: 增加用户注册功能` |
 
-docs: 文档变更
-用于提交仅文档相关的修改。
-例如：docs: 更新README文件
-
-style: 代码风格变动（不影响代码逻辑）
-用于提交仅格式化、标点符号、空白等不影响代码运行的变更。
-例如：style: 删除多余的空行
-
-refactor: 代码重构（既不是新增功能也不是修复bug的代码更改）
-用于提交代码重构。
-例如：refactor: 重构用户验证逻辑
-
-perf: 性能优化
-用于提交提升性能的代码修改。
-例如：perf: 优化图片加载速度
-
-test: 添加或修改测试
-用于提交测试相关的内容。
-例如：test: 增加用户模块的单元测试
-
-chore: 杂项（构建过程或辅助工具的变动）
-用于提交构建过程、辅助工具等相关的内容修改。
-例如：chore: 更新依赖库
-
-build: 构建系统或外部依赖项的变更
-用于提交影响构建系统的更改。
-例如：build: 升级webpack到版本5
-
-ci: 持续集成配置的变更
-用于提交CI配置文件和脚本的修改。
-例如：ci: 修改GitHub Actions配置文件
-
-revert: 回滚
-用于提交回滚之前的提交。
-例如：revert: 回滚feat: 增加用户注册功能
-```
-
-##包含规范
+## 头文件包含规范
 
 ```
 优先级由上到下
 1. 尽量使用前向声明
-2. 对应的头文件（foo.cpp → foo.h）
-3. 本项目其他头文件
-4. 第三方库头文件
-5. 标准库头文件
+2. 对应的头文件(foo.cpp → foo.h),使用 "" 号
+3. 本项目其他头文件,使用相对目录和 "" 号(../util/util_logger.h)
+4. 第三方库头文件,使用相对目录和 <> 号(<../spdlog/spdlog.h>)
+5. 标准库头文件,使用 <> 号(<iostream>)
 ```
-
