@@ -60,6 +60,22 @@ public:
      */
     bool IsRedirectOnly() const { return m_redirectOnly; }
 
+    /**
+     * @brief 设置重定向状态码（Open 前调用；仅重定向实例有意义）
+     *
+     * 默认 302。需要"重定向不改方法"的语义（PUT/POST 也原样跳转）时建议 308；
+     * 需要永久语义时 301/308（会进浏览器缓存，改回困难，默认不用）。
+     * @param status 301/302/303/307/308；非法值记 WARN 并忽略
+     */
+    void SetRedirectStatus(int status)
+    {
+        if (status == 301 || status == 302 || status == 303 ||
+            status == 307 || status == 308)
+            m_redirectStatus = status;
+        else
+            PUBLIC_LOG_WARN("ZmHttpFrontendServer::SetRedirectStatus 非法状态码 {},忽略", status);
+    }
+
     // ── 前端面可配置结构（业务层在 Open 前调用；平台层只给机制，不含具体路径） ──
     /**
      * @brief 注册路径封禁：请求命中 prefix（含子路径）一律 404
@@ -145,6 +161,7 @@ private:
     void CacheHeaderAdvice(const drogon::HttpRequestPtr& req,
                            const drogon::HttpResponsePtr& resp);
     bool m_redirectOnly = false;                 ///< 重定向专用实例标记
+    int m_redirectStatus = 302;                  ///< 重定向状态码(SetRedirectStatus 可改)
     std::vector<std::string> m_deniedPaths;      ///< 封禁前缀
     std::string m_docRoot;                       ///< SetDocumentRoot 缓存（构造页面绝对路径用）
     ZmStaticCacheConfig m_staticCache;           ///< 静态缓存头策略（defaultPolicy 空 = 关闭）

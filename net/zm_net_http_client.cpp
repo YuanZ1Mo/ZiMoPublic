@@ -103,6 +103,48 @@ ZmHttpResult MakeErrorResult(drogon::ReqResult err, int status)
     return r;
 }
 
+/// 客户端未就绪(未 Init/已 Close)的统一错误结果。
+/// err 保留 BadServerAddress 为兼容占位;判定请用 failure == ZmHttpFailure::NotReady
+/// (历史上此处挪用 BadServerAddress 造成监控误计,现由 failure 字段细分)。
+ZmHttpResult NotReadyResult()
+{
+    ZmHttpResult r = MakeErrorResult(drogon::ReqResult::BadServerAddress, 0);
+    r.failure = ZmHttpFailure::NotReady;
+    r.error = "ZmHttpClient 未初始化或已关闭(IsReady()==false)";
+    return r;
+}
+
+/// RFC 4648 base64(Basic 认证凭据注入用;仅进请求头,不落日志)
+string Base64Encode(const string& in)
+{
+    static constexpr char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    string out;
+    out.reserve((in.size() + 2) / 3 * 4);
+    size_t i = 0;
+    for (; i + 2 < in.size(); i += 3)
+    {
+        const uint32_t v = (static_cast<unsigned char>(in[i]) << 16) |
+                           (static_cast<unsigned char>(in[i + 1]) << 8) |
+                           static_cast<unsigned char>(in[i + 2]);
+        out += tbl[(v >> 18) & 0x3F];
+        out += tbl[(v >> 12) & 0x3F];
+        out += tbl[(v >> 6) & 0x3F];
+        out += tbl[v & 0x3F];
+    }
+    if (i < in.size())
+    {
+        const uint32_t b0 = static_cast<unsigned char>(in[i]);
+        const uint32_t b1 = (i + 1 < in.size()) ? static_cast<unsigned char>(in[i + 1]) : 0;
+        const uint32_t v = (b0 << 16) | (b1 << 8);
+        out += tbl[(v >> 18) & 0x3F];
+        out += tbl[(v >> 12) & 0x3F];
+        out += (i + 1 < in.size()) ? tbl[(v >> 6) & 0x3F] : '=';
+        out += '=';
+    }
+    return out;
+}
+
 /// @return 去掉首尾空白(空格/制表/CR/LF)的副本
 string Trim(const string& s)
 {
@@ -411,6 +453,28 @@ bool IsSensitiveHeader(const string& name)
     return l == "authorization" || l == "cookie" || l == "proxy-authorization";
 }
 
+/**
+ * @brief 判断头表中是否已有指定名字的头(大小写不敏感)
+ *
+ * HTTP 头名不区分大小写,而 std::map 的键区分:按原样 find 会漏判
+ * "authorization" 这类写法,导致再注入一份同名头(请求里出现两个 Authorization)。
+ *
+ * @param headers 头表(名字 → 值)
+ * @param name    待查头名(任意大小写)
+ * @return true 已存在同名头
+ */
+bool HasHeaderNoCase(const std::map<std::string, std::string>& headers,
+                     const std::string& name)
+{
+    const std::string want = ToLowerCopy(name);
+    for (const auto& kv : headers)
+    {
+        if (ToLowerCopy(kv.first) == want)
+            return true;
+    }
+    return false;
+}
+
 // 状态机前向声明(定义见下方"连接池实现"/"请求组装"小节;供内联成员函数体使用)
 using ZmHeaderList = std::vector<std::pair<string, string>>;  // 与下方定义同类型(重复声明合法)
 /// 取/建池并择路(实现见"连接池实现"小节)
@@ -460,18 +524,35 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
     {
     }
 
+    /// @return 取消令牌(SendAsync 句柄用;Start 前为空,调用方须在 Start 后取)
+    ZmCancelToken GetCancelToken() const { return m_cancel; }
+
     /// 在调用方线程启动(main/业务线程或上游回调线程均可;m_prelude 存在时先离核)
     void Start()
     {
         const auto& def = ZmHttpClient::GetOptions();
         m_retryBudget = (m_opts->retryCount >= 0) ? m_opts->retryCount: def.retryMax;
         m_totalBudget = def.maxTotalAttempts > 0 ? def.maxTotalAttempts: 8;
+        // 取消令牌:调用方提供的优先;否则自建(SendAsync 的句柄由此持有)
+        m_cancel = m_opts->cancelToken
+                       ? m_opts->cancelToken
+                       : std::make_shared<std::atomic<bool>>(false);
         m_headerSnapshot.clear();
         m_headerSnapshot.reserve(def.commonHeaders.size() + m_opts->headers.size());
         for (const auto& kv : def.commonHeaders)
             m_headerSnapshot.push_back(kv);
         for (const auto& kv: m_opts->headers)
             m_headerSnapshot.push_back(kv);
+        // Basic 认证注入:逐请求头与全局公共头都没有 Authorization 时才生成
+        // (跨域重定向仍会按敏感头剥除 —— PrepareRequest 的 IsSensitiveHeader)
+        if (!m_opts->basicAuthUser.empty() &&
+            !HasHeaderNoCase(m_opts->headers, "Authorization") &&
+            !HasHeaderNoCase(def.commonHeaders, "Authorization"))
+        {
+            m_headerSnapshot.push_back(
+                {"Authorization",
+                 "Basic " + Base64Encode(m_opts->basicAuthUser + ":" + m_opts->basicAuthPass)});
+        }
         m_t0 = std::chrono::steady_clock::now();
 
         if (m_prelude)
@@ -505,6 +586,17 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
     std::string m_curContentType;
 
   private:
+    /// 取消判定(令牌由任意线程置真;幂等检查点见 Start/NextAttempt/尝试回执)
+    bool Cancelled() const
+    {
+        return m_cancel && m_cancel->load(std::memory_order_acquire);
+    }
+    /// 取消终结(统一形态:NetworkFailure 兼容占位 + failure=Cancelled)
+    void FinishCancelled()
+    {
+        FinishErr(drogon::ReqResult::NetworkFailure, 0, "请求已被取消",
+                  ZmHttpFailure::Cancelled);
+    }
     /// 工作池线程:执行离核预组装并接续首跳;异常一律按网络失败终结
     void RunPreludeOnPool()
     {
@@ -514,10 +606,11 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
             if (!m_prelude(*this, err))
             {
                 PUBLIC_LOG_WARN("ZmHttpClient 离核预组装失败: {}", err);
-                // 本地错误(文件过大/打开失败等)与网络故障区分:错误分类仍是
-                // NetworkFailure(调用方按"可重试传输失败"处理),但带上可读原因,
-                // 否则排障时无法从"网络失败"分辨出其实是本地文件问题
-                FinishErr(drogon::ReqResult::NetworkFailure, 0, err);
+                // 本地错误(文件过大/打开失败等)与网络故障区分:err 保留
+                // NetworkFailure 为兼容占位,failure=LocalFile 才是权威分类,
+                // error 带可读原因 —— 三者合一,业务与监控都能正确分流
+                FinishErr(drogon::ReqResult::NetworkFailure, 0, err,
+                          ZmHttpFailure::LocalFile);
             }
             else
                 NextAttempt();  // 线程安全:状态机仅经 drogon queueInLoop 与池快照序列化触达共享面
@@ -525,7 +618,8 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
         catch (...)
         {
             PUBLIC_LOG_WARN("ZmHttpClient 离核预组装异常");
-            FinishErr(drogon::ReqResult::NetworkFailure, 0, "离核预组装异常(未捕获)");
+            FinishErr(drogon::ReqResult::NetworkFailure, 0, "离核预组装异常(未捕获)",
+                      ZmHttpFailure::LocalFile);
         }
     }
 
@@ -534,6 +628,11 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
     {
         if (m_finished)
             return;
+        if (Cancelled())
+        {
+            FinishCancelled();   // 重试/重定向链立即截断
+            return;
+        }
         if (!ZmHttpClient::IsReady())
         {
             // Close 竞态:拒绝在关闭后建池/回退 app loop
@@ -626,6 +725,12 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
         }
 
         int status = m_attemptResult.status;
+        // 取消检查点:在飞尝试收场后立即终结,不再进入重试/重定向分支
+        if (Cancelled())
+        {
+            FinishCancelled();
+            return;
+        }
         bool netRetriable = (m_attemptResult.err == drogon::ReqResult::Timeout ||
                              m_attemptResult.err == drogon::ReqResult::NetworkFailure);
         // 5xx 与 429(限流)可重试;429 的 Retry-After 由 RetryDelayMs 优先尊重
@@ -759,11 +864,13 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
         }
     }
 
-/// 直接以错误分类终结(错误码 + 状态码一并带回执)
-    void FinishErr(drogon::ReqResult err, int status, const std::string& why = {})
+/// 直接以错误分类终结(错误码 + 状态码一并带回执;failure 标注非传输层来源)
+    void FinishErr(drogon::ReqResult err, int status, const std::string& why = {},
+                   ZmHttpFailure failure = ZmHttpFailure::None)
     {
         ZmHttpResult r = MakeErrorResult(err, status);
         r.error = why;
+        r.failure = failure;
         Finish(std::move(r));
     }
 
@@ -791,12 +898,14 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
     RequestOptionsPtr m_opts;
     PreludeFn m_prelude;
     ZmMachineDoneFn m_onDone;
+    ZmCancelToken m_cancel;               ///< 取消令牌(Start 定型;opts 提供或自建)
     std::chrono::steady_clock::time_point m_t0;
 };
 
 // 发起状态机(前置:调用方已确认 IsReady;not-ready 由各级包装同步处理).
 // prelude 可空(JSON/表单走 nullptr,上传走离核预组装).
-void RunSendMachine(drogon::HttpMethod m, std::string url, ZMJSON body, std::string raw,
+// @return 状态机的取消令牌(SendAsync 句柄用;协程/同步形态忽略)
+ZmCancelToken RunSendMachine(drogon::HttpMethod m, std::string url, ZMJSON body, std::string raw,
                     std::string contentType, bool rawProvided,
                     ZmHttpClient::ZmHttpRequestOptionsPtr opts, ZmSendMachine::PreludeFn prelude,
                     ZmMachineDoneFn done)
@@ -805,6 +914,7 @@ void RunSendMachine(drogon::HttpMethod m, std::string url, ZMJSON body, std::str
         m, std::move(url), std::move(body), std::move(raw), std::move(contentType), rawProvided,
         std::move(opts), std::move(prelude), std::move(done));
     machine->Start();
+    return machine->GetCancelToken();
 }
 
 // 协程薄桥:帧内成员仅指针对齐(shared_ptr<ZmMachineCtx>/EventLoop*/coroutine_handle);
@@ -849,7 +959,7 @@ class ZmMachineAwaiter
     {
         if (!ZmHttpClient::IsReady())
         {
-            m_ctx->result = MakeErrorResult(drogon::ReqResult::BadServerAddress, 0);
+            m_ctx->result = NotReadyResult();
             return true;
         }
         return false;
@@ -1500,21 +1610,30 @@ drogon::Task<ZmHttpResult> ZmHttpClient::UploadCoro(const std::string& url,
 // ----------------------------------------------------------------------------
 
 /// 异步回调形态(完成回调线程 = lane loop)
-void ZmHttpClient::SendAsync(drogon::HttpMethod m, const std::string& url, const ZMJSON& body,
-                             std::function<void(ZmHttpResult)> cb,
-                             const ZmHttpRequestOptions& opts)
+ZmRequestHandle ZmHttpClient::SendAsync(drogon::HttpMethod m, const std::string& url,
+                                        const ZMJSON& body,
+                                        std::function<void(ZmHttpResult)> cb,
+                                        const ZmHttpRequestOptions& opts)
 {
     if (!cb)
-        return;
+        return {};
     if (!IsReady())
     {
-        cb(MakeErrorResult(drogon::ReqResult::BadServerAddress, 0));
-        return;
+        cb(NotReadyResult());
+        return {};
     }
-    // 直接发状态机,完成回调线程 = lane loop
-    RunSendMachine(m, url, body, string(), string(), false,
+    // 直接发状态机,完成回调线程 = lane loop;句柄 = 状态机取消令牌
+    auto token = RunSendMachine(m, url, body, string(), string(), false,
                    std::make_shared<const ZmHttpRequestOptions>(opts), {},
                    [cb = std::move(cb)](ZmHttpResult&& r) { cb(std::move(r)); });
+    ZmRequestHandle h;
+    h.token = token;
+    return h;
+}
+
+ZmCancelToken ZmHttpClient::MakeCancelToken()
+{
+    return std::make_shared<std::atomic<bool>>(false);
 }
 
 /// 同步形态:仅限业务线程(已登记 loop 线程一律拒绝)
@@ -1530,7 +1649,7 @@ ZmHttpResult ZmHttpClient::SendSync(drogon::HttpMethod m, const std::string& url
         return MakeErrorResult(drogon::ReqResult::NetworkFailure, 0);
     }
     if (!IsReady())
-        return MakeErrorResult(drogon::ReqResult::BadServerAddress, 0);
+        return NotReadyResult();
 
     // 直接发状态机,promise/future 桥接(完成回调线程 = lane loop;业务线程阻塞取)
     // 注:promise 不可拷贝,经 shared_ptr 包装以适配 std::function 的拷贝要求

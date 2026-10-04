@@ -68,6 +68,29 @@ public:
      */
     void RegisterMethod(const std::string& name, ZmJrpcMethodHandler handler);
 
+    /**
+     * @brief 注册**离核执行**的 method 处理器（RegisterMethod 的慢方法形态）
+     *
+     * 处理器在共享阻塞工作池（ZmHttpServer::WorkPool）执行，执行期间该请求的
+     * 协程挂起、事件循环继续服务其它连接 —— 慢方法（DB/磁盘/外部调用）不再拖死
+     * JRPC 面所在的事件循环。协程随后回事件循环取结果。
+     *
+     * ⚠ 工作池线程数有限（默认 8，SetWorkPoolSize 可调）：off-core 方法数量应
+     *   与池容量匹配，超长方法建议业务自建执行器。
+     * 其余语义（重复覆盖、run 后拒绝）同 RegisterMethod。
+     *
+     * @param name     方法名
+     * @param handler  处理器（在工作池线程执行；成功写 result 返回 true）
+     *
+     * @example
+     *   srv.RegisterMethodOffCore("user.query", [](const ZMJSON& params,
+     *                                              ZMJSON& result, ZMJSON& error) {
+     *       result = QueryDb(params);   // 慢操作,离核执行
+     *       return true;
+     *   });
+     */
+    void RegisterMethodOffCore(const std::string& name, ZmJrpcMethodHandler handler);
+
 protected:
     // ── 结构路由（per-port 门禁 + 协议 handler，自动挂到 GetRootPath()） ──
     /**
@@ -88,10 +111,12 @@ private:
      * @brief 协议校验与分发核心（返回完整 ZMJSON 信封）
      *
      * 校验顺序与错误码见 JSON-RPC 2.0（-32700/-32600/-32601/-32602/-32603）。
+     * 协程形态:off-core method（RegisterMethodOffCore 注册）经 RunOnPool 离核执行,
+     * 处理器运行期间事件循环不被占用。
      * @param req  解析后的请求 JSON
      * @return 响应信封（id → jsonrpc → result 或 error，恒 HTTP 200）
      */
-    ZMJSON Dispatch(const ZMJSON& req);
+    drogon::Task<ZMJSON> Dispatch(const ZMJSON& req);
 
     // ── 门禁实现 ──
     /// @brief per-port 门禁实现：本面端口且路径非本面 root（且非共享路径）→ 404
@@ -101,6 +126,8 @@ private:
     /// 方法名 → 处理器（Phase1 只写、运行期只读；RegisterMethod 有 run 后拒绝守卫
     /// 保证写入只发生在启动期，故无需加锁）
     std::map<std::string, ZmJrpcMethodHandler> m_methods;
+    /// 离核执行的方法名集合（RegisterMethodOffCore 登记；Phase1 只写、运行期只读）
+    std::set<std::string> m_offCoreMethods;
 };
 
 #endif /* ZM_NET_HTTP_JSONRPC_SERVER */

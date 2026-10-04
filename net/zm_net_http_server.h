@@ -207,14 +207,21 @@ public:
         //     改经 `SetCorsAllowedOrigins`（Open 前）声明，与 SetJsonp*/SetRootPath 同款。
     };
 
-    //    文件内容内存交付，受单请求 maxBytes 约束；大文件走 RegisterStreamCoro
+    //    文件部件**流式落盘**：边收边写临时文件（不驻留内存，单请求总量仍受
+    //    maxBytes 约束），业务经 SaveMultipartFile 落位；字段值仍驻内存（≤1MB）
     /**
      * @brief multipart 解析结果（表单字段 + 上传文件）
      */
     struct ZmMultipartResult
     {
         /**
-         * @brief 单个上传文件（内容驻留内存）
+         * @brief 单个上传文件（内容在流式临时文件中，不驻留内存）
+         *
+         * 只可移动、不可拷贝（tempPath 归属唯一）。生命周期契约：
+         *   · SaveMultipartFile(f, dest) 落位到目的地（成功即接管，析构不再删）；
+         *   · 或业务自行 MoveFile/消费后处置 tempPath；
+         *   · 都不做 → 析构自动删除临时文件（业务遗漏不泄漏磁盘）。
+         * ⚠ 需要延迟消费请把 File 移动走（本结构随响应协程结束销毁）。
          */
         struct File
         {
@@ -222,14 +229,39 @@ public:
             std::string fileName;      ///< 已消毒文件名（仅文件名段；空 = 无合法名）
             std::string contentType;   ///< 客户端声明的 Content-Type
             uint64_t size = 0;         ///< 文件字节数
-            std::string data;          ///< 内容（内存；有界 = 单请求 maxBytes）
+            std::string tempPath;      ///< 流式临时文件路径（UTF-8；内容在此，非内存）
+            File() = default;
+            File(File&& o) noexcept { *this = std::move(o); }
+            File& operator=(File&& o) noexcept
+            {
+                if (this != &o)
+                {
+                    DiscardTemp();
+                    itemName = std::move(o.itemName);
+                    fileName = std::move(o.fileName);
+                    contentType = std::move(o.contentType);
+                    size = o.size;
+                    claimed = o.claimed;
+                    tempPath = std::move(o.tempPath);
+                    o.tempPath.clear();
+                    o.claimed = false;
+                }
+                return *this;
+            }
+            File(const File&) = delete;
+            File& operator=(const File&) = delete;
+            ~File() { DiscardTemp(); }
+        private:
+            friend class ZmHttpServer;          ///< SaveMultipartFile 落位成功后置 claimed
+            bool claimed = false;               ///< 临时文件已被接管（析构不再删）
+            void DiscardTemp();                 ///< 删除未接管的临时文件（cpp 定义）
         };
         std::vector<std::pair<std::string, std::string>> fields;  ///< 表单字段（key,value）
-        std::vector<File> files;                                  ///< 上传文件列表
+        std::vector<File> files;                                  ///< 上传文件列表（只可移动）
     };
 
     using ZmMultipartHandler = std::function<drogon::Task<drogon::HttpResponsePtr>(
-        const drogon::HttpRequestPtr&, const ZmMultipartResult&)>;
+        const drogon::HttpRequestPtr&, ZmMultipartResult&)>;
 
     /**
      * @brief WebSocket 回调集（按注册名存入全局表）
@@ -317,6 +349,25 @@ public:
     static void Close();
 
     /**
+     * @brief 优雅排空并关闭（Close 的增强替代）
+     *
+     * 流程：置排空标志（新业务请求经 DrainGate 回 503+Retry-After；/ready 与
+     * /metrics 不受闸门拦截，前者回 503+draining、后者照常给出 inflight 快照）
+     * → 等在飞请求归零（inflight 计数）→ 复用 Close 收尾。超时兜底：超时后强制
+     * 关闭并返回 false（在飞业务善后仍归业务层，见 Close 注）。
+     *
+     * 线程纪律同 Close：须在业务线程调用，严禁服务器事件循环内。
+     *
+     * @param timeoutMs 等待在飞归零的上限毫秒（0 = 不等待直接关闭）
+     * @return true 完整排空后关闭；false 超时强关
+     *
+     * @example
+     *   // 收到退出信号后：LB 经 /ready 摘流量，等存量请求跑完再退出
+     *   ZmHttpServer::DrainAndClose(30000);
+     */
+    static bool DrainAndClose(uint32_t timeoutMs = 30000);
+
+    /**
      * @brief 是否已完成一次性初始化（可登记监听/路由）
      * @return true 状态为 Initialized/Opened；false 仍为 Uninit 或已 Closed
      *         （不看事件循环死活：Open 失败会回退到 Initialized 并允许修正后重试）
@@ -340,6 +391,7 @@ public:
         uint64_t s4xx = 0;            ///< 状态码 4xx
         uint64_t s5xx = 0;            ///< 状态码 5xx
         uint64_t inflight = 0;        ///< 在飞请求数（PreRouting 起算，PreSending 结算）
+        uint64_t rateLimited429 = 0;  ///< 被限流拒绝次数（ZmIpRateLimiter 429）
         uint64_t latencyLe100ms = 0;  ///< 耗时 ≤100ms
         uint64_t latencyLe500ms = 0;  ///< 100ms ~ 500ms
         uint64_t latencyLe2s = 0;     ///< 500ms ~ 2s
@@ -416,7 +468,7 @@ public:
      * @param path     路由路径（可含 {N} 占位符）
      * @param m        HTTP 方法
      * @param h        协程 handler（首参须按值 HttpRequestPtr）
-     * @param filters  过滤器名列表（须已 AddFilter 注册，未注册记 ERROR 但仍登记）
+     * @param filters  过滤器名列表（须已 AddFilter 注册，未注册拒绝整条路由）
      *
      * @example
      *   srv.RegisterCoro("/zimo/api/status", drogon::Get,
@@ -494,14 +546,17 @@ public:
                                        uint64_t maxBytes = 256ULL * 1024 * 1024);
 
     /**
-     * @brief 助手：多部件文件落盘（离核工作池）
+     * @brief 助手：多部件文件落位（离核工作池；同盘 rename 原子，跨盘 copy+delete）
      *
-     * 业务回调内必须经此落盘，不得直接写文件 —— 事件循环纪律。
-     * @param f         待落盘的文件（内容来自 ZmMultipartResult）
-     * @param destPath  目标文件路径
-     * @return 写入字节数；失败 -1
+     * 文件部件内容已在流式临时文件中（见 ZmMultipartResult::File），本函数把
+     * 临时文件落到目的地并**接管**（成功后 File 析构不再删除临时文件）。
+     * 业务回调内必须经此落位，不得直接写文件 —— 事件循环纪律。
+     * @param f         待落位的文件部件（须来自本次请求的 ZmMultipartResult）
+     * @param destPath  目标文件路径（UTF-8；已存在则覆盖）
+     * @return 落位字节数（= f.size）；临时文件缺失/路径非法/文件操作失败 -1
+     *         （失败时临时文件保留，可重试；业务放弃时随 File 析构清理）
      */
-    static drogon::Task<int64_t> SaveMultipartFile(const ZmMultipartResult::File& f,
+    static drogon::Task<int64_t> SaveMultipartFile(ZmMultipartResult::File& f,
                                                    const std::string& destPath);
 
     /**
@@ -1054,6 +1109,10 @@ protected:
         bool sizeFailed = false;  ///< 存在但取大小失败（否则 → 500）
         size_t size = 0;          ///< 文件字节数
         int64_t mtimeSec = 0;     ///< last_write_time → epoch 秒
+        /// last_write_time → epoch 起 100ns 数(FILETIME 粒度):供 ETag 使用,
+        /// 防止"同秒内同尺寸替换"造成的 ETag 不变 → 永久 304 脏缓存;0 = 未知
+        /// (回退秒粒度)。Last-Modified 仍用 mtimeSec(HTTP-date 秒粒度)。
+        int64_t mtimeNt100 = 0;
         /// 可选的 ETag 前缀(条目 id 等):非空时 ETag 形如 "<key>-<size>-<mtime>",
         /// 使 size/mtime 相同的不同条目各有各的 ETag;空 = 仅用 size-mtime
         std::string key;
@@ -1082,6 +1141,24 @@ protected:
      * @return 非空 = 304 响应；nullptr = 继续 200/206 流程
      */
     static drogon::HttpResponsePtr Maybe304(const drogon::HttpRequestPtr& req,
+                                            const ZmFileMeta& m,
+                                            const std::pair<std::string, std::string>& cacheHeaders);
+
+    /**
+     * @brief 写保护条件请求判定：If-Match / If-Unmodified-Since 不满足 → 412
+     *
+     * 语义（RFC 7232 3.1/3.4，两方法通用）：
+     *   · If-Match 按强比较逐项匹配当前强 ETag，全部不命中 → 412（并发覆盖写保护）；
+     *     值为 "*" 时资源存在即通过；
+     *   · If-Unmodified-Since 在无 If-Match 时生效：资源修改时间晚于该日期 → 412。
+     * 判定顺序在 If-None-Match 之前（RFC 7232 6：先评估前置条件）。
+     *
+     * @param req           请求（读 If-Match / If-Unmodified-Since）
+     * @param m             文件元信息
+     * @param cacheHeaders  CacheHeaders 产出的头对（取当前强 ETag）
+     * @return 非空 = 412 响应；nullptr = 前置条件满足，继续后续条件与正常流程
+     */
+    static drogon::HttpResponsePtr Maybe412(const drogon::HttpRequestPtr& req,
                                             const ZmFileMeta& m,
                                             const std::pair<std::string, std::string>& cacheHeaders);
 
@@ -1195,7 +1272,8 @@ private:
     static drogon::Task<drogon::HttpResponsePtr>
     SendFileCoroImpl(const drogon::HttpRequestPtr& req, const std::string& path,
                      const std::string& attachmentName, size_t fileSize,
-                     int64_t mtimeSec, const std::string& etagKey = "");
+                     int64_t mtimeSec, const std::string& etagKey = "",
+                     int64_t mtimeNt100 = 0);
 
     /**
      * @brief 已知元信息的流式发送内部实现（分工同 SendFileCoroImpl）
@@ -1212,7 +1290,7 @@ private:
                            const std::string& path,
                            const std::string& attachmentName,
                            const ZmHttpSendFileOptions& opts, size_t fileSize,
-                           int64_t mtimeSec);
+                           int64_t mtimeSec, int64_t mtimeNt100 = 0);
 
 };
 
@@ -1266,7 +1344,11 @@ void ZmHttpServer::RegisterCoroWithPathParams(const std::string& path, drogon::H
     for (const auto& fn : filters)
     {
         if (!CheckFilterRegistered(fn))
-            PUBLIC_LOG_ERROR("RegisterCoroWithPathParams[{}]: filter 未注册: {}", path, fn);
+        {
+            PUBLIC_LOG_ERROR("RegisterCoroWithPathParams[{}]: filter 未注册: {} → 拒绝注册"
+                             "(请先 AddFilter)", path, fn);
+            return;
+        }
         cons.emplace_back(fn);
     }
     // 原生注册：不经 PathPatternToRegex（{N} 由 drogon 自行转换为捕获组并绑定到形参）

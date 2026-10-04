@@ -45,7 +45,31 @@ void ZmHttpJsonRpcServer::RegisterMethod(const string& name, ZmJrpcMethodHandler
     }
     if (m_methods.count(name))
         PUBLIC_LOG_WARN("ZmHttpJsonRpcServer::RegisterMethod 重复覆盖: {}", name);
+    // 后注册者形态为准:同名若曾被登记为离核执行,本次重注册即摘除离核标记
+    m_offCoreMethods.erase(name);
     m_methods[name] = std::move(handler);   // 同名覆盖：后注册者生效
+}
+
+/**
+ * @brief 注册离核执行的 method 处理器（声明见头文件）
+ *
+ * 处理器本体仍存 m_methods（形态不变），仅额外在 m_offCoreMethods 登记名字 ——
+ * Dispatch 到该方法时经 RunOnPool 离核执行。同名经 RegisterMethod 重注册时
+ * 摘除离核标记（后注册者形态为准）。
+ */
+void ZmHttpJsonRpcServer::RegisterMethodOffCore(const std::string& name,
+                                                ZmJrpcMethodHandler handler)
+{
+    if (IsOpened())
+    {
+        PUBLIC_LOG_ERROR("ZmHttpJsonRpcServer::RegisterMethodOffCore 已拒绝"
+                         "(run 后 method 表只读): {}", name);
+        return;
+    }
+    if (m_methods.count(name))
+        PUBLIC_LOG_WARN("ZmHttpJsonRpcServer::RegisterMethodOffCore 重复覆盖: {}", name);
+    m_methods[name] = std::move(handler);
+    m_offCoreMethods.insert(name);
 }
 
 // ── 结构路由（per-port 门禁 + 协议 handler，自动挂到 GetRootPath()） ──
@@ -69,10 +93,11 @@ void ZmHttpJsonRpcServer::RegisterRoutes()
     });
 
     // ── JRPC 协议 handler（平台内建校验 + 信封，对齐 JrpcRequestReadCB 骨架） ──
-    // Dispatch 直接产出 ZMJSON 信封（id→jsonrpc→result|error 构造序），HTTP 恒 200
+    // Dispatch 协程产出 ZMJSON 信封（id→jsonrpc→result|error 构造序），HTTP 恒 200;
+    // off-core method 在 Dispatch 内离核执行,此处只挂起等待
     RegisterCoro(m_rootPath, HttpMethod::Post,
         [this](HttpRequestPtr req) -> Task<HttpResponsePtr> {
-            ZMJSON rsp = Dispatch(ParseRequest(req));
+            ZMJSON rsp = co_await Dispatch(ParseRequest(req));
             co_return ZmHttpServer::JsonResponse(200, rsp);
         });
 }
@@ -124,7 +149,7 @@ ZMJSON MakeJsonrpcError(int code, const string& message)
  * @param req  解析后的请求 JSON
  * @return 响应信封（id → jsonrpc → result 或 error）
  */
-ZMJSON ZmHttpJsonRpcServer::Dispatch(const ZMJSON& req)
+Task<ZMJSON> ZmHttpJsonRpcServer::Dispatch(const ZMJSON& req)
 {
     // 信封 ZMJSON 直构：构造序 id → jsonrpc → (result|error)
     // id 先占位 null，后续校验分支按需改值（改值不调整键序）；jsonrpc 恒 "2.0"
@@ -136,7 +161,7 @@ ZMJSON ZmHttpJsonRpcServer::Dispatch(const ZMJSON& req)
     if (req.is_null())
     {
         rsp["error"] = MakeJsonrpcError(-32700, "Parse error");
-        return rsp;
+        co_return rsp;
     }
 
     // 必须是对象。批量数组本面**有意不支持**（规范要求回批量信封数组，与本面
@@ -145,7 +170,7 @@ ZMJSON ZmHttpJsonRpcServer::Dispatch(const ZMJSON& req)
     {
         rsp["error"] =
             MakeJsonrpcError(-32600, "Invalid Request (batch requests are not supported)");
-        return rsp;
+        co_return rsp;
     }
 
     // id 必须存在。本面**有意不支持 JSON-RPC 通知**（通知按规范不回包，而本面
@@ -156,7 +181,7 @@ ZMJSON ZmHttpJsonRpcServer::Dispatch(const ZMJSON& req)
     {
         rsp["error"] = MakeJsonrpcError(
             -32600, "Invalid Request, Missing id Parameter (notifications are not supported)");
-        return rsp;
+        co_return rsp;
     }
     rsp["id"] = req["id"];               // 校验通过后才回填 id（保证键序不变）
 
@@ -165,14 +190,14 @@ ZMJSON ZmHttpJsonRpcServer::Dispatch(const ZMJSON& req)
         req["jsonrpc"].get<string>() != "2.0")
     {
         rsp["error"] = MakeJsonrpcError(-32600, "Invalid Request, Missing jrpc Parameter");
-        return rsp;
+        co_return rsp;
     }
 
     // -32600 method
     if (!req.contains("method") || !req["method"].is_string())
     {
         rsp["error"] = MakeJsonrpcError(-32600, "Invalid Request, Missing method Parameter");
-        return rsp;
+        co_return rsp;
     }
     string method = req["method"].get<string>();
 
@@ -181,7 +206,7 @@ ZMJSON ZmHttpJsonRpcServer::Dispatch(const ZMJSON& req)
     {
         // 文案须描述真实原因：params 存在但类型非法（原文案说 "Missing"，误导排障）
         rsp["error"] = MakeJsonrpcError(-32602, "Invalid params, params must be object or array");
-        return rsp;
+        co_return rsp;
     }
     ZMJSON params = req.contains("params") ? req["params"] : ZMJSON::object();
 
@@ -190,20 +215,35 @@ ZMJSON ZmHttpJsonRpcServer::Dispatch(const ZMJSON& req)
     if (it == m_methods.end())
     {
         rsp["error"] = MakeJsonrpcError(-32601, "Method not found: " + method);
-        return rsp;
+        co_return rsp;
     }
 
-    // 业务处理（异常兜底 -32603）
+    // 业务处理（异常兜底 -32603;离核方法经 RunOnPool 在工作池执行,
+    // 处理器运行期间事件循环继续服务其它连接）
     ZMJSON result, error;
     try
     {
-        if (!(it->second)(params, result, error))
+        bool ok = false;
+        if (m_offCoreMethods.count(method))
+        {
+            // 捕获引用:协程挂起期间帧存活,工作池线程读写安全(m_methods 运行期只读)
+            auto& fn = it->second;
+            ok = co_await ZmHttpServer::RunOnPool<bool>(
+                [&fn, &params, &result, &error]() -> bool {
+                    return fn(params, result, error);
+                });
+        }
+        else
+        {
+            ok = (it->second)(params, result, error);
+        }
+        if (!ok)
         {
             // 业务自报失败：给了 error 对象就用它，否则回通用 -32603
             rsp["error"] = error.is_object()
                                ? error
                                : MakeJsonrpcError(-32603, "Internal error");
-            return rsp;
+            co_return rsp;
         }
     }
     catch (const std::exception& e)
@@ -211,17 +251,17 @@ ZMJSON ZmHttpJsonRpcServer::Dispatch(const ZMJSON& req)
         // 业务异常不上抛：统一转 -32603，避免协程栈上抛出导致连接被断
         PUBLIC_LOG_ERROR("JRPC method '{}' 异常: {}", method, e.what());
         rsp["error"] = MakeJsonrpcError(-32603, "Internal error");
-        return rsp;
+        co_return rsp;
     }
     catch (...)
     {
         // 非 std 异常（裸类型抛出）同样必须收口：否则穿透协程 → 框架断连接而非回 -32603
         PUBLIC_LOG_ERROR("JRPC method '{}' 异常(非 std::exception)", method);
         rsp["error"] = MakeJsonrpcError(-32603, "Internal error");
-        return rsp;
+        co_return rsp;
     }
     rsp["result"] = result;
-    return rsp;
+    co_return rsp;
 }
 
 // ── 门禁实现 ──

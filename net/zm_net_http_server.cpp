@@ -28,6 +28,8 @@
 #include <cctype>
 #include <deque>
 #include <chrono>
+#include <cmath>
+#include <thread>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -163,7 +165,12 @@ public:
     void ReadChunk(uint64_t want)
     {
         DWORD rd = 0;
-        auto buf = std::make_shared<std::string>();
+        // 复用块缓冲(省每块一次大块分配):预读窗口恒为 1 块 —— 上一块已在
+        // OnReadDone 中拷入 trantor 输出缓冲并随其帧结束释放,Next 只会在其
+        // 返回后经 runAfter 调度,故本缓冲任一时刻只有 I/O 线程单一在途填充。
+        if (!m_chunkBuf)
+            m_chunkBuf = std::make_shared<std::string>();
+        std::shared_ptr<std::string> buf = m_chunkBuf;
         buf->resize(want);
         const BOOL readOk =
             ::ReadFile(m_handle, buf->data(), static_cast<DWORD>(want), &rd, nullptr);
@@ -191,6 +198,8 @@ private:
     bool m_fini = false;
     int m_inFlight = 0;   // 在途异步读计数(仅事件循环线程访问)
     bool m_closed = false;
+    /// 复用的读块缓冲(预读窗口 = 1 块,见 ReadChunk 注;仅 I/O 线程填充)
+    std::shared_ptr<std::string> m_chunkBuf;
     /// 本响应起点的连接累计发送字节(水位判定的排水量基准)
     uint64_t m_baseConnSent = 0;
     /// 被水位挡住时的下一轮延后(毫秒;1 起步翻倍到 250 封顶,排水恢复即归零)
@@ -235,6 +244,7 @@ static std::atomic<uint64_t> s_m_s3xx{0};
 static std::atomic<uint64_t> s_m_s4xx{0};
 static std::atomic<uint64_t> s_m_s5xx{0};
 static std::atomic<uint64_t> s_m_inflight{0};
+static std::atomic<uint64_t> s_m_rateLimited{0};   // 被限流拒绝(429)独立计数
 static std::atomic<uint64_t> s_m_latLe100{0};
 static std::atomic<uint64_t> s_m_latLe500{0};
 static std::atomic<uint64_t> s_m_latLe2s{0};
@@ -942,6 +952,7 @@ std::atomic<bool> s_startReady{false};
 std::atomic<bool> s_initClaimed{false};   // Init 单次执行门(CAS 抢占,防并发双跑)
 std::atomic<bool> s_trustProxy{false};    // 限流 key 是否取 X-Forwarded-For 首跳
 std::atomic<bool> s_closing{false};       // Close 已接手收尾(锁外的 quit+join 进行中)
+std::atomic<bool> s_draining{false};      // 排空中(DrainAndClose 置位;Close 复位,防进程内复用一直 503)
 
 /**
  * @brief 把服务器事件循环登记进 ZmHttpClient 的已登记 loop 表
@@ -1060,6 +1071,87 @@ drogon::Task<HttpResponsePtr> HandlePing(HttpRequestPtr req)
 }
 
 /**
+ * @brief 就绪探针:liveness(/ping)之外的 readiness 检查
+ *
+ * 200 {"ok":true} = 正常服务;503 {"ok":false,"reason":"draining"} = 排空中
+ * (DrainAndClose 已置位)。供 LB/K8s 在滚动更新时摘流量 —— /ping 只答"进程在",
+ * /ready 答"还能接新业务"。
+ * 本路由不受 DrainGate 拦截(排空期唯一能拿到 draining 语义的入口)。
+ *
+ * @return JSON 响应(200/503)
+ */
+drogon::Task<HttpResponsePtr> HandleReady(HttpRequestPtr req)
+{
+    ZMJSON data;
+    if (s_draining.load(std::memory_order_acquire))
+    {
+        data["ok"] = false;
+        data["reason"] = "draining";
+        co_return ZmHttpServer::JsonResponse(503, data);
+    }
+    data["ok"] = true;
+    co_return ZmHttpServer::JsonResponse(200, data);
+}
+
+/**
+ * @brief 指标导出:进程级计数快照(总/状态段/在飞/延迟桶/被限流),JSON 形态
+ *
+ * 统计口径见 GetMetricsSnapshot;监控抓取即可,无需接 Prometheus 库。
+ *
+ * @return JSON 响应(200)
+ */
+drogon::Task<HttpResponsePtr> HandleMetrics(HttpRequestPtr req)
+{
+    const auto m = ZmHttpServer::GetMetricsSnapshot();
+    ZMJSON data;
+    data["total"] = static_cast<uint64_t>(m.total);
+    data["s2xx"] = static_cast<uint64_t>(m.s2xx);
+    data["s3xx"] = static_cast<uint64_t>(m.s3xx);
+    data["s4xx"] = static_cast<uint64_t>(m.s4xx);
+    data["s5xx"] = static_cast<uint64_t>(m.s5xx);
+    data["inflight"] = static_cast<uint64_t>(m.inflight);
+    data["latencyLe100ms"] = static_cast<uint64_t>(m.latencyLe100ms);
+    data["latencyLe500ms"] = static_cast<uint64_t>(m.latencyLe500ms);
+    data["latencyLe2s"] = static_cast<uint64_t>(m.latencyLe2s);
+    data["latencyGt2s"] = static_cast<uint64_t>(m.latencyGt2s);
+    data["rateLimited429"] = static_cast<uint64_t>(m.rateLimited429);
+    data["workPoolSize"] = static_cast<uint64_t>(ZmHttpServer::GetWorkPoolSize());
+    data["draining"] = s_draining.load(std::memory_order_acquire);
+    co_return ZmHttpServer::JsonResponse(200, data);
+}
+
+/**
+ * @brief 排空闸门:排空中对新业务请求一律 503(排空期不再接新业务)
+ *
+ * 挂在 RecordAccessStart 之后(保持"访问起始 advice 必为首个 PreRouting"不变式:
+ * 503 响应仍带请求 ID 并经 PreSending 出口结算,inflight 配对不破)。
+ * 已 inflight 的请求不受影响,自然跑完后由 DrainAndClose 的等待归零。
+ * 探测与指标端点(/ready /metrics)放行:排空期仍需可观测 —— /ready 自行回
+ * 503+draining(见 HandleReady),/metrics 继续暴露 inflight 供观察归零。
+ *
+ * @param req 请求(取 path 判定是否放行)
+ * @param cb  短路回调(排空中 → 503)
+ * @param cc  放行回调
+ */
+void DrainGate(const HttpRequestPtr& req, AdviceCallback&& cb, AdviceChainCallback&& cc)
+{
+    if (!s_draining.load(std::memory_order_acquire))
+    {
+        cc();
+        return;
+    }
+    const std::string& path = req->path();
+    if (path == "/ready" || path == "/metrics")
+    {
+        cc();
+        return;
+    }
+    auto resp = ZmHttpServer::ErrorResponse(503, "server draining");
+    resp->addHeader("Retry-After", "5");
+    cb(std::move(resp));
+}
+
+/**
  * @brief 记录访问起始时间与请求 ID(观察式 advice,不改流向)
  *
  * 起始时间与请求 ID 都写进 req attributes,供响应出口结算时取用;
@@ -1103,6 +1195,8 @@ void GateNonStreamBody(const HttpRequestPtr& req, AdviceCallback&& cb,
             {
                 if (std::stoull(cl) > limit && req->getHeader("X-File-Size").empty())
                 {
+                    PUBLIC_LOG_WARN("非流式请求体超限拒绝: 声明 {} 字节(上限 {}), path={}",
+                                    cl, limit, req->path());
                     cb(ZmHttpServer::ErrorResponse(413, "body too large"));
                     return;
                 }
@@ -1352,6 +1446,11 @@ bool ZmHttpServer::Init(const Options& opts)
     MarkShared("/ping");
     // 注:本捆绑 drogon 的 FunctionTraits 协程特化要求 handler 首参为按值 HttpRequestPtr
     app().registerHandler("/ping", &HandlePing, { HttpMethod::Get });
+    // readiness(/ready)与指标(/metrics):同为平台共享路径,三面均可达
+    MarkShared("/ready");
+    app().registerHandler("/ready", &HandleReady, { HttpMethod::Get });
+    MarkShared("/metrics");
+    app().registerHandler("/metrics", &HandleMetrics, { HttpMethod::Get });
 
     // 请求访问记录(:不用 AccessLogger/access.log,
     // 格式化后经公共库日志 PUBLIC_LOG_* 承载,与运行日志同文件按标签区分)。
@@ -1361,6 +1460,8 @@ bool ZmHttpServer::Init(const Options& opts)
     //   结算 —— 若本 advice 被排到短路者之后,那些响应取不到 "ZmRequestId"
     //   (drogon 对缺失键返回空串),表现为空 X-Request-Id 头与日志行首 "[]"。
     app().registerPreRoutingAdvice(&RecordAccessStart);
+    // 排空闸门:DrainAndClose 置位后对新请求 503(详见 DrainGate 注)
+    app().registerPreRoutingAdvice(&DrainGate);
     // ⚠ 观察结算不注册在此:drogon 1.9.13 的 PostHandling advice 只覆盖
     //    controller/binder 响应路径(HttpServer.cc:658/692/764),静态目录(含 304)、
     //    Range 响应、重定向等经 sendResponses 直达发送链,不经本 advice ——
@@ -1571,12 +1672,14 @@ void ZmHttpServer::Close()
     ZmRuntimeState cur = s_state.load();
     if (cur == ZmRuntimeState::Uninit || cur == ZmRuntimeState::Closed)
     {
+        s_draining.store(false, std::memory_order_release);
         return;   // 幂等:未启动 / 已关闭
     }
     if (cur == ZmRuntimeState::Initialized)
     {
         // 未 Open 就直接 Close:仅回退状态
         s_state.store(ZmRuntimeState::Closed);
+        s_draining.store(false, std::memory_order_release);
         s_stateCv.notify_all();
         return;
     }
@@ -1606,9 +1709,46 @@ void ZmHttpServer::Close()
 
     lock.lock();
     s_closing.store(false);
+    s_draining.store(false, std::memory_order_release);   // 终态即复位排空标志
     UnregisterServerLoops();  // :与 RegisterServerLoops 对称注销
     s_stateCv.notify_all();   // 唤醒并发 Open/Close 的等待
     PUBLIC_LOG_INFO("ZmHttpServer::Close 完成(已 quit+Stop,终态)");
+}
+
+/**
+ * @brief 优雅排空并关闭(可选替代 Close 的收尾方式)
+ *
+ * 流程:置排空标志(DrainGate 对新业务请求回 503+Retry-After;/ready 与 /metrics
+ * 不受闸门拦截:前者回 503+draining,后者照常给出 inflight 快照)→ 等在飞请求归零
+ * (inflight 由 PreRouting 起算、PreSending 结算,排空后新请求不再 inflight)
+ * → 复用 Close 收尾。超时兜底:超时后仍执行 Close(不再等待,行为等同普通 Close,
+ * 在飞业务的善后仍归业务层 —— 见 Close 的"在飞 HTTP 语义"注)。
+ *
+ * 线程纪律与 Close 相同:须在业务线程调用(严禁服务器事件循环内)。
+ * 幂等性:重复调用安全(排空标志幂等,Close 幂等)。
+ *
+ * @param timeoutMs 等待在飞归零的上限毫秒(0 = 只发 503 不等待,直接 Close)
+ * @return true 在飞归零后关闭(完整排空);false 超时强关(在飞请求可能被截断)
+ */
+bool ZmHttpServer::DrainAndClose(uint32_t timeoutMs)
+{
+    s_draining.store(true, std::memory_order_release);
+    PUBLIC_LOG_INFO("ZmHttpServer::DrainAndClose 开始排空(上限 {} ms)", timeoutMs);
+
+    const int64_t deadline = NowMs() + static_cast<int64_t>(timeoutMs);
+    while (s_m_inflight.load(std::memory_order_acquire) > 0)
+    {
+        if (static_cast<int64_t>(timeoutMs) <= 0 || NowMs() >= deadline)
+        {
+            PUBLIC_LOG_WARN("ZmHttpServer::DrainAndClose 超时,在飞 {} 未归零,强制关闭",
+                            s_m_inflight.load(std::memory_order_relaxed));
+            Close();
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    Close();
+    return true;
 }
 
 /**
@@ -1653,6 +1793,7 @@ ZmHttpServer::ZmMetrics ZmHttpServer::GetMetricsSnapshot()
     m.s4xx = s_m_s4xx.load(std::memory_order_relaxed);
     m.s5xx = s_m_s5xx.load(std::memory_order_relaxed);
     m.inflight = s_m_inflight.load(std::memory_order_relaxed);
+    m.rateLimited429 = s_m_rateLimited.load(std::memory_order_relaxed);
     m.latencyLe100ms = s_m_latLe100.load(std::memory_order_relaxed);
     m.latencyLe500ms = s_m_latLe500.load(std::memory_order_relaxed);
     m.latencyLe2s = s_m_latLe2s.load(std::memory_order_relaxed);
@@ -1789,7 +1930,7 @@ void ZmHttpServer::Setup()
  * @param path     路由路径,占位符写作 {id}(如 "/api/user/{id}")
  * @param m        HTTP 方法
  * @param h        业务协程 handler(返回空响应时回 500)
- * @param filters  filter 名列表(须已经 AddFilter 注册;未注册仅记错误日志)
+ * @param filters  filter 名列表(须已经 AddFilter 注册;未注册拒绝整条路由)
  *
  * @example
  *   api.RegisterCoro("/api/user/{id}", Get,
@@ -1810,7 +1951,13 @@ void ZmHttpServer::RegisterCoro(const string& path, drogon::HttpMethod m,
     for (const auto& fn : filters)
     {
         if (!CheckFilterRegistered(fn))
-            PUBLIC_LOG_ERROR("RegisterCoro[{}]: filter 未注册: {}", path, fn);
+        {
+            // fail-fast:未注册 filter 意味着路由约束形同虚设(甚至注册期崩溃),
+            // 拖到运行期暴露代价更高 —— 直接拒绝整条路由
+            PUBLIC_LOG_ERROR("RegisterCoro[{}]: filter 未注册: {} → 拒绝注册"
+                             "(请先 AddFilter)", path, fn);
+            return;
+        }
         cons.emplace_back(fn);
     }
     // 适配:本捆绑 drogon 的 FunctionTraits 协程特化要求 HttpRequestPtr 按值;
@@ -1943,7 +2090,7 @@ bool ZmHttpServer::CheckPathParamPlaceholders(const string& path, size_t arity,
  * @param m           HTTP 方法
  * @param h           业务协程 handler
  * @param deadlineMs  业务超时(毫秒);必须 > 0,无超时需求请改用 RegisterCoro
- * @param filters     filter 名列表(须已经 AddFilter 注册;未注册仅记错误日志)
+ * @param filters     filter 名列表(须已经 AddFilter 注册;未注册拒绝整条路由)
  *
  * @example
  *   api.RegisterCoroWithDeadline("/api/heavy", Post, HandleHeavy, 30000);
@@ -2028,7 +2175,11 @@ void ZmHttpServer::RegisterCoroWithDeadline(const string& path, drogon::HttpMeth
     for (const auto& fn : filters)
     {
         if (!CheckFilterRegistered(fn))
-            PUBLIC_LOG_ERROR("RegisterCoroWithDeadline[{}]: filter 未注册: {}", path, fn);
+        {
+            PUBLIC_LOG_ERROR("RegisterCoroWithDeadline[{}]: filter 未注册: {} → 拒绝注册"
+                             "(请先 AddFilter)", path, fn);
+            return;
+        }
         cons.emplace_back(fn);
     }
 
@@ -2135,6 +2286,9 @@ struct ZmMultipartCollector
     uint64_t total = 0;
     uint64_t maxBytes = 0;        // 单请求总量上限(0 = 不限制)
     bool tooLarge = false;        // 累积超限/字段超限(交付 413)
+    // 文件部件流式落盘:当前部件的临时文件句柄(result.files.back() 一一对应)
+    HANDLE curFile = INVALID_HANDLE_VALUE;
+    bool ioFailed = false;        // 临时文件创建/写入失败(交付 500;临时件随析构清理)
 };
 
 /**
@@ -2166,6 +2320,62 @@ std::string SanitizeFileName(std::string name)
         return "";
     return out;
 }
+
+/// multipart 流式临时文件的进程内序号(防重名)
+std::atomic<uint64_t> s_mpTempSeq{0};
+
+/**
+ * @brief 为文件部件创建流式临时文件(系统临时目录;CREATE_NEW 保证唯一)
+ *
+ * FILE_ATTRIBUTE_TEMPORARY:内容短驻(业务随即落位/删除),尽量留在内存缓存不落盘。
+ *
+ * @param outUtf8Path 成功时回填临时文件路径(UTF-8)
+ * @return 文件句柄;失败 INVALID_HANDLE_VALUE(调用方转 ioFailed → 500)
+ */
+HANDLE CreateMultipartTemp(std::string& outUtf8Path)
+{
+    wchar_t tmpDir[MAX_PATH + 2] = {};
+    const DWORD n = ::GetTempPathW(MAX_PATH + 1, tmpDir);
+    if (n == 0 || n > MAX_PATH)
+        return INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 8; ++attempt)
+    {
+        const uint64_t seq = s_mpTempSeq.fetch_add(1, std::memory_order_relaxed);
+        wchar_t name[MAX_PATH + 64] = {};
+        const int nameLen = _snwprintf_s(name, _countof(name), _TRUNCATE,
+                                         L"%szmmp-%lu-%llu.tmp", tmpDir,
+                                         static_cast<unsigned long>(::GetCurrentProcessId()),
+                                         static_cast<unsigned long long>(seq));
+        if (nameLen < 0)
+            return INVALID_HANDLE_VALUE;   // 临时目录过长被截断:不落到半截名上
+        HANDLE h = ::CreateFileW(name, GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                 FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        if (h != INVALID_HANDLE_VALUE)
+        {
+            outUtf8Path = ZmString::Unicode_To_UTF8(name);
+            return h;
+        }
+        if (::GetLastError() != ERROR_FILE_EXISTS)
+            return INVALID_HANDLE_VALUE;   // 非重名(权限/磁盘等)不重试
+    }
+    return INVALID_HANDLE_VALUE;
+}
+
+/**
+ * @brief 删除 multipart 临时文件(UTF-8 路径);失败只告警
+ *
+ * @param utf8Path 临时文件路径(UTF-8;空 = 无事可做)
+ */
+void DeleteMultipartTempQuiet(const std::string& utf8Path)
+{
+    if (utf8Path.empty())
+        return;
+    const std::wstring w = ZmString::UTF8_To_Unicode(utf8Path);
+    if (w.empty() || ::DeleteFileW(w.c_str()))
+        return;
+    PUBLIC_LOG_WARN("multipart 临时文件清理失败(GetLastError={}): {}",
+                    ::GetLastError(), utf8Path);
+}
 }  // namespace
 
 /**
@@ -2178,7 +2388,7 @@ std::string SanitizeFileName(std::string name)
  * @param path      路由路径(含 {N} 占位符时自动改走 regex 注册)
  * @param m         HTTP 方法
  * @param h         业务协程 handler(收到收集完成的字段与文件)
- * @param filters   filter 名列表(须已经 AddFilter 注册;未注册仅记错误日志)
+ * @param filters   filter 名列表(须已经 AddFilter 注册;未注册拒绝整条路由)
  * @param maxBytes  单请求总量上限(0 = 不限制,由全局配置兜底)
  */
 /**
@@ -2191,10 +2401,17 @@ struct ZmMultipartHeaderCb
     void operator()(MultipartHeader header) const
 {
 
-    if (state->tooLarge)
+    if (state->tooLarge || state->ioFailed)
         return;
     if (state->fieldActive && state->fieldMode)
         state->result.fields.emplace_back(state->curFieldKey, state->curField);
+    // 部件切换:上一个文件部件的临时句柄在此收口(数据不会再写它)
+    if (!state->fieldMode && state->fieldActive &&
+        state->curFile != INVALID_HANDLE_VALUE)
+    {
+        ::CloseHandle(state->curFile);
+        state->curFile = INVALID_HANDLE_VALUE;
+    }
     state->fieldActive = true;
     if (header.filename.empty())
     {
@@ -2206,11 +2423,21 @@ struct ZmMultipartHeaderCb
     else
     {
         state->fieldMode = false;
+        // 文件部件:开流式临时文件(边收边写,内容不驻留内存)
+        std::string tmpPath;
+        HANDLE hFile = CreateMultipartTemp(tmpPath);
+        if (hFile == INVALID_HANDLE_VALUE)
+        {
+            state->ioFailed = true;   // 下一个数据块到达时统一停消费
+            return;
+        }
         ZmHttpServer::ZmMultipartResult::File f;
         f.itemName = header.name;
         f.fileName = SanitizeFileName(header.filename);
         f.contentType = header.contentType;
+        f.tempPath = std::move(tmpPath);
         state->result.files.push_back(std::move(f));
+        state->curFile = hFile;
     }
 }
 };
@@ -2226,8 +2453,12 @@ struct ZmMultipartDataCb
     void operator()(const char* buf, size_t len) const
 {
 
-    if (state->tooLarge)
+    if (state->tooLarge || state->ioFailed)
+    {
+        // (首次)停止消费:超限/io 失败后剩余网络数据一律丢弃
+        stream->setStreamReader(drogon::RequestStreamReader::newNullReader());
         return;
+    }
     if (state->fieldMode)
     {
         if (state->curFieldSize + static_cast<int64_t>(len) > kMaxFieldBytes)
@@ -2244,8 +2475,20 @@ struct ZmMultipartDataCb
     }
     else
     {
+        // 文件部件:边收边写临时文件(网络块粒度,同步写事件循环可承受;
+        // 大块写盘走 RegisterStreamCoro 的 ZmUploadSink 异步路径)
         auto& f = state->result.files.back();
-        f.data.append(buf, len);
+        DWORD wrote = 0;
+        if (state->curFile == INVALID_HANDLE_VALUE ||
+            !::WriteFile(state->curFile, buf, static_cast<DWORD>(len), &wrote, nullptr) ||
+            wrote != len)
+        {
+            PUBLIC_LOG_ERROR("multipart 临时文件写入失败(GetLastError={}): {}",
+                             ::GetLastError(), f.tempPath);
+            state->ioFailed = true;
+            stream->setStreamReader(drogon::RequestStreamReader::newNullReader());
+            return;
+        }
         f.size += len;
     }
     state->total += len;
@@ -2272,7 +2515,7 @@ struct ZmMultipartDispatch
     {
         try
         {
-            auto resp = co_await h(req, std::move(res));
+            auto resp = co_await h(req, res);   // 非 const 引用:业务可经 SaveMultipartFile 接管临时件
             if (resp)
                 cb(resp);
             else
@@ -2303,8 +2546,23 @@ struct ZmMultipartFinishCb
     void operator()(std::exception_ptr e) const
 {
 
+    // 统一收口当前文件部件句柄 —— 后续 tooLarge/异常路径的临时文件清理
+    // (File 析构 DeleteFileW)依赖句柄已关
+    if (state->curFile != INVALID_HANDLE_VALUE)
+    {
+        ::CloseHandle(state->curFile);
+        state->curFile = INVALID_HANDLE_VALUE;
+    }
+    if (state->ioFailed)
+    {
+        // 临时文件创建/写入失败:已收的临时件随 state 析构(File 析构)自动清理
+        cb(ZmHttpServer::ErrorResponse(500, "multipart temp io error"));
+        return;
+    }
     if (state->tooLarge)
     {
+        PUBLIC_LOG_WARN("multipart 超限拒绝: 已收 {} 字节(上限 {})",
+                        state->total, state->maxBytes);
         cb(ZmHttpServer::ErrorResponse(413, "multipart too large"));
         return;
     }
@@ -2333,7 +2591,11 @@ void ZmHttpServer::RegisterMultipartCoro(const string& path, drogon::HttpMethod 
     for (const auto& fn : filters)
     {
         if (!CheckFilterRegistered(fn))
-            PUBLIC_LOG_ERROR("RegisterMultipartCoro[{}]: filter 未注册: {}", path, fn);
+        {
+            PUBLIC_LOG_ERROR("RegisterMultipartCoro[{}]: filter 未注册: {} → 拒绝注册"
+                             "(请先 AddFilter)", path, fn);
+            return;
+        }
         cons.emplace_back(fn);
     }
 
@@ -2398,14 +2660,41 @@ void ZmHttpServer::RegisterMultipartCoro(const string& path, drogon::HttpMethod 
 }
 
 /**
- * @brief 把 multipart 收集到的文件部件落盘
+ * @brief 删除未接管的 multipart 流式临时文件(File::DiscardTemp 的 cpp 实现)
  *
- * 经 RunOnPool 投递到业务工作池执行(事件循环纪律:业务回调内禁止直接写文件);
- * 路径按 UTF-8 契约转 wide 后打开,按 64MB 分块循环写入以支持大文件。
+ * 删除同样是文件系统操作,按事件循环纪律投到阻塞工作池执行;提交失败(池已停等)
+ * 就地删除兜底 —— 宁可阻塞一次事件循环,也不把临时件留在盘上。
+ */
+void ZmHttpServer::ZmMultipartResult::File::DiscardTemp()
+{
+    if (tempPath.empty() || claimed)
+        return;
+    // 副本先落地:提交抛异常时兜底路径仍可用(move 进 lambda 会让原串失效)
+    const std::string path = std::move(tempPath);
+    tempPath.clear();
+    try
+    {
+        ZmHttpServer::WorkPool().Submit([path]() { DeleteMultipartTempQuiet(path); });
+        return;
+    }
+    catch (...)
+    {
+        PUBLIC_LOG_WARN("multipart 临时文件清理任务提交失败,改为就地删除: {}", path);
+    }
+    DeleteMultipartTempQuiet(path);
+}
+
+/**
+ * @brief 把 multipart 收集到的文件部件落位到目的地(离核工作池)
  *
- * @param f         待落盘的文件部件(内容已在内存中)
- * @param destPath  目标文件路径(UTF-8 编码)
- * @return 写入的字节数;路径转换失败、创建文件失败或写盘失败时返回 -1
+ * 内容已在流式临时文件中,本函数做的是**移动**而非重写:同盘
+ * MoveFileExW(REPLACE_EXISTING) 原子落位;跨盘(移动失败 ERROR_NOT_SAME_DEVICE)
+ * 退化为 CopyFileW + DeleteFileW。成功即接管临时文件(f.claimed = true,
+ * File 析构不再删);失败时临时文件保留可重试,业务放弃时随 File 析构清理。
+ *
+ * @param f         待落位的文件部件(来自本次请求的 ZmMultipartResult)
+ * @param destPath  目标文件路径(UTF-8 编码;已存在则覆盖)
+ * @return 落位字节数(= f.size);临时文件缺失/路径非法/文件操作失败 -1
  *
  * @example
  *   int64_t n = co_await ZmHttpServer::SaveMultipartFile(res.files[0], "D:/up/a.bin");
@@ -2413,47 +2702,50 @@ void ZmHttpServer::RegisterMultipartCoro(const string& path, drogon::HttpMethod 
  *       co_return ZmHttpServer::ErrorResponse(500, "save failed");
  */
 /**
- * @brief 多部件文件落盘任务:在阻塞工作池内分块写入(事件循环不得直接写文件)
+ * @brief 多部件文件落位任务:在阻塞工作池内执行(事件循环不得直接碰文件系统)
+ *
+ * 只负责搬文件;落位成功的"接管"标记由 SaveMultipartFile 在协程侧置位
+ * (claimed 是 File 私有成员,仅 ZmHttpServer 可写)。
  */
-struct ZmMultipartWriteTask
+struct ZmMultipartPlaceTask
 {
-    const ZmHttpServer::ZmMultipartResult::File* f = nullptr;   ///< 待落盘文件部件
-    const std::string*                           destPath = nullptr;  ///< 目标路径(UTF-8)
+    ZmHttpServer::ZmMultipartResult::File* f = nullptr;   ///< 待落位文件部件
+    const std::string*                     destPath = nullptr;  ///< 目标路径(UTF-8)
 
     int64_t operator()() const
 {
 
-    std::wstring wpath = ZmString::UTF8_To_Unicode(*destPath);
-    if (wpath.empty())
+    if (f->tempPath.empty())
         return -1;
-    HANDLE h = ::CreateFileW(wpath.c_str(), GENERIC_WRITE, 0, nullptr,
-                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE)
+    const std::wstring wsrc = ZmString::UTF8_To_Unicode(f->tempPath);
+    const std::wstring wdst = ZmString::UTF8_To_Unicode(*destPath);
+    if (wsrc.empty() || wdst.empty())
         return -1;
-    const char* p = f->data.data();
-    size_t off = 0;
-    while (off < f->data.size())
+
+    // 同盘:rename 原子落位;跨盘:copy + delete 退化
+    if (!::MoveFileExW(wsrc.c_str(), wdst.c_str(), MOVEFILE_REPLACE_EXISTING))
     {
-        DWORD chunk = static_cast<DWORD>(
-            std::min<size_t>(f->data.size() - off, (1u << 26)));
-        DWORD wrote = 0;
-        if (!::WriteFile(h, p + off, chunk, &wrote, nullptr) || wrote == 0)
-        {
-            ::CloseHandle(h);
+        if (::GetLastError() != ERROR_NOT_SAME_DEVICE)
             return -1;
-        }
-        off += wrote;
+        if (!::CopyFileW(wsrc.c_str(), wdst.c_str(), FALSE))
+            return -1;
+        if (!::DeleteFileW(wsrc.c_str()))
+            PUBLIC_LOG_WARN("multipart 跨盘落位后临时文件删除失败(GetLastError={}): {}",
+                            ::GetLastError(), f->tempPath);   // 已落位,垃圾件不致命
     }
-    ::CloseHandle(h);
-    return static_cast<int64_t>(f->data.size());
+    return static_cast<int64_t>(f->size);
 }
 };
 
-drogon::Task<int64_t> ZmHttpServer::SaveMultipartFile(const ZmMultipartResult::File& f,
+drogon::Task<int64_t> ZmHttpServer::SaveMultipartFile(ZmMultipartResult::File& f,
                                                       const string& destPath)
 {
-    // 离核工作池写盘(事件循环纪律:回调内禁止直接写文件);路径 UTF-8 → wide
-    co_return co_await RunOnPool<int64_t>(ZmMultipartWriteTask{&f, &destPath});
+    // 离核工作池落位(事件循环纪律:回调内禁止直接碰文件系统);路径 UTF-8 → wide
+    const int64_t n = co_await RunOnPool<int64_t>(ZmMultipartPlaceTask{&f, &destPath});
+    // 接管:临时件已迁到目的地,File 析构不再删除;失败保留临时件供重试/析构清理
+    if (n >= 0)
+        f.claimed = true;
+    co_return n;
 }
 
 // ── 流式接收(路径 B;与 Options.enableRequestStream 配套) ──
@@ -2519,9 +2811,11 @@ public:
     }
 
 private:
-    /// 写积压上限(条);超出即中止上传,保证缓冲内存有界。
-    /// 注:须 ≥ 单次同步灌入的最大块数(读回调挂上前 drogon 会同步吐出已缓冲块)
+    /// 写积压上限:条数与**字节数双水位**,任一超出即中止上传,保证缓冲内存有界。
+    /// 条数防止极端多块;字节数使内存上限不受 trantor 单块大小(本方不可控)影响。
+    /// 注:条数须 ≥ 单次同步灌入的最大块数(读回调挂上前 drogon 会同步吐出已缓冲块)
     static constexpr size_t kUploadQueueCap = 128;
+    static constexpr uint64_t kUploadQueueCapBytes = 64ULL * 1024 * 1024;
 
     /**
      * @brief 构造执行器(只存参数,不启动写线程;请经 Create 走完整流程)
@@ -2716,6 +3010,7 @@ private:
                 if (!m_pending.empty())
                 {
                     item = std::move(m_pending.front());
+                    m_pendingBytes -= item.size();
                     m_pending.pop_front();
                 }
                 else
@@ -2818,11 +3113,13 @@ private:
         bool overflow = false;
         {
             std::lock_guard lk(m_wmtx);
-            if (m_pending.size() >= kUploadQueueCap)
-                overflow = true;   // 写积压超限 → 中止,内存有界
+            if (m_pending.size() >= kUploadQueueCap ||
+                m_pendingBytes + len > kUploadQueueCapBytes)
+                overflow = true;   // 写积压超限(条数/字节) → 中止,内存有界
             else
             {
                 m_pending.emplace_back(buf, len);   // 一次拷贝(网络块 → 写队)
+                m_pendingBytes += len;
                 m_wcv.notify_all();                 // 唤醒写线程消费
             }
         }
@@ -2890,6 +3187,7 @@ private:
     std::mutex m_wmtx;
     std::condition_variable m_wcv;
     std::deque<std::string> m_pending;          ///< FIFO 写队列(事件循环入队/写线程消费)
+    size_t m_pendingBytes = 0;                  ///< 队列积压字节(m_wmtx 保护;与 m_pending 同步增减)
     std::atomic<bool> m_wStop{false};           ///< 停止请求(中止/超限/网络中断)
     std::atomic<bool> m_streamEnded{false};     ///< 请求体已结束(写线程排空后收尾)
     std::atomic<bool> m_writerDead{false};      ///< 写线程已退出(防入队到无人消费)
@@ -2965,7 +3263,7 @@ drogon::Task<bool> ZmHttpServer::SaveStreamToFile(drogon::RequestStreamPtr strea
  * @param path      路由路径(含 {N} 占位符时自动改走 regex 注册)
  * @param m         HTTP 方法
  * @param h         业务协程 handler(形参含 RequestStreamPtr)
- * @param filters   filter 名列表(须已经 AddFilter 注册;未注册仅记错误日志)
+ * @param filters   filter 名列表(须已经 AddFilter 注册;未注册拒绝整条路由)
  * @param maxBytes  路由级上传上限(0 = 不额外限制,由全局配置兜底):X-File-Size
  *                  声明超限 → 丢剩余并 413(newNullReader),并把上限写 req
  *                  attributes("ZmStreamMaxBytes")供业务 SaveStreamToFile 兜底取用
@@ -3015,7 +3313,11 @@ void ZmHttpServer::RegisterStreamCoro(const string& path, drogon::HttpMethod m,
     for (const auto& fn : filters)
     {
         if (!CheckFilterRegistered(fn))
-            PUBLIC_LOG_ERROR("RegisterStreamCoro[{}]: filter 未注册: {}", path, fn);
+        {
+            PUBLIC_LOG_ERROR("RegisterStreamCoro[{}]: filter 未注册: {} → 拒绝注册"
+                             "(请先 AddFilter)", path, fn);
+            return;
+        }
         cons.emplace_back(fn);
     }
 
@@ -3884,7 +4186,11 @@ ZmHttpServer::ZmFileMeta ZmHttpServer::FetchFileMeta(const string& path)
     ft.HighPart = fad.ftLastWriteTime.dwHighDateTime;
     constexpr uint64_t kEpochDiff100ns = 116444736000000000ULL;   // 1601→1970 的 100ns 数
     if (ft.QuadPart >= kEpochDiff100ns)
-        m.mtimeSec = static_cast<int64_t>((ft.QuadPart - kEpochDiff100ns) / 10000000ULL);
+    {
+        const uint64_t nt100 = ft.QuadPart - kEpochDiff100ns;
+        m.mtimeSec = static_cast<int64_t>(nt100 / 10000000ULL);
+        m.mtimeNt100 = static_cast<int64_t>(nt100);   // 100ns 粒度:ETag 防同秒碰撞
+    }
     return m;
 }
 
@@ -3898,11 +4204,15 @@ ZmHttpServer::ZmFileMeta ZmHttpServer::FetchFileMeta(const string& path)
  */
 pair<string, string> ZmHttpServer::CacheHeaders(const ZmFileMeta& m)
 {
-    // ETag 前缀(如条目 id):区分 size/mtime 恰好相同的不同条目
+    // ETag 前缀(如条目 id):区分 size/mtime 恰好相同的不同条目。
+    // 时间分量优先用 100ns 粒度:同秒内同尺寸替换(秒粒度 ETag 不变)会令
+    // 客户端永久 304 脏缓存;100ns 粒度下内容替换必然改变 ETag。
+    // 未知(0,如旧调用方只传秒)回退秒粒度。Last-Modified 保持秒(HTTP-date 粒度)。
     string etag = "\"";
     if (!m.key.empty())
         etag += m.key + "-";
-    etag += std::to_string(m.size) + "-" + std::to_string(m.mtimeSec) + "\"";
+    etag += std::to_string(m.size) + "-" +
+            std::to_string(m.mtimeNt100 > 0 ? m.mtimeNt100 : m.mtimeSec) + "\"";
     return {HttpDateStr(m.mtimeSec), std::move(etag)};
 }
 
@@ -4015,6 +4325,71 @@ drogon::HttpResponsePtr ZmHttpServer::Maybe304(const HttpRequestPtr& req,
     return nullptr;
 }
 
+drogon::HttpResponsePtr ZmHttpServer::Maybe412(const HttpRequestPtr& req,
+                                               const ZmFileMeta& m,
+                                               const pair<string, string>& cacheHeaders)
+{
+    // 412 响应统一形态:不带 body(前置条件失败,非业务错误包)
+    auto preconditionFailed = [] {
+        auto resp = HttpResponse::newHttpResponse();
+        resp->setStatusCode(k412PreconditionFailed);
+        return resp;
+    };
+
+    // ① If-Match:强比较(按 RFC,If-Match 必须强比较;弱 ETag 不命中)。
+    //    列表任一项命中(或 "*")即通过;全部不命中 → 412。
+    string im = req->getHeader("If-Match");
+    if (!im.empty())
+    {
+        string etagN = StripEtagTag(cacheHeaders.second);   // 当前强 ETag(本方生成的本就无 W/)
+        bool hit = (im == "*");
+        if (!hit && !etagN.empty())
+        {
+            size_t pos = 0;
+            while (pos <= im.size())
+            {
+                size_t comma = im.find(',', pos);
+                string tag = im.substr(pos, comma == string::npos ? string::npos : comma - pos);
+                size_t b = tag.find_first_not_of(" \t");
+                size_t e = tag.find_last_not_of(" \t");
+                tag = (b == string::npos) ? string() : tag.substr(b, e - b + 1);
+                // 强比较:带 W/ 前缀的项直接不命中(StripEtagTag 去前缀后无法区分,
+                // 故先查原始片段是否以 W/ 开头)
+                bool weak = tag.size() >= 2 &&
+                            (tag[0] == 'W' || tag[0] == 'w') && tag[1] == '/';
+                if (!tag.empty() && !weak && StripEtagTag(tag) == etagN)
+                {
+                    hit = true;
+                    break;
+                }
+                if (comma == string::npos)
+                    break;
+                pos = comma + 1;
+            }
+        }
+        if (!hit)
+            return preconditionFailed();
+        return nullptr;   // If-Match 命中 → If-Unmodified-Since 不再评估(RFC 7232 6)
+    }
+
+    // ② If-Unmodified-Since:仅无 If-Match 时评估;资源修改晚于该日期 → 412
+    string ius = req->getHeader("If-Unmodified-Since");
+    if (!ius.empty())
+    {
+        try
+        {
+            trantor::Date d = drogon::utils::getHttpDate(ius);
+            if (m.mtimeSec > d.microSecondsSinceEpoch() / 1000000)
+                return preconditionFailed();
+        }
+        catch (...)
+        {
+            // 日期非法 → 当作未提供
+        }
+    }
+    return nullptr;
+}
+
 bool ZmHttpServer::IfRangeAllowsPartial(const HttpRequestPtr& req,
                                         const pair<string, string>& cacheHeaders)
 {
@@ -4061,7 +4436,8 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileCoro(const HttpRequestPtr& r
         co_return ErrorResponse(404, "file not found");
     if (m.sizeFailed)
         co_return ErrorResponse(500, "file stat failed");
-    co_return co_await SendFileCoroImpl(req, path, attachmentName, m.size, m.mtimeSec);
+    co_return co_await SendFileCoroImpl(req, path, attachmentName, m.size, m.mtimeSec,
+                                        "", m.mtimeNt100);
 }
 
 /**
@@ -4075,24 +4451,31 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileCoro(const HttpRequestPtr& r
  * @param fileSize        文件总大小(字节,调用方已 stat)
  * @param mtimeSec        文件修改时间(epoch 秒,调用方已 stat)
  * @param etagKey         ETag 前缀(空 = 仅 size-mtime);须与方案乙同源
- * @return 文件响应(200/206/304/416)
+ * @param mtimeNt100      文件修改时间的 100ns 粒度值(ETag 防同秒碰撞;0 = 未知)
+ * @return 文件响应(200/206/304/412/416)
  */
 drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileCoroImpl(const HttpRequestPtr& req,
                                                              const string& path,
                                                              const string& attachmentName,
                                                              size_t fileSize,
                                                              int64_t mtimeSec,
-                                                             const string& etagKey)
+                                                             const string& etagKey,
+                                                             int64_t mtimeNt100)
 {
     ZmFileMeta m;                       // 元信息由公开入口/Hybrid 已取,此处只组装
     m.size = fileSize;
     m.mtimeSec = mtimeSec;
+    m.mtimeNt100 = mtimeNt100;
     // ETag 前缀与方案乙同源:否则同一文件在 Hybrid 阈值两侧拿到不同 ETag,
     // 缓存验证器与 If-Range 判定会随路径不同而打架
     m.key = etagKey;
 
-    // ① 条件请求(304 无 body);命中即返回,不再走 Range/200
+    // ① 写保护条件请求(412):If-Match/If-Unmodified-Since 不满足即拒绝,
+    //    判定顺序在 If-None-Match 之前(RFC 7232 6)
     auto cacheHeaders = CacheHeaders(m);
+    if (auto precond = Maybe412(req, m, cacheHeaders))
+        co_return precond;
+    // ② 条件请求(304 无 body);命中即返回,不再走 Range/200
     if (auto notMod = Maybe304(req, m, cacheHeaders))
         co_return notMod;
 
@@ -4175,7 +4558,7 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoro(const HttpRequest
     if (m.sizeFailed)
         co_return ErrorResponse(500, "file stat failed");
     co_return co_await SendFileStreamCoroImpl(req, path, attachmentName, opts,
-                                              m.size, m.mtimeSec);
+                                              m.size, m.mtimeSec, m.mtimeNt100);
 }
 
 /**
@@ -4190,18 +4573,24 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoro(const HttpRequest
  * @param opts            分块粒度/块间间隔/停滞放弃阈值/进度回调
  * @param fileSize        文件总大小(字节,调用方已 stat)
  * @param mtimeSec        文件修改时间(epoch 秒,调用方已 stat)
- * @return 流式响应(200/206/304/416)
+ * @param mtimeNt100      文件修改时间的 100ns 粒度值(ETag 防同秒碰撞;0 = 未知)
+ * @return 流式响应(200/206/304/412/416)
  */
 drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileStreamCoroImpl(
     const HttpRequestPtr& req, const string& path, const string& attachmentName,
-    const ZmHttpSendFileOptions& opts, size_t fileSize, int64_t mtimeSec)
+    const ZmHttpSendFileOptions& opts, size_t fileSize, int64_t mtimeSec,
+    int64_t mtimeNt100)
 {
-    // ① 条件请求(304 无 body);命中即返回,不再走流式
+    // ① 写保护条件请求(412):If-Match/If-Unmodified-Since 不满足即拒绝
     ZmFileMeta m;
     m.size = fileSize;
     m.mtimeSec = mtimeSec;
+    m.mtimeNt100 = mtimeNt100;
     m.key = opts.etagKey;   // 可选:让 ETag 带上条目身份,避免跨条目碰撞
     auto cacheHeaders = CacheHeaders(m);
+    if (auto precond = Maybe412(req, m, cacheHeaders))
+        co_return precond;
+    // ② 条件请求(304 无 body);命中即返回,不再走流式
     if (auto notMod = Maybe304(req, m, cacheHeaders))
         co_return notMod;
 
@@ -4301,9 +4690,9 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileHybridCoro(const HttpRequest
         co_return ErrorResponse(500, "file stat failed");
     if (m.size < threshold)
         co_return co_await SendFileCoroImpl(req, path, attachmentName, m.size, m.mtimeSec,
-                                            streamOpts.etagKey);
+                                            streamOpts.etagKey, m.mtimeNt100);
     co_return co_await SendFileStreamCoroImpl(req, path, attachmentName, streamOpts,
-                                              m.size, m.mtimeSec);
+                                              m.size, m.mtimeSec, m.mtimeNt100);
 }
 
 // ── 流式工厂 ──
@@ -4515,8 +4904,10 @@ HttpResponsePtr ZmHttpServer::FileResponse(const HttpRequestPtr& req, const stri
         return NotFoundResponse(req);
     }
 
-    // 条件请求(增强):命中 → 304 无 body(与 SendFile* 同一判定)
+    // 条件请求(增强):412 写保护 → 304 命中即无 body(与 SendFile* 同一判定)
     auto cacheHeaders = CacheHeaders(m);
+    if (auto precond = Maybe412(req, m, cacheHeaders))
+        return precond;
     if (auto notMod = Maybe304(req, m, cacheHeaders))
         return notMod;
 
@@ -4880,6 +5271,17 @@ static string FirstForwardedFor(const HttpRequestPtr& req)
 bool ZmHttpServer::ZmIpRateLimiter::Check(const drogon::HttpRequestPtr& req,
                                           drogon::HttpResponsePtr& resp)
 {
+    // 429 响应统一构造:Retry-After 提示"本桶时间单位"的整秒上限
+    // (ceil(timeUnitSec);限流器不暴露精确重置时刻,取单位上限是保守合法值)。
+    // 被限流独立计数,便于与业务 4xx 分开监控。
+    auto limited = [](double timeSec) {
+        s_m_rateLimited.fetch_add(1, std::memory_order_relaxed);
+        auto r = ZmHttpServer::ErrorResponse(429, "rate limited");
+        r->addHeader("Retry-After", std::to_string(
+            static_cast<long long>(timeSec > 0 ? std::ceil(timeSec) : 60)));
+        return r;
+    };
+
     // 限流 key:默认只认对端 IP —— 反代/负载均衡后置时全体客户端会同桶,
     // 需经 Options.trustProxyHeaders 显式开启 X-Forwarded-For(该头可伪造,
     // 只在入口已被可信代理覆写时才可信任)。
@@ -4898,7 +5300,7 @@ bool ZmHttpServer::ZmIpRateLimiter::Check(const drogon::HttpRequestPtr& req,
         switch (it->second.kind)
         {
         case ZmOverlayRule::Blocked:
-            resp = ErrorResponse(429, "rate limited");   // 引用入参:无条件赋值(doFilter 判非空)
+            resp = limited(m_impl->timeSec);   // 引用入参:无条件赋值(doFilter 判非空)
             return false;
         case ZmOverlayRule::Allowed:
             return true;
@@ -4907,7 +5309,7 @@ bool ZmHttpServer::ZmIpRateLimiter::Check(const drogon::HttpRequestPtr& req,
             // 专项额度:桶挂在规则上(进程内一 IP 一桶,稳态零锁)
             if (it->second.quota->Get(m_impl->type)->isAllowed())
                 return true;
-            resp = ErrorResponse(429, "rate limited");
+            resp = limited(it->second.timeSec);
             return false;
         }
         default:
@@ -4917,7 +5319,7 @@ bool ZmHttpServer::ZmIpRateLimiter::Check(const drogon::HttpRequestPtr& req,
     auto lim = m_impl->BucketFor(ip);
     if (lim->isAllowed())
         return true;
-    resp = ErrorResponse(429, "rate limited");
+    resp = limited(m_impl->timeSec);
     return false;
 }
 

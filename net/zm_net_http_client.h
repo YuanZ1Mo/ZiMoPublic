@@ -27,9 +27,11 @@
 #include <../drogon/include/drogon/HttpClient.h>
 #include <../drogon/include/drogon/utils/coroutine.h>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 
 // 本文件只用 EventLoop 的指针(形参与成员),前向声明即可
@@ -42,16 +44,58 @@ class EventLoop;
 // 公共类型
 // ----------------------------------------------------------------------------
 
+/// 取消令牌:MakeCancelToken 创建,持有方可随时置真请求取消(线程安全)
+/// 语义为**尽力而为**:立即截断重试/重定向链;已在飞的单次尝试无法中断,
+/// 待其收场(响应/超时)后立即以 Cancelled 错误终结。结果仍恰一次交付。
+using ZmCancelToken = std::shared_ptr<std::atomic<bool>>;
+
 /// 单次请求运行时选项(每请求覆盖全局默认)
 struct ZmHttpRequestOptions
 {
-    double timeoutSec = 0;              ///< 0 = 全局默认; -1 = 不超时
+    /// 总超时(秒):0 = 全局默认(defaultTimeoutSec);-1 = 不超时。
+    /// 下载通道(DownloadCoro)例外:0/-1 = 不设总超时,>0 = 会话总时长上限。
+    double timeoutSec = 0;
     int    retryCount = -1;             ///< -1 = 全局默认; 0 = 不重试
     bool   idempotent = false;          ///< 非幂等方法显式声明后可重试(配合业务重放语义)
     bool   followRedirect = true;       ///< 跟随重定向(上限走全局 maxRedirects)
-    trantor::EventLoop* resumeLoop = nullptr;  ///< 协程恢复目标 loop(空 = 客户端 lane loop;线程亲和业务用)
+    trantor::EventLoop* resumeLoop = nullptr;  ///< 协程恢复目标 loop(空 = 调用方所属 loop;线程亲和业务用)
+    /// 取消令牌(空 = 不可取消;SendAsync 自带句柄无需设置本项)
+    ZmCancelToken cancelToken;
     std::map<std::string, std::string> headers;   ///< 追加头
+    /// 认证注入便捷项:basicAuthUser 非空时自动生成 "Authorization: Basic
+    /// base64(user:pass)"(仅当调用方未在 headers 显式提供 Authorization 时注入;
+    /// 跨域重定向仍按敏感头剥除)。Bearer 等 token 形态请直接用 headers。
+    std::string basicAuthUser;
+    std::string basicAuthPass;
+    /// 下载通道专用(DownloadCoro):最终文件总量上限,字节;0 = 不限。
+    /// 含续传基线 —— 206 续传时按"已有 .part 大小 + 本次响应量"累计判定,
+    /// 超限即失败(.part 保留);普通 lane 忽略本项。
+    uint64_t maxDownloadBytes = 0;
     size_t maxBodyBytes = 0;            ///< 0 = 全局护栏
+};
+
+/// 失败来源细分(与 err 互补):err 对齐 drogon 传输层分类(网络/超时/TLS…),
+/// 本字段标注**非传输层**的失败来源,供监控/排障区分"网络问题"与"客户端/本地问题"。
+/// 判定优先级:failure != None 时以 failure 为准(err 此时只是兼容性占位)。
+enum class ZmHttpFailure
+{
+    None,       ///< 无(传输层正常分类)
+    NotReady,   ///< 客户端未初始化/已关闭(IsReady()==false;err 为兼容占位)
+    LocalFile,  ///< 客户端本地失败(文件过大/打开/落盘/校验、受理失败等;err 兼容占位为 NetworkFailure)
+    Cancelled   ///< 调用方经 cancelToken/句柄请求取消(err 兼容占位为 NetworkFailure)
+};
+
+/// 在飞请求句柄(SendAsync 返回):Cancel() 置真取消令牌(线程安全,可重复)
+struct ZmRequestHandle
+{
+    std::weak_ptr<std::atomic<bool>> token;   ///< 状态机的取消令牌(终态后自动失效)
+    /// 请求取消(尽力而为):立即截断重试/重定向链;已在飞的单次尝试无法中断,
+    /// 待其收场后立即终结 —— 结果仍恰一次回调(错误形态,failure=Cancelled)
+    void Cancel() const
+    {
+        if (auto t = token.lock())
+            t->store(true, std::memory_order_release);
+    }
 };
 
 /// 统一结果(业务感知的唯一载体;错误分类对齐 drogon ReqResult)
@@ -69,6 +113,8 @@ struct ZmHttpResult
     /// 失败原因可读文本。本地错误（离核预组装失败：文件过大/打开失败等）必定填充，
     /// 网络类错误可空；判定"是不是网络问题"请看 err，不要看 error 是否为空
     std::string error;
+    /// 失败来源细分(见 ZmHttpFailure):非 None 时优先于 err 判读
+    ZmHttpFailure failure = ZmHttpFailure::None;
 
     /// Content-Type 为 JSON 时解析为 ZMJSON(解析失败空对象 + 告警日志)
     ZMJSON Json() const;
@@ -136,9 +182,13 @@ public:
     static drogon::Task<ZmHttpResult> UploadCoro(const std::string& url,
         const std::string& filePath, const std::string& field, const ZmHttpRequestOptions& opts = {});  // multipart 手拼
 
-    // ── 回调(异步兼容) ──
-    static void SendAsync(drogon::HttpMethod m, const std::string& url, const ZMJSON& body,
+    // ── 回调(异步兼容;返回取消句柄,不需要可忽略) ──
+    static ZmRequestHandle SendAsync(drogon::HttpMethod m, const std::string& url, const ZMJSON& body,
         std::function<void(ZmHttpResult)> cb, const ZmHttpRequestOptions& opts = {});
+
+    /// 创建取消令牌(供 SendCoro/SendSync/DownloadCoro 经 opts.cancelToken 使用;
+    /// SendAsync 自带句柄无需本项)。持有方对 token 置真即请求取消。
+    static ZmCancelToken MakeCancelToken();
 
     // ── 同步(仅限业务线程/客户端自持工作池;所有已登记 loop 线程一律拒绝) ──
     static ZmHttpResult SendSync(drogon::HttpMethod m, const std::string& url,
@@ -152,7 +202,11 @@ public:
         uint64_t written = 0;     ///< 最终文件大小(字节)
         uint64_t resumedFrom = 0; ///< 续传起始偏移(0 = 全新下载)
         std::string error;        ///< 失败原因(ok=false 时)
+        /// 失败来源细分(见 ZmHttpFailure):非 None 时优先于 error 文本判读
+        ZmHttpFailure failure = ZmHttpFailure::None;
     };
+    /// @note opts.timeoutSec 在本通道为会话总时长上限(0/-1 = 不限);
+    ///       失败来源见 ZmDownloadResult::failure
     static drogon::Task<ZmDownloadResult> DownloadCoro(const std::string& url,
         const std::string& destPath, const ZmHttpRequestOptions& opts = {});  // 断点续传:起点恒 =.part 现有大小,If-Range 校验,不符回退 0
 

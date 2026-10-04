@@ -19,6 +19,11 @@
 #include <../drogon/include/drogon/utils/coroutine.h>
 
 #include <windows.h>
+#include <bcrypt.h>
+
+#if defined(_MSC_VER)
+#pragma comment(lib, "bcrypt.lib")
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -324,6 +329,39 @@ bool IsSafeHeaderValue(const string& s)
     return true;
 }
 
+/// RFC 4648 base64 解码(Content-MD5 头校验用);含非法字符返回空串
+std::string Base64Decode(const std::string& in)
+{
+    auto val = [](unsigned char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    std::string out;
+    // 累加器只保留低 24 位(一组 4 字符的位宽):否则长输入持续左移会溢出
+    uint32_t acc = 0;
+    int bits = 0;
+    for (unsigned char c : in)
+    {
+        if (c == '=' || c == '\r' || c == '\n' || c == ' ' || c == '\t')
+            continue;
+        const int v = val(c);
+        if (v < 0)
+            return {};
+        acc = ((acc << 6) | static_cast<uint32_t>(v)) & 0xFFFFFFu;
+        bits += 6;
+        if (bits >= 8)
+        {
+            bits -= 8;
+            out += static_cast<char>((acc >> bits) & 0xFF);
+        }
+    }
+    return out;
+}
+
 // ----------------------------------------------------------------------------
 // 单次下载会话 dlLoop:解析/编排/指令入队;写线程:唯一盘上执行者;Done 恰一次(写线程).
 // ----------------------------------------------------------------------------
@@ -357,6 +395,18 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
         s->m_chunkBytes = def.downloadChunkBytes > 0 ? def.downloadChunkBytes: 1024 * 1024;
         s->m_stallAbortMs = def.downloadStallAbortMs > 0 ? (int64_t)def.downloadStallAbortMs: 120000;
         s->m_qCap = def.downloadQueueMaxBytes > 0 ? def.downloadQueueMaxBytes: 64ULL * 1024 * 1024;
+
+        // 配额/总超时定型(逐请求选项覆盖;0 = 不启用)
+        s->m_startMs = NowMs();
+        if (s->m_opts)
+        {
+            if (s->m_opts->maxDownloadBytes > 0)
+                s->m_maxBytes = s->m_opts->maxDownloadBytes;
+            if (s->m_opts->timeoutSec > 0)
+                s->m_deadlineMs = s->m_startMs +
+                    static_cast<int64_t>(s->m_opts->timeoutSec * 1000.0);
+            s->m_cancel = s->m_opts->cancelToken;
+        }
 
         s->m_tgt = ParseDownloadUrl(url);
         if (!s->m_tgt.ok)
@@ -503,6 +553,7 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
         // 兜底摘除:未走 Deliver 的路径(异常/放弃)也要放掉 destPath 互斥。
         // 放在 join 之后:写线程可能正在 Deliver 里摘同一把登记。
         ReleaseDestClaim();
+        Md5Cleanup();
     }
 
   private:
@@ -534,6 +585,19 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
     std::wstring m_destKey;   // 同 destPath 互斥登记键(空 = 未持有;由 Deliver/析构摘除)
     ZmHttpClient::ZmHttpRequestOptionsPtr m_opts;
     ZmDoneFn m_done;
+
+    // 配额/总超时(Create 时由 opts 定型;0/空 = 不启用)
+    uint64_t m_maxBytes = 0;    ///< 最终文件总量上限(maxDownloadBytes)
+    uint64_t m_quotaBase = 0;   ///< 配额累计基线(206 续传 = .part 大小;200/全新 = 0)
+    int64_t m_startMs = 0;      ///< 会话创建时刻(总超时起点)
+    int64_t m_deadlineMs = 0;   ///< 总超时截止(timeoutSec>0 时非 0;0 = 不限)
+    ZmCancelToken m_cancel;     ///< 取消令牌(opts.cancelToken;OnGuard 周期判定,≤250ms 生效)
+
+    // Content-MD5 校验(BCrypt 增量哈希;仅 200 全量实体验,206 跳过 —— 分段实体无全量摘要)
+    std::string m_respMd5;      ///< 服务器声明的 Content-MD5(base64;空 = 不校验)
+    void* m_hAlg = nullptr;     ///< BCRYPT_ALG_HANDLE
+    void* m_hHash = nullptr;    ///< BCRYPT_HASH_HANDLE
+    bool m_md5Broken = false;   ///< 哈希初始化失败(写线程置位:终态按校验不通过收场,日志只出一次)
 
     ZmDownloadTarget m_tgt;
     trantor::EventLoop* m_loop = nullptr;  // 本会话的下载 loop(创建时固化,不读全局)
@@ -777,6 +841,20 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
             qb = m_qBytes;
             lastWrite = m_lastWriteMs;
         }
+        // 取消(opts.cancelToken 置真):先行于停滞/超时判定(.part 保留可续传)
+        if (m_cancel && m_cancel->load(std::memory_order_acquire))
+        {
+            Fail(drogon::ReqResult::NetworkFailure, m_statusCode, "已被调用方取消",
+                 ZmHttpFailure::Cancelled);
+            return;
+        }
+        // 总超时(timeoutSec):会话级截止,先于停滞判定 —— "慢但在动"的下载
+        // 停滞看护永不触发,总时长护栏在此兜底(opts.timeoutSec 对下载生效)
+        if (m_deadlineMs > 0 && now > m_deadlineMs)
+        {
+            Fail(drogon::ReqResult::Timeout, m_statusCode, "总超时(timeoutSec)");
+            return;
+        }
         bool readStalled = (now - m_lastActivityMs > m_stallAbortMs);
         bool writeStalled = (qb == 0) || (now - lastWrite > m_stallAbortMs);
         if (readStalled && writeStalled)
@@ -939,6 +1017,10 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
                     tePresent = true;
                     m_chunked = (ToLowerCopy(val).find("chunked") != string::npos);
                 }
+                else if (key == "content-md5")
+                {
+                    m_respMd5 = val;   // base64;仅全量响应(非续传)验
+                }
                 else if (key == "content-encoding")
                 {
                     // 请求侧已声明 identity:对端仍压缩 → 落盘即坏字节,当场终结
@@ -982,6 +1064,17 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
             return;
         }
         m_headerDone = true;
+
+        // 总量上限(maxDownloadBytes):声明总量(含续传基线)超限 → 当场终结。
+        // 基线:206 = .part 已有大小(续写);200/全新 = 0(200+续传会就地截断重写)。
+        m_quotaBase = (m_statusCode == 206) ? m_resumedFrom : 0;
+        if (m_maxBytes > 0 && m_hasContentLength &&
+            m_quotaBase + m_contentLength > m_maxBytes)
+        {
+            Fail(drogon::ReqResult::BadResponse, m_statusCode,
+                 "下载总量超上限(maxDownloadBytes)");
+            return;
+        }
 
         // 分支表:206 校验首字节;200 原连接续读+就地截断;3xx 换目标重连;异常重连一次
         if (m_statusCode == 200)
@@ -1044,6 +1137,7 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
         m_respEtag.clear();
         m_respLm.clear();
         m_respLocation.clear();
+        m_respMd5.clear();
     }
 
     /// 200 截断从头 / 206 不符,412,416:断开 → 截断 → 重连一次(发普通 GET)
@@ -1186,6 +1280,12 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
                         remain -= n;
                     }
                     m_recvBody += (size_t)m_chunkPendingSize;
+                    if (m_maxBytes > 0 && m_quotaBase + m_recvBody > m_maxBytes)
+                    {
+                        Fail(drogon::ReqResult::BadResponse, m_statusCode,
+                             "下载总量超上限(maxDownloadBytes)");
+                        return;
+                    }
                 }
                 m_pendingBuf.erase(0, (size_t)m_chunkPendingSize + 2);  // + CRLF
                 m_chunkPendingSize = UINT64_MAX;
@@ -1197,6 +1297,12 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
             if (m_hasContentLength && m_recvBody > m_contentLength)
             {
                 Fail(drogon::ReqResult::BadResponse, m_statusCode, "响应体超出 Content-Length");
+                return;
+            }
+            if (m_maxBytes > 0 && m_quotaBase + m_recvBody > m_maxBytes)
+            {
+                Fail(drogon::ReqResult::BadResponse, m_statusCode,
+                     "下载总量超上限(maxDownloadBytes)");
                 return;
             }
             // 块粒度聚合入队
@@ -1257,10 +1363,12 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
     }
 
 /// 终态失败:记日志 → 断连 → 回填原因并解除写阻塞 → 入队 ABORT(保留 .part/.meta)
-/// @param err    网络层错误分类
-/// @param status HTTP 状态码(0 = 无响应)
-/// @param why    失败原因(回执给调用方)
-    void Fail(drogon::ReqResult err, int status, const string& why)
+/// @param err     网络层错误分类
+/// @param status  HTTP 状态码(0 = 无响应)
+/// @param why     失败原因(回执给调用方)
+/// @param failure 失败来源细分(见 ZmHttpFailure;传输层之外的失败须显式给出)
+    void Fail(drogon::ReqResult err, int status, const string& why,
+              ZmHttpFailure failure = ZmHttpFailure::None)
     {
         if (m_finished.exchange(true))
             return;
@@ -1274,6 +1382,7 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
             std::lock_guard lk(m_qMtx);
             m_failStatus = status;
             m_failWhy = why;
+            m_failKind = failure;
         }
         CancelPendingFileIo();  // 解除写线程慢盘阻塞(否则 ABORT 永不执行)
         ZmDlAction ab;
@@ -1360,6 +1469,55 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
     }
 
     // -------------------------------------------------- 写线程(唯一盘上执行者)
+    // -- Content-MD5 增量哈希(写线程专用;懒启动:首个 Write 且可校验时开) --
+    //    206 不验:分段实体无全量摘要。200 恒为全量实体(.part 已按序截断/续写),
+    //    哈希覆盖的就是最终文件全部字节,故不按"本次是否续传"排除。
+    bool Md5CanVerify() const
+    {
+        return !m_respMd5.empty() && m_statusCode == 200;
+    }
+    bool Md5Begin()
+    {
+        if (m_hHash)
+            return true;
+        if (!m_hAlg &&
+            ::BCryptOpenAlgorithmProvider(&m_hAlg, BCRYPT_MD5_ALGORITHM, nullptr, 0) != 0)
+            return false;
+        return ::BCryptCreateHash(m_hAlg, &m_hHash, nullptr, 0, nullptr, 0, 0) == 0;
+    }
+    void Md5Update(const std::string& data)
+    {
+        if (m_hHash)
+            ::BCryptHashData(m_hHash, (PUCHAR)data.data(), (ULONG)data.size(), 0);
+    }
+    /// 结束哈希并取 16 字节摘要(同时清理句柄);返回 false = 哈希未启动或失败
+    bool Md5Final(std::string& digest)
+    {
+        if (!m_hHash)
+            return false;
+        unsigned char buf[16] = {};
+        const bool ok =
+            ::BCryptFinishHash(m_hHash, buf, sizeof(buf), 0) == 0;
+        ::BCryptDestroyHash(m_hHash);
+        m_hHash = nullptr;
+        if (ok)
+            digest.assign(reinterpret_cast<char*>(buf), sizeof(buf));
+        return ok;
+    }
+    void Md5Cleanup()
+    {
+        if (m_hHash)
+        {
+            ::BCryptDestroyHash(m_hHash);
+            m_hHash = nullptr;
+        }
+        if (m_hAlg)
+        {
+            ::BCryptCloseAlgorithmProvider(m_hAlg, 0);
+            m_hAlg = nullptr;
+        }
+    }
+
     void WriterLoop()
     {
         for (;;)
@@ -1404,6 +1562,18 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
                         WriterFail("写盘失败");
                         return;
                     }
+                    // Content-MD5 增量哈希(懒启动;仅全量响应)
+                    if (Md5CanVerify() && !m_md5Broken)
+                    {
+                        if (Md5Begin())
+                            Md5Update(a.data);
+                        else
+                        {
+                            m_md5Broken = true;   // 一次起不来就不再逐块重试
+                            PUBLIC_LOG_WARN("Content-MD5 哈希初始化失败,本次下载按校验不通过收场: {}",
+                                            m_destPath);
+                        }
+                    }
                     break;
                 }
                 case ZmDlAction::Kind::Truncate:
@@ -1438,6 +1608,33 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
                 }
                 case ZmDlAction::Kind::Finish:
                 {
+                    // Content-MD5 校验(仅 200 全量实体):不一致或无法计算 → 删除损坏的 .part/.meta。
+                    // 空响应体(无 Write 动作)也在此补算 —— 摘要即空串摘要,不得因
+                    // "哈希未启动"而静默放过校验。
+                    if (Md5CanVerify())
+                    {
+                        const std::string expect = Base64Decode(m_respMd5);
+                        std::string digest;
+                        const bool hashed = (m_hHash || Md5Begin()) && Md5Final(digest);
+                        if (!hashed || expect.empty() || digest != expect)
+                        {
+                            m_finished.store(true);
+                            ClosePartFile();
+                            DeleteFileW(ToW(m_destPath + ".part").c_str());
+                            DeleteFileW(ToW(m_destPath + ".part.meta").c_str());
+                            ZmHttpClient::ZmDownloadResult r;
+                            r.ok = false;
+                            r.status = m_statusCode;
+                            r.resumedFrom = m_resumedFrom;
+                            r.failure = ZmHttpFailure::LocalFile;
+                            r.error = !hashed ? "Content-MD5 无法计算(已删除损坏文件)"
+                                              : (expect.empty()
+                                                     ? "Content-MD5 头非法(已删除损坏文件)"
+                                                     : "Content-MD5 校验不一致(已删除损坏文件)");
+                            Deliver(std::move(r));
+                            return;
+                        }
+                    }
                     FinishOk(a.number);
                     return;
                 }
@@ -1503,6 +1700,7 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
             r.ok = false;
             r.status = m_statusCode;
             r.resumedFrom = m_resumedFrom;
+            r.failure = ZmHttpFailure::LocalFile;
             r.error = "最后改名失败(.part→目标)";
             Deliver(std::move(r));  // .part 保留
             return;
@@ -1525,6 +1723,7 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
         r.ok = false;
         r.status = m_failStatus;
         r.resumedFrom = m_resumedFrom;
+        r.failure = m_failKind;
         r.error = why;
         Deliver(std::move(r));
     }
@@ -1538,6 +1737,7 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
         r.ok = false;
         r.status = m_statusCode;
         r.resumedFrom = m_resumedFrom;
+        r.failure = ZmHttpFailure::LocalFile;   // 写盘/截断失败:本地文件问题
         r.error = why;
         Deliver(std::move(r));
     }
@@ -1567,6 +1767,7 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
 
     // Fail 的回执补充(入队 ABORT 后写线程读取;mutex 提供可见性)
     int m_failStatus = 0;
+    ZmHttpFailure m_failKind = ZmHttpFailure::None;
     string m_failWhy;
 };
 
@@ -1633,6 +1834,7 @@ void ZmAcceptDownload::operator()() const
         {
             ZmHttpClient::ZmDownloadResult r;
             r.ok = false;
+            r.failure = ZmHttpFailure::LocalFile;
             r.error = localErr.empty() ? "下载未受理": localErr;
             m_done(std::move(r));
         }

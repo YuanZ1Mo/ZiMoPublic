@@ -64,7 +64,8 @@ void ZmHttpFrontendServer::SetupListeners(const string& ip, bool useSSL,
         SetRootPath(rootPath);           // 先声明归属：门禁判定以其为前提
     if (m_redirectOnly)
     {
-        // 重定向专用实例：恒 80（HTTP），仅负责 301 → 443
+        // 重定向专用实例：恒 80（HTTP），仅负责 HTTP→HTTPS 重定向（状态码
+        // 默认 302,可经 SetRedirectStatus 配置）
         AddListener(80, false, ip);
     }
     else if (useSSL)
@@ -176,13 +177,49 @@ void ZmHttpFrontendServer::RegisterRoutes()
 }
 
 /**
+ * @brief 把解码后的请求路径重新编码为可直接放入 Location 的形态
+ *
+ * req->path() 是**解码后**的字符串:含空格/非 ASCII(UTF-8)/控制字符的原始请求
+ * 经解码后直接拼回 Location 会产生非法 URL。这里对"不安全字节"做百分号编码
+ * (%xx),其余(含 / 与保留字符)原样保留。
+ *
+ * @param path  解码后的请求路径
+ * @return 可放入 Location 的路径串
+ */
+string ReencodePathForLocation(const string& path)
+{
+    static const char* hex = "0123456789ABCDEF";
+    string out;
+    out.reserve(path.size() + 8);
+    for (unsigned char c : path)
+    {
+        const bool unsafe =
+            (c <= 0x20 || c >= 0x7F) ||
+            c == '"' || c == '#' || c == '%' || c == '<' || c == '>' ||
+            c == '[' || c == ']' || c == '\\' || c == '^' || c == '`' ||
+            c == '{' || c == '|' || c == '}';
+        if (!unsafe)
+            out += static_cast<char>(c);
+        else
+        {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 0x0F];
+        }
+    }
+    return out;
+}
+
+/**
  * @brief 80→443 重定向（仅重定向专用实例注册）
  *
- * 用 Host 头重建 https 地址并剥离端口；Host 缺失时回退请求实际到达的本地地址，
- * 再回退本面绑定地址（通配绑定时用请求地址才对，不能用固定 127.0.0.1）。
+ * 用 Host 头重建 https 地址并剥离端口;状态码由 SetRedirectStatus 配置(默认 302)。
+ * Host 缺失(HTTP/1.1 客户端必带;HTTP/1.0 老客户端可能缺失) → 400:旧兜底逻辑
+ * 会用本地/绑定地址拼 URL,通配绑定时得到 0.0.0.0 这类无效目标 —— 与其重定向
+ * 到错误地址,不如明确拒绝。
  *
  * @param req 请求
- * @param cb  短路回调（回 302）
+ * @param cb  短路回调（回重定向响应）
  * @param cc  放行回调
  */
 void ZmHttpFrontendServer::RedirectAdvice(const HttpRequestPtr& req,
@@ -196,16 +233,17 @@ void ZmHttpFrontendServer::RedirectAdvice(const HttpRequestPtr& req,
         return;
     }
     // 以 Host 头重建 https 地址：去掉主机上的端口段，统一 :443
-    // Host 缺省兜底不用 127.0.0.1：通配绑定（0.0.0.0）时客户端经局域网 IP 访问会
-    // 重定向错误，故优先用请求实际到达的本地地址（req->getLocalAddr），
-    // 再回退本面绑定的 ip。
     string host = req->getHeader("Host");
     if (host.empty())
     {
-        const string localIp = req->getLocalAddr().toIp();
-        host = (localIp == "0.0.0.0" || localIp == "::")
-                   ? (m_listener.ip.empty() ? string("127.0.0.1") : m_listener.ip)
-                   : localIp;
+        // RFC 7231 5.4:HTTP/1.1 请求缺 Host 必须 400;此处一并覆盖无 Host 的
+        // HTTP/1.0 请求(无法可靠推断对外可见的主机名,不猜)
+        auto resp = HttpResponse::newHttpResponse();
+        resp->setStatusCode(drogon::k400BadRequest);
+        resp->setBody("Host header required");
+        resp->addHeader("Connection", "close");
+        cb(resp);
+        return;
     }
     // 端口剥离：IPv6 形如 "[::1]:80" —— 冒号须在 ']' 之后才是端口分隔符
     // （否则拼出 "https://[::1]:80:443" 这类非法地址）
@@ -216,11 +254,12 @@ void ZmHttpFrontendServer::RedirectAdvice(const HttpRequestPtr& req,
     {
         host = host.substr(0, colon);
     }
-    string loc = "https://" + host + ":443" + string(req->path());
-    string query = req->getQuery();   // 保留原查询串（重定向不丢参数）
+    string loc = "https://" + host + ":443" + ReencodePathForLocation(req->path());
+    string query = req->getQuery();   // 保留原查询串（raw,未解码;重定向不丢参数）
     if (!query.empty())
         loc += "?" + query;
-    cb(HttpResponse::newRedirectionResponse(loc));
+    cb(HttpResponse::newRedirectionResponse(
+        loc, static_cast<drogon::HttpStatusCode>(m_redirectStatus)));
 }
 
 /**
