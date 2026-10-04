@@ -2,6 +2,7 @@
 
 #include <../spdlog/pattern_formatter.h>
 #include <../spdlog/sinks/base_sink.h>
+#include <../spdlog/sinks/null_sink.h>
 
 #include <atomic>
 #include <cstdio>
@@ -102,6 +103,33 @@ static void release_shared_sink(const std::string& path)
     {
         g_shared_sinks.erase(it);
     }
+}
+
+/**
+ * @brief 日志系统自身的告警出口(不依赖 logger / sink)
+ *
+ * 日志文件打不开时 logger 还没建起来(或已降级),必须有一个一定可用的出口把原因
+ * 说出来,否则表现为"服务起不来且没有任何线索"。同时写 stderr(调试模式控制台可见)
+ * 与 OutputDebugString(调试器可见);两者失败都不影响流程。
+ *
+ * @param msg 告警内容(UTF-8)
+ */
+static void WarnStderr(const std::string& msg)
+{
+    const std::string line = "[ZiMoLogger] " + msg + "\n";
+    std::fputs(line.c_str(), stderr);
+    std::fflush(stderr);
+    ::OutputDebugStringA(line.c_str());
+}
+
+/// @return 当前进程 exe 文件名(不含扩展名);取不到时返回 "app"
+static std::string CurrentExeStem()
+{
+    char buf[MAX_PATH] = {};
+    if (::GetModuleFileNameA(nullptr, buf, MAX_PATH) == 0 || buf[0] == '\0')
+        return "app";
+    std::string stem = std::filesystem::path(buf).stem().string();
+    return stem.empty() ? std::string("app") : stem;
 }
 
 // ============================================================================
@@ -386,9 +414,38 @@ void RotatingLoggerBase::CreateLogger()
     // 先清理旧 logger（如果存在）
     spdlog::drop(config_.logger_name);
 
-    // 获取或创建共享 sink（同路径复用，避免多 sink 写同一文件）
-    std::string path = get_log_path();
-    auto sink = acquire_shared_sink(path, config_.max_file_size, config_.max_files);
+    // ── sink 选择:主路径 → 用户临时目录 → NullSink ──
+    // 日志文件打不开不该把进程带走:典型场景是提权运行留下的日志文件 ACL 只给
+    // Users 读,非提权启动时 spdlog 会抛 spdlog_ex;若发生在启动早期且无人捕获,
+    // 就变成 std::terminate → abort → __fastfail(0xC0000409)。
+    std::shared_ptr<spdlog::sinks::sink> sink;
+    active_sink_path_.clear();
+    std::string primary;
+    try
+    {
+        primary = get_log_path();
+        sink = acquire_shared_sink(primary, config_.max_file_size, config_.max_files);
+        active_sink_path_ = primary;
+    }
+    catch (const std::exception& e)
+    {
+        WarnStderr("打开日志文件失败: " + primary + " —— " + e.what() +
+                   ";回退到用户临时目录");
+        std::string alt;
+        try
+        {
+            alt = get_fallback_log_path();
+            sink = acquire_shared_sink(alt, config_.max_file_size, config_.max_files);
+            active_sink_path_ = alt;
+            WarnStderr("日志已回退到: " + alt);
+        }
+        catch (const std::exception& e2)
+        {
+            WarnStderr("回退日志文件同样失败: " + alt + " —— " + e2.what() +
+                       ";本次运行日志静默(NullSink),服务继续启动");
+            sink = std::make_shared<spdlog::sinks::null_sink_mt>();
+        }
+    }
 
     // 创建 logger 并绑定共享 sink
     logger_ = std::make_shared<spdlog::logger>(config_.logger_name, std::move(sink));
@@ -429,33 +486,57 @@ void RotatingLoggerBase::ReleaseLogger()
         logger_.reset();
 
         // 释放共享 sink，引用计数归零时自动销毁 sink
-        release_shared_sink(get_log_path());
+        // 注:必须按"实际用过的路径"释放 —— 回退到临时目录时 get_log_path() 并非它,
+        //    否则共享表里会残留一条永不释放的条目(后续同路径无法复用)
+        if (!active_sink_path_.empty())
+            release_shared_sink(active_sink_path_);
+        active_sink_path_.clear();
     }
 }
 
 std::string RotatingLoggerBase::get_log_path() const
 {
-    char buf[MAX_PATH] = {};
-    GetModuleFileNameA(nullptr, buf, MAX_PATH);
-    std::string exe_name = std::filesystem::path(buf).stem().string();
-
     char* program_data = nullptr;
     size_t required_size = 0;
-    errno_t err = _dupenv_s(&program_data, &required_size, "ProgramData");
-
     std::string base_dir;
-    if (err == 0 && program_data != nullptr) {
+    if (_dupenv_s(&program_data, &required_size, "ProgramData") == 0 && program_data != nullptr)
+    {
         base_dir = program_data;
         free(program_data);
     }
-    else {
+    if (base_dir.empty())
         base_dir = "C:\\ProgramData";
-    }
 
     std::filesystem::path dir = std::filesystem::path(base_dir) / "ZiMo" / "logs";
-    std::filesystem::create_directories(dir);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);   // 失败不抛:交给 sink 创建去报错并触发回退
 
-    return (dir / (exe_name + ".log")).string();
+    return (dir / (CurrentExeStem() + ".log")).string();
+}
+
+std::string RotatingLoggerBase::get_fallback_log_path() const
+{
+    // 用户临时目录:与"提权进程建的 ProgramData 日志"无关,当前用户必定可写
+    std::string base;
+    char* env = nullptr;
+    size_t required = 0;
+    if (_dupenv_s(&env, &required, "TEMP") == 0 && env != nullptr)
+    {
+        base = env;
+        free(env);
+    }
+    if (base.empty() && _dupenv_s(&env, &required, "LOCALAPPDATA") == 0 && env != nullptr)
+    {
+        base = env;
+        free(env);
+    }
+    if (base.empty())
+        base = ".";                      // 最后兜底:进程当前目录
+
+    std::filesystem::path dir = std::filesystem::path(base) / "ZiMo" / "logs";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return (dir / (CurrentExeStem() + ".log")).string();
 }
 
 void DefaultLogger::Ensure()

@@ -28,9 +28,11 @@
 #include <cctype>
 #include <deque>
 #include <chrono>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <future>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -225,6 +227,18 @@ static int64_t NowMs()
 // ----------------------------------------------------------------------------
 /// 请求 ID 的进程内自增序号(原子;每生成一次 +1)
 static std::atomic<uint64_t> s_reqIdSeq{1};
+
+// 响应结算指标(原子;PreRouting 起算在飞,PreSending 结算总/状态段/延迟桶)
+static std::atomic<uint64_t> s_m_total{0};
+static std::atomic<uint64_t> s_m_s2xx{0};
+static std::atomic<uint64_t> s_m_s3xx{0};
+static std::atomic<uint64_t> s_m_s4xx{0};
+static std::atomic<uint64_t> s_m_s5xx{0};
+static std::atomic<uint64_t> s_m_inflight{0};
+static std::atomic<uint64_t> s_m_latLe100{0};
+static std::atomic<uint64_t> s_m_latLe500{0};
+static std::atomic<uint64_t> s_m_latLe2s{0};
+static std::atomic<uint64_t> s_m_latGt2s{0};
 
 /**
  * @brief 生成请求 ID
@@ -667,6 +681,95 @@ T& ZmClaimSlot(std::vector<std::pair<const ZmHttpServer*, T>>& claims,
     return claims.back().second;
 }
 
+#ifndef SO_EXCLUSIVEADDRUSE
+#define SO_EXCLUSIVEADDRUSE ((int)(~SO_REUSEADDR))
+#endif
+
+/**
+ * @brief 解析 IPv4 点分十进制字面量
+ *
+ * 不用 inet_addr/inet_pton:前者被标记弃用(C4996),后者要引入 winsock2 头序约束,
+ * 而这里只需要判"是不是 IPv4 字面量 + 取 4 字节网络序值"。
+ *
+ * @param s   待解析串
+ * @param out 出参:网络序地址(可直接赋给 sockaddr_in::sin_addr.s_addr)
+ * @return true 合法 IPv4 字面量;false 非 IPv4(含 IPv6/主机名/畸形)
+ */
+static bool ParseIPv4Literal(const string& s, unsigned long& out)
+{
+    unsigned long parts[4] = {0, 0, 0, 0};
+    size_t idx = 0;
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        if (s[i] == '.')
+        {
+            if (i == 0 || s[i - 1] == '.' || ++idx > 3)
+                return false;                      // 空段 / 段数超 4
+            continue;
+        }
+        if (!std::isdigit(static_cast<unsigned char>(s[i])))
+            return false;
+        parts[idx] = parts[idx] * 10 + static_cast<unsigned long>(s[i] - '0');
+        if (parts[idx] > 255)
+            return false;
+    }
+    if (s.empty() || s.back() == '.' || idx != 3)
+        return false;
+    // 先拼成"点分顺序"的 32 位值,再转网络序 —— 直接赋值会大小端颠倒
+    // (把 127.0.0.1 绑成 1.0.0.127,绑定必失败,预探测就会误报"端口被占用")
+    out = ::htonl((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]);
+    return true;
+}
+
+/**
+ * @brief 预探测各已登记监听端口能否绑定(绑得上立刻释放)
+ *
+ * 为什么必须预探测:捆抛的 trantor 在 bind 失败处直接 exit(1)(trantor Socket.cc:67),
+ * 而该 exit 在"另一线程正阻塞于条件变量"时可能走不完 —— 进程既不服务也不退出。
+ * 探测端必须带 SO_EXCLUSIVEADDRUSE:Windows 上裸绑定的端口会被带 SO_REUSEADDR 的
+ * 后来者抢绑,不加独占就测不出"已被占用"。
+ * 只探测 IPv4 字面量地址;IPv6/主机名不做预探测(避免误判),交回真实绑定路径。
+ *
+ * @param why 出参:失败原因(形如 "0.0.0.0:80 已被占用")
+ * @return true 全部可绑定;false 至少一个不可绑定(原因已回填)
+ */
+static bool ProbeListenerPorts(string& why)
+{
+    std::vector<std::pair<const ZmHttpServer*, uint16_t>> claims;
+    {
+        std::lock_guard<std::mutex> lk(s_ownerMtx);
+        claims = s_portClaims;
+    }
+    for (const auto& [face, port] : claims)
+    {
+        if (port == 0 || !face)
+            continue;
+        const string ip = face->GetBindIp();
+        unsigned long addr = 0;
+        if (ip.empty() || !ParseIPv4Literal(ip, addr))
+            continue;                              // 未登记/非 IPv4 字面量:不预探测
+
+        SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET)
+            continue;                              // 探测本身不可用时不阻断
+        BOOL excl = TRUE;
+        ::setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                     reinterpret_cast<const char*>(&excl), sizeof(excl));
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(port);
+        a.sin_addr.s_addr = addr;
+        const bool ok = ::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;
+        ::closesocket(s);
+        if (!ok)
+        {
+            why = ip + ":" + std::to_string(port) + " 已被占用(或本进程无权绑定)";
+            return false;
+        }
+    }
+    return true;
+}
+
 /// 启动后只读的归属快照(热路径零锁:门禁一次查表、归属网一次查表)
 struct ZmOwnerSnapshot
 {
@@ -742,6 +845,8 @@ std::mutex s_jsonpMtx;
 ZmHttpServer::ZmJsonpOptions s_jsonpDefaults;                      // 全局基线(Init 前可改)
 std::vector<std::pair<std::string, ZmHttpServer::ZmJsonpOptions>> s_jsonpRoutes;  // 前缀 → 合并后
 std::set<std::string, std::less<>> s_jsonpWarned;                  // 观察期:未声明却被包装的路径
+/// 观察期告警路径集合上限:路径由客户端可控,必须封顶(超限只静默,不再记录新路径)
+constexpr size_t kJsonpWarnedMax = 4096;
 
 struct ZmJsonpSnapshot
 {
@@ -807,7 +912,7 @@ void ZmBuildJsonpSnapshot()
 //   drogon app() 为全局单例且 run() 只能跑一次 → 生命周期为进程级一次:
 //     Uninit → Initialized(Init) → Opened(Open) → Closed(Close, 终态)。
 //   相位契约:AddListener/RegisterRoutes/RegisterCoro 全部须在 Open 前完成;
-//   Open() 起 run 线程,绑定失败(端口占用等)在 300ms 内探测并 fail-fast。
+//   Open() 先预探测监听端口(占用则干净返回 false),再起 run 线程跑事件循环。
 //   运行期唯一可热更新能力:ReloadCertificates()(reloadSSLFiles)。
 namespace
 {
@@ -829,11 +934,14 @@ std::string s_runErrorMsg;
 std::atomic<bool> s_hasCert{false};
 
 // 启动成功信号:registerBeginningAdvice 在事件循环真正跑起来时置值,
-// Open() 用 future 等待,替代"300ms 没报错就认为成功"的盲猜。
-// 用 unique_ptr 管理:Open 失败回退后可重建以支持重试。
-std::mutex s_startMtx;
-std::unique_ptr<std::promise<void>> s_startPromise;
+// Open() 据此确定性等待"启动成功"(替代"300ms 没报错就认为成功"的盲猜)。
+// ⚠ 该标志的读写与通知都在 s_stateMtx 内:等待方在持锁期间判定谓词,
+//   通知方若不持同一把锁,"check 后 / block 前"到达的通知会丢(等待方永久阻塞)。
 std::atomic<bool> s_startReady{false};
+
+std::atomic<bool> s_initClaimed{false};   // Init 单次执行门(CAS 抢占,防并发双跑)
+std::atomic<bool> s_trustProxy{false};    // 限流 key 是否取 X-Forwarded-For 首跳
+std::atomic<bool> s_closing{false};       // Close 已接手收尾(锁外的 quit+join 进行中)
 
 /**
  * @brief 把服务器事件循环登记进 ZmHttpClient 的已登记 loop 表
@@ -923,21 +1031,16 @@ bool IsValidJsonpCallback(const std::string& cb);
 /**
  * @brief 事件循环真正跑起来时置启动就绪信号
  *
- * 供 Open() 确定性等待"启动成功";绑定失败会在事件循环启动前抛异常,
- * 此时本函数不触发,由 run 线程的异常路径兜底。
+ * 供 Open() 确定性等待"启动成功"。端口占用**不**走这里 —— 由 Open 的端口预探测
+ * 在起线程前拦下(捆抛的 trantor 在 bind 失败处直接 exit(1),不会抛异常)。
  */
 void NotifyServerStarted()
 {
-
-    {
-        std::lock_guard lk(s_startMtx);
-        if (s_startPromise && !s_startReady.load())
-        {
-            s_startPromise->set_value();
-            s_startReady.store(true);
-        }
-    }
-    s_stateCv.notify_all();   // 唤醒 Open() 的 wait_for(依赖 s_startReady 判定)
+    // 通知必须在 s_stateMtx 内:等待方(Open/Close)持该锁判定谓词,通知方不持锁
+    // 则存在"check 后 / block 前"的丢通知窗口 —— 丢了就永久阻塞(无人会再通知)。
+    std::lock_guard lk(s_stateMtx);
+    s_startReady.store(true);
+    s_stateCv.notify_all();
 }
 
 /**
@@ -968,6 +1071,7 @@ void RecordAccessStart(const HttpRequestPtr& req)
 {
 
     req->getAttributes()->insert("ZmAccessStartMs", std::any(int64_t(NowMs())));
+    s_m_inflight.fetch_add(1, std::memory_order_relaxed);   // 与 FinalizeResponse 结算配对
     // 请求 ID:上游透传优先(合法字符校验),否则生成 zm-<秒>-<序>
     string rid = req->getHeader("X-Request-Id");
     if (rid.empty() || !IsValidRequestId(rid))
@@ -1090,6 +1194,30 @@ void FinalizeResponse(const HttpRequestPtr& req, const HttpResponsePtr& resp)
         query.empty() ? string(req->path()) : string(req->path()) + "?" + query,
         reqBytes, req->getPeerAddr().toIpPort(), req->getLocalAddr().toIpPort(),
         static_cast<int>(resp->getStatusCode()), respBytes, cost);
+
+    // ── 指标累加(与 RecordAccessStart 的 inflight+1 配对;start>0 才配得上) ──
+    if (start > 0)
+    {
+        s_m_inflight.fetch_sub(1, std::memory_order_relaxed);
+        const int code = static_cast<int>(resp->getStatusCode());
+        s_m_total.fetch_add(1, std::memory_order_relaxed);
+        if (code >= 500)
+            s_m_s5xx.fetch_add(1, std::memory_order_relaxed);
+        else if (code >= 400)
+            s_m_s4xx.fetch_add(1, std::memory_order_relaxed);
+        else if (code >= 300)
+            s_m_s3xx.fetch_add(1, std::memory_order_relaxed);
+        else
+            s_m_s2xx.fetch_add(1, std::memory_order_relaxed);
+        if (cost <= 100)
+            s_m_latLe100.fetch_add(1, std::memory_order_relaxed);
+        else if (cost <= 500)
+            s_m_latLe500.fetch_add(1, std::memory_order_relaxed);
+        else if (cost <= 2000)
+            s_m_latLe2s.fetch_add(1, std::memory_order_relaxed);
+        else
+            s_m_latGt2s.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 /**
@@ -1124,18 +1252,13 @@ void ApplyAutoJsonp(const HttpRequestPtr& req, const HttpResponsePtr& resp)
             break;
         }
     }
+    bool undeclared = false;
     if (!opt)
     {
         if (!snap->defaults.enabled)
             return;                      // 目标形态:未声明路由不包装
         opt = &snap->defaults;           // 观察期:兼容现状 + 告警(每路径一次)
-        std::lock_guard<std::mutex> lk(s_jsonpMtx);
-        if (s_jsonpWarned.insert(path).second)
-        {
-            PUBLIC_LOG_WARN("[JSONP] 未声明路由 \"{}\" 的 JSON 响应被自动包装(观察期);"
-                            "确认无外部调用方后请 SetJsonpDefaults 置 enabled=false,"
-                            "并对需要 JSONP 的路由 SetJsonpEnabled", path);
-        }
+        undeclared = true;
     }
     if (!opt->enabled)
         return;                          // 该前缀被显式排除(声明 ≠ 启用)
@@ -1151,7 +1274,18 @@ void ApplyAutoJsonp(const HttpRequestPtr& req, const HttpResponsePtr& resp)
             break;
     }
     if (cb.empty() || !IsValidJsonpCallback(cb))
-        return;
+        return;                          // 无合法回调名 = 不是 JSONP 请求:不包装,也不记录告警
+    if (undeclared)
+    {
+        // 告警只在"确实包装了未声明路由"时记录,且有界(路径是客户端可控输入)
+        std::lock_guard<std::mutex> lk(s_jsonpMtx);
+        if (s_jsonpWarned.size() < kJsonpWarnedMax && s_jsonpWarned.insert(path).second)
+        {
+            PUBLIC_LOG_WARN("[JSONP] 未声明路由 \"{}\" 的 JSON 响应被自动包装(观察期);"
+                            "确认无外部调用方后请 SetJsonpDefaults 置 enabled=false,"
+                            "并对需要 JSONP 的路由 SetJsonpEnabled", path);
+        }
+    }
     string body = cb + "(" + std::string(resp->getBody()) + ");";
     resp->setBody(body);
     resp->setContentTypeCode(CT_TEXT_JAVASCRIPT);
@@ -1160,10 +1294,23 @@ void ApplyAutoJsonp(const HttpRequestPtr& req, const HttpResponsePtr& resp)
 }  // namespace
 bool ZmHttpServer::Init(const Options& opts)
 {
+    // 单次执行门:CAS 抢占。只查状态存在 TOCTOU —— 两个线程可同时通过检查后各跑
+    // 一遍(重复注册 advice/handler:轻则行为漂移,重则触发 drogon 断言)。
+    // 注:本门只表达"有线程正在/曾经跑 Init",不表达"已初始化"(那是 s_state 的职责)——
+    //     **尚未产生任何副作用**的失败分支必须归还本门,否则调用方修正后重试会被永久挡死;
+    //     反之,一旦已改动 app() 全局状态就不得归还(再跑一遍会二次注册 advice/handler)。
+    bool claimed = false;
+    if (!s_initClaimed.compare_exchange_strong(claimed, true))
+    {
+        PUBLIC_LOG_ERROR("ZmHttpServer::Init 只可调用一次(已有并发 Init 或此前已 Init 过)");
+        return false;
+    }
     ZmRuntimeState cur = s_state.load();
     if (cur != ZmRuntimeState::Uninit)
     {
         PUBLIC_LOG_ERROR("ZmHttpServer::Init 只可调用一次(当前状态已非 Uninit)");
+        // 归还本门:本次未做任何事,重复 Init 由状态判定负责拒绝(无副作用,安全可重试)
+        s_initClaimed.store(false);
         return false;
     }
 
@@ -1183,6 +1330,7 @@ bool ZmHttpServer::Init(const Options& opts)
     // 捆绑 drogon 1.9.13 已含 setBrStatic,且 lib 已链接 brotli(USE_BROTLI)
     app().setBrStatic(opts.brotliStatic);
     s_workPoolSize.store(opts.workPoolSize);       // 首次 RunOnPool 前定型
+    s_trustProxy.store(opts.trustProxyHeaders);    // 限流 key 来源(见 ZmIpRateLimiter::Check)
 
     // ── TLS(证书全局,保证热加载) ──
     s_hasCert.store(!opts.certFile.empty(), std::memory_order_relaxed);
@@ -1194,7 +1342,8 @@ bool ZmHttpServer::Init(const Options& opts)
     }
 
     // ── 启动成功信号:事件循环真正跑起来时置值,供 Open 确定性等待 ──
-    // 绑定失败会在事件循环启动前抛异常,此时 BeginningAdvice 不触发 → 由 run 异常兜底。
+    // 注:端口占用由 Open 的预探测在起线程前拦下(捆抛的 trantor 在 bind 失败处
+    //     直接 exit(1),不抛异常);其余启动/运行异常由 run 线程的异常路径兜底。
     app().registerBeginningAdvice(&NotifyServerStarted);
 
     // ── 全局 advice + /ping(经 Options 一次性注册,不再依赖"首个 Open"去重) ──
@@ -1251,20 +1400,26 @@ bool ZmHttpServer::Init(const Options& opts)
  * @brief 启动服务器(Phase2):后台线程跑 app.run
  *
  * 前置条件:已 Init 且已登记至少一个监听。启动成功以"事件循环就绪信号"
- * (registerBeginningAdvice)为准,而非固定超时;绑定失败(端口占用等)经 run 线程
+ * (registerBeginningAdvice)为准;端口占用经预探测 fail-fast,其余启动异常经 run 线程
  * 异常 fail-fast。并发纪律:状态迁移全程持 s_stateMtx —— Close 在 Open 的启动窗口/
  * 等待期插入时能看到一致状态并正常收管(run 线程由 Close join)。
  *
- * @return true 启动成功(app().run 运行中);false 前置不满足、归属校验失败、
- *         run 线程启动失败或 run 抛异常(状态回退为 Initialized,修正后可重试)
+ * @return true 启动成功(app().run 运行中);false 前置不满足、归属校验失败、监听端口
+ *         被占用(预探测)、run 线程启动失败、run 抛异常或等待就绪超时
+ *         —— 除成功外状态均回退 Initialized,修正后可重试
  */
 namespace
 {
 /**
  * @brief app().run() 的承载线程入口
  *
- * 事件循环启动失败(端口占用等)会在绑定前抛异常,此处捕获并置位错误信号,
- * 供 Open() 的等待逻辑 fail-fast。
+ * app().run() 抛出的异常在此捕获并置位错误信号,供 Open() 的等待逻辑 fail-fast;
+ * 它同时是"运行期异常"对外可见的唯一信号 ——
+ * s_state 不回退,由 IsOpened() 读它,避免"服务器已死但对外仍报运行中"。
+ * 注:端口占用不走这里(trantor 在 bind 失败处直接 exit(1),trantor Socket.cc:67),
+ * 该场景由 Open 的端口预探测拦下。
+ * 置位与通知都在 s_stateMtx 内(与等待方共用一把锁,避免丢通知);
+ * Close 的 join 已移出该锁(见 Close),故此处取锁不会与之互等。
  */
 void RunServerLoop(std::stop_token)
 {
@@ -1275,13 +1430,17 @@ void RunServerLoop(std::stop_token)
     catch (const std::exception& e)
     {
         s_runErrorMsg = e.what();
+        std::lock_guard lk(s_stateMtx);
         s_runError.store(true, std::memory_order_release);
+        PUBLIC_LOG_ERROR("ZmHttpServer app().run() 线程异常退出: {}", s_runErrorMsg);
         s_stateCv.notify_all();
     }
     catch (...)
     {
         s_runErrorMsg = "unknown";
+        std::lock_guard lk(s_stateMtx);
         s_runError.store(true, std::memory_order_release);
+        PUBLIC_LOG_ERROR("ZmHttpServer app().run() 线程异常退出(未知异常)");
         s_stateCv.notify_all();
     }
 }
@@ -1307,22 +1466,30 @@ bool ZmHttpServer::Open()
     if (!ValidateRouteOwnership())
         return false;
 
+    // 端口可用性预探测:必须在这里干净地失败 —— 捆抛的 trantor 在 bind 失败处直接
+    // exit(1)(Socket.cc:67),且该 exit 在有线程阻塞于条件变量时走不完 → 进程卡死,
+    // Open 既不返回也不报错。预探测通过后真实绑定仍可能被别进程抢走(TOCTOU),
+    // 那由下面的有界等待兜底。
+    {
+        string why;
+        if (!ProbeListenerPorts(why))
+        {
+            PUBLIC_LOG_ERROR("ZmHttpServer::Open: 监听端口不可用 —— {};修正后可直接重试 Open",
+                             why);
+            return false;   // 状态仍为 Initialized:允许修正后重试
+        }
+    }
+
     s_runError.store(false);
     s_state.store(ZmRuntimeState::Opened);
 
-    // 启动信号重置:advice 已注册,每次 Open 重建 promise 供本次等待
-    // (s_startReady 原子标志为实际判定依据,advice 置值 + notify s_stateCv)
-    {
-        std::lock_guard lk(s_startMtx);
-        s_startPromise = std::make_unique<std::promise<void>>();
-        s_startReady.store(false);
-    }
+    // 启动信号复位:本函数全程持 s_stateMtx,故与通知方/等待方互斥(见 s_startReady 注)
+    s_startReady.store(false);
 
     // 后台线程跑 app().run()(ZmThread 模型;Stop 靠 request_stop + join,
     // 实际退出由 app().quit() 驱动,run() 不查 stop_token)。
-    // 绑定失败(端口占用等)会在事件循环启动前抛异常 → s_runError 捕获兜底。
-    // 注:run 线程异常路径仅写 s_runErrorMsg + release s_runError,不取 s_stateMtx,
-    //     避免与 Close 的 Stop(join) 互等。
+    // 注:run 线程异常路径在 s_stateMtx 内置 s_runError 并通知;Close 的 join 已移出
+    //     该锁,故两者不会互等(见 Close 与 RunServerLoop)。
     s_runThread = std::make_unique<ZmThread>("DrogonHttpRun", &RunServerLoop);
     if (!s_runThread->Start())
     {
@@ -1332,14 +1499,30 @@ bool ZmHttpServer::Open()
         return false;
     }
 
-    // 纯事件等待"启动结果":三个信号必然有一个到达并 notify ——
-    //   BeginningAdvice 触发(事件循环已跑)→ 成功;run 抛异常(绑定失败等)→ s_runError;
+    // 等待"启动结果":三个信号之一到达并 notify ——
+    //   BeginningAdvice 触发(事件循环已跑)→ 成功;run 抛异常 → s_runError;
     //   并发 Close 收管 → s_state == Closed。
-    // 无需超时:绑定失败必抛异常、启动成功必触发 advice。
-    s_stateCv.wait(lock, [&] {
+    // 有界兜底:进程内已无更强保证 —— trantor 在 bind 失败处 exit(1) 而 exit 可能
+    // 走不完(不触发上面任何信号),此时调用方会永久阻塞。宁可超时报失败。
+    constexpr int64_t kStartWaitMs = 15000;
+    const auto startDeadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(kStartWaitMs);
+    auto startReady = [&] {
         return s_runError.load(std::memory_order_acquire) || s_startReady.load() ||
                s_state.load() == ZmRuntimeState::Closed;
-    });
+    };
+    while (!startReady())
+    {
+        if (s_stateCv.wait_until(lock, startDeadline) == std::cv_status::timeout && !startReady())
+        {
+            PUBLIC_LOG_ERROR("ZmHttpServer::Open: 等待事件循环就绪超时({}ms) —— run 线程"
+                             "可能卡在第三方 exit 路径;按启动失败返回(状态回退 Initialized,"
+                             "run 线程未 join,进程应尽快重启)",
+                             kStartWaitMs);
+            s_state.store(ZmRuntimeState::Initialized);
+            return false;
+        }
+    }
 
     // 并发 Close 已收管(线程已 join、s_runThread 已复位):本次 Open 视为失败
     if (s_state.load() == ZmRuntimeState::Closed)
@@ -1349,6 +1532,8 @@ bool ZmHttpServer::Open()
     {
         PUBLIC_LOG_ERROR("app().run() 启动异常: {}", s_runErrorMsg);
         // 让 run 线程收尾退出,再回退状态允许重试
+        // 此处持 s_stateMtx join 是安全的:s_runError 由 run 线程在该锁内置位,
+        // 本函数能看到它为 true 即说明对方已离开临界区(且此后不会再取该锁)。
         app().quit();
         s_runThread->Stop();
         s_runThread.reset();
@@ -1367,13 +1552,22 @@ bool ZmHttpServer::Open()
  * Opened → 先 app().quit() 停事件循环,再 Stop(join) —— 顺序不可颠倒。
  * ⚠ 在飞 HTTP 语义:quit 后挂起的协程不再调度,业务层自保障(守护线程 join/断点),
  *    本函数不等待在飞业务。
- * 并发纪律:全程持 s_stateMtx,可安全打断 Open 的启动等待窗口
- * (notify_all 唤醒其 CV 等待;run 线程由本函数 join 并复位)。
+ * 并发纪律(两条,缺一会挂):
+ *   ① 启动窗口内 run 线程尚未进 loop,quit() 此时是 no-op,故先等"循环已起/run 抛
+ *      异常"再 quit,否则 run() 永不返回,Stop() join 永久挂死;
+ *   ② join 必须在 s_stateMtx 之外做:run 线程的异常收尾要取该锁才能通知(见
+ *      RunServerLoop),持锁 join 会与之互等死锁。终态先落在锁内,故并发 Open 仍按
+ *      "已收管"收场;s_closing 门保证并发 Close 等到本次收尾真正做完再返回。
+ * ⚠ 严禁在 run 线程(服务器事件循环)内调用:那会 join 自身线程,标准库直接抛
+ *    resource_deadlock_would_occur,且收尾无法完成。
  * Closed 为终态,之后不能再 Open/Init/AddListener。
  */
 void ZmHttpServer::Close()
 {
-    std::lock_guard<std::mutex> lock(s_stateMtx);
+    std::unique_lock<std::mutex> lock(s_stateMtx);   // wait 需要可解锁的锁
+    // 并发 Close:已有一次收尾在锁外 join,等它做完再返回(保证"返回即已停")
+    s_stateCv.wait(lock, [] { return !s_closing.load(); });
+
     ZmRuntimeState cur = s_state.load();
     if (cur == ZmRuntimeState::Uninit || cur == ZmRuntimeState::Closed)
     {
@@ -1387,34 +1581,83 @@ void ZmHttpServer::Close()
         return;
     }
     // Opened:先 quit 让 run() 返回,再 Stop(join) — 顺序必须保持
+    std::unique_ptr<ZmThread> runThread;
     if (s_runThread)
     {
-        app().quit();
-        s_runThread->Stop();
-        s_runThread.reset();
+        // 启动窗口:run 线程还没进 loop,quit() 是 no-op(drogon 以
+        // getLoop()->isRunning() 为前提,HttpAppFrameworkImpl.cc:1036)→ run() 永不返回
+        // → Stop() join 永久阻塞。先等两个信号之一:事件循环已起(BeginningAdvice)
+        // 或 run 已抛异常(此时线程已在收尾,join 立刻返回)。
+        s_stateCv.wait(lock, [&] {
+            return s_startReady.load() || s_runError.load(std::memory_order_acquire);
+        });
+        runThread = std::move(s_runThread);   // 所有权移出静态槽:join 放到锁外
     }
+    s_state.store(ZmRuntimeState::Closed);   // 终态先落:并发 Open/Close 由此收场
+    s_closing.store(true);
+    app().quit();                            // 只入队不阻塞,保持"quit 先于 join"的顺序
+    lock.unlock();
+
+    if (runThread)
+    {
+        runThread->Stop();      // join(锁外;理由见 doc ②)
+        runThread.reset();
+    }
+
+    lock.lock();
+    s_closing.store(false);
     UnregisterServerLoops();  // :与 RegisterServerLoops 对称注销
-    s_state.store(ZmRuntimeState::Closed);
-    s_stateCv.notify_all();   // 唤醒并发 Open 的等待(其按 Closed 收场)
+    s_stateCv.notify_all();   // 唤醒并发 Open/Close 的等待
     PUBLIC_LOG_INFO("ZmHttpServer::Close 完成(已 quit+Stop,终态)");
 }
 
 /**
  * @brief 查询是否已完成 Init(可登记监听/路由,无论是否已启动)
- * @return true 状态 ≥ Initialized;false 仍为 Uninit
+ * @return true 状态为 Initialized/Opened;false 仍为 Uninit 或已 Closed
+ *         (枚举序 Closed 在 Initialized 之后,"≥ Initialized" 会把它误判为可用)。
+ *         注:不看 run 线程死活 —— Open 失败会回退到 Initialized 并允许"修正后重试",
+ *         此时 Init 阶段确实已完成,与"当前是否有事件循环"是两件事(后者看 IsOpened)。
  */
 bool ZmHttpServer::IsInitialized()
 {
-    return s_state.load() >= ZmRuntimeState::Initialized;
+    ZmRuntimeState cur = s_state.load();
+    return cur == ZmRuntimeState::Initialized || cur == ZmRuntimeState::Opened;
 }
 
 /**
  * @brief 查询事件循环是否正在运行
- * @return true 状态为 Opened(此时只能 Close 或证书热重载);false 其它状态
+ * @return true 状态为 Opened 且 run 线程未抛异常(运行期抛异常 = 事件循环已死,
+ *         s_state 不回退,故这里必须读 s_runError);false 其它状态
  */
 bool ZmHttpServer::IsOpened()
 {
-    return s_state.load() == ZmRuntimeState::Opened;
+    return s_state.load() == ZmRuntimeState::Opened &&
+           !s_runError.load(std::memory_order_acquire);
+}
+
+/**
+ * @brief 读取运行时指标快照
+ *
+ * 口径:total/状态段/延迟桶在响应出口(FinalizeResponse)累加,只统计经过 PreRouting
+ * 的请求 —— 取不到起始时间戳的响应不结算(与访问日志同一判据);inflight 为
+ * PreRouting 起算数减已结算数,属测量性指标,连接已断的响应不结算故非精确值。
+ *
+ * @return 各字段的原子读快照
+ */
+ZmHttpServer::ZmMetrics ZmHttpServer::GetMetricsSnapshot()
+{
+    ZmMetrics m;
+    m.total = s_m_total.load(std::memory_order_relaxed);
+    m.s2xx = s_m_s2xx.load(std::memory_order_relaxed);
+    m.s3xx = s_m_s3xx.load(std::memory_order_relaxed);
+    m.s4xx = s_m_s4xx.load(std::memory_order_relaxed);
+    m.s5xx = s_m_s5xx.load(std::memory_order_relaxed);
+    m.inflight = s_m_inflight.load(std::memory_order_relaxed);
+    m.latencyLe100ms = s_m_latLe100.load(std::memory_order_relaxed);
+    m.latencyLe500ms = s_m_latLe500.load(std::memory_order_relaxed);
+    m.latencyLe2s = s_m_latLe2s.load(std::memory_order_relaxed);
+    m.latencyGt2s = s_m_latGt2s.load(std::memory_order_relaxed);
+    return m;
 }
 
 /**
@@ -1852,6 +2095,33 @@ void ZmHttpServer::RegisterCoroWithDeadline(const string& path, drogon::HttpMeth
 namespace
 {
 constexpr int64_t kMaxFieldBytes = 1 << 20;  // 单字段值上限(1MB)
+/// 文件部件全量驻留内存的安全上限:调用方 maxBytes=0 且全局闸门也为 0 时的兜底
+constexpr uint64_t kMultipartMemoryCeiling = 256ULL * 1024 * 1024;
+
+/**
+ * @brief 大小写不敏感的子串查找(RFC 规定 media type 与参数名大小写不敏感)
+ *
+ * @param hay     被查串(如 Content-Type 头值)
+ * @param needle  待查串(须为小写字面量)
+ * @return 首次出现的下标;未命中返回 string::npos
+ */
+size_t FindNoCase(const string& hay, const char* needle)
+{
+    const size_t n = std::strlen(needle);
+    if (n == 0 || hay.size() < n)
+        return string::npos;
+    for (size_t i = 0; i + n <= hay.size(); ++i)
+    {
+        size_t j = 0;
+        while (j < n &&
+               std::tolower(static_cast<unsigned char>(hay[i + j])) ==
+                   static_cast<unsigned char>(needle[j]))
+            ++j;
+        if (j == n)
+            return i;
+    }
+    return string::npos;
+}
 
 /// Multipart 收集器状态(全部在事件循环线程按序访问,无需锁)
 struct ZmMultipartCollector
@@ -2073,21 +2343,28 @@ void ZmHttpServer::RegisterMultipartCoro(const string& path, drogon::HttpMethod 
                   std::function<void(const HttpResponsePtr&)>&& cb) {
         // ① Content-Type / boundary 预检(缺 → 400,不消费流)
         string ct = req->getHeader("Content-Type");
-        if (ct.find("multipart/form-data") == string::npos ||
-            ct.find("boundary=") == string::npos)
+        // media type 与参数名大小写不敏感(RFC 7231/2045),不能按原样 find
+        if (FindNoCase(ct, "multipart/form-data") == string::npos ||
+            FindNoCase(ct, "boundary=") == string::npos)
         {
             cb(ZmHttpServer::ErrorResponse(400, "multipart form-data required"));
             return;
         }
+        // 单请求总量上限:0 不再等于"无上限"(否则单请求可把内存吃满)——
+        // 依次回落到非流式体量闸门、内置硬上限
+        uint64_t effMax = maxBytes;
+        if (effMax == 0)
+            effMax = s_nonStreamBodyLimit.load(std::memory_order_relaxed);
+        if (effMax == 0)
+            effMax = kMultipartMemoryCeiling;
         // ② 声明超限预检(413;Content-Length 缺失(chunked)由运行时 total 兜底)
-        if (maxBytes > 0)
         {
             string cl = req->getHeader("Content-Length");
             if (!cl.empty())
             {
                 try
                 {
-                    if (std::stoull(cl) > maxBytes)
+                    if (std::stoull(cl) > effMax)
                     {
                         streamCtx->setStreamReader(
                             drogon::RequestStreamReader::newNullReader());
@@ -2100,7 +2377,7 @@ void ZmHttpServer::RegisterMultipartCoro(const string& path, drogon::HttpMethod 
         }
 
         auto state = std::make_shared<ZmMultipartCollector>();
-        state->maxBytes = maxBytes;
+        state->maxBytes = effMax;
         // 超限后中途换 NullReader 用(拷贝持有流;见 dataCb)
         drogon::RequestStreamPtr stream = streamCtx;
 
@@ -3372,14 +3649,10 @@ ZmHttpServer::RangeInfo ZmHttpServer::ParseRange(const HttpRequestPtr& req,
     if (range.rfind("bytes=", 0) != 0)
         return r;                                    // 不认识的 unit → MUST ignore
     string body = range.substr(6);
-    // 多段只服务首段:回 200 全文件会让续传客户端拿不到区间(且多段响应体需 multipart 封装)
-    size_t comma = body.find(',');
-    if (comma != string::npos)
-    {
-        body = body.substr(0, comma);
-        while (!body.empty() && std::isspace(static_cast<unsigned char>(body.back())))
-            body.pop_back();
-    }
+    // 多段区间(multipart/byteranges)本实现不提供:按 RFC 7233 "MAY ignore" 整体忽略 → 200。
+    // 不可只服务首段 —— 请求多段的客户端会按区间拼装,缺段会被当成"这一段没变"而静默出错。
+    if (body.find(',') != string::npos)
+        return r;                                    // present=true,partial/unsatisfiable=false → 忽略
     size_t dash = body.find('-');
     if (dash == string::npos)
         return r;                                    // 语法非法 → ignore
@@ -3590,28 +3863,28 @@ ZmHttpServer::ZmFileMeta ZmHttpServer::FetchFileMeta(const string& path)
     const std::wstring wpath = ZmString::UTF8_To_Unicode(path);
     if (wpath.empty() && !path.empty())
         return m;
-    const std::filesystem::path fsPath(wpath);
-    std::error_code ec;
-    m.found = std::filesystem::exists(fsPath, ec) && !ec;
-    if (!m.found)
-        return m;
-    m.size = static_cast<size_t>(std::filesystem::file_size(fsPath, ec));
-    if (ec)
+    // 单次 GetFileAttributesExW 取齐 存在性/大小/修改时间:静态资源热路径每请求
+    // 省掉两次内核调用(旧实现 exists / file_size / last_write_time 各一次)
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!::GetFileAttributesExW(wpath.c_str(), GetFileExInfoStandard, &fad))
+        return m;                                    // 不存在或无权访问 → found=false(调用方 404)
+    m.found = true;
+    if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
     {
-        m.sizeFailed = true;
+        m.sizeFailed = true;   // 目录不是可发送文件(保持旧语义:调用方回 500)
         return m;
     }
-    std::error_code ec2;
-    auto ft = std::filesystem::last_write_time(fsPath, ec2);
-    if (!ec2)
-    {
-        auto fileNow = std::filesystem::file_time_type::clock::now();
-        auto sysNow = std::chrono::system_clock::now();
-        auto sysT = std::chrono::time_point_cast<std::chrono::seconds>(
-            sysNow - (fileNow - ft));
-        m.mtimeSec =
-            static_cast<int64_t>(std::chrono::system_clock::to_time_t(sysT));
-    }
+    ULARGE_INTEGER sz{};
+    sz.LowPart = fad.nFileSizeLow;
+    sz.HighPart = fad.nFileSizeHigh;
+    m.size = static_cast<size_t>(sz.QuadPart);
+    // FILETIME(1601-01-01 起算,单位 100ns)→ Unix 秒
+    ULARGE_INTEGER ft{};
+    ft.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+    ft.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+    constexpr uint64_t kEpochDiff100ns = 116444736000000000ULL;   // 1601→1970 的 100ns 数
+    if (ft.QuadPart >= kEpochDiff100ns)
+        m.mtimeSec = static_cast<int64_t>((ft.QuadPart - kEpochDiff100ns) / 10000000ULL);
     return m;
 }
 
@@ -3801,17 +4074,22 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileCoro(const HttpRequestPtr& r
  * @param attachmentName  非空 = 以附件下载
  * @param fileSize        文件总大小(字节,调用方已 stat)
  * @param mtimeSec        文件修改时间(epoch 秒,调用方已 stat)
+ * @param etagKey         ETag 前缀(空 = 仅 size-mtime);须与方案乙同源
  * @return 文件响应(200/206/304/416)
  */
 drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileCoroImpl(const HttpRequestPtr& req,
                                                              const string& path,
                                                              const string& attachmentName,
                                                              size_t fileSize,
-                                                             int64_t mtimeSec)
+                                                             int64_t mtimeSec,
+                                                             const string& etagKey)
 {
     ZmFileMeta m;                       // 元信息由公开入口/Hybrid 已取,此处只组装
     m.size = fileSize;
     m.mtimeSec = mtimeSec;
+    // ETag 前缀与方案乙同源:否则同一文件在 Hybrid 阈值两侧拿到不同 ETag,
+    // 缓存验证器与 If-Range 判定会随路径不同而打架
+    m.key = etagKey;
 
     // ① 条件请求(304 无 body);命中即返回,不再走 Range/200
     auto cacheHeaders = CacheHeaders(m);
@@ -4022,7 +4300,8 @@ drogon::Task<HttpResponsePtr> ZmHttpServer::SendFileHybridCoro(const HttpRequest
     if (m.sizeFailed)
         co_return ErrorResponse(500, "file stat failed");
     if (m.size < threshold)
-        co_return co_await SendFileCoroImpl(req, path, attachmentName, m.size, m.mtimeSec);
+        co_return co_await SendFileCoroImpl(req, path, attachmentName, m.size, m.mtimeSec,
+                                            streamOpts.etagKey);
     co_return co_await SendFileStreamCoroImpl(req, path, attachmentName, streamOpts,
                                               m.size, m.mtimeSec);
 }
@@ -4466,8 +4745,9 @@ bool ZmHttpServer::IsRateRuleHit(const string& ip)
 }
 
 // ----------------------------------------------------------------------------
-// ZmIpRateLimiter:逐 IP 桶协调器(每个 IP 独立桶;有界 + 插入序驱逐)
-//   默认桶:key = 来访 IP(攻击者可控)→ 必须有界,故按插入序驱逐
+// ZmIpRateLimiter:逐 IP 桶协调器(每个 IP 独立桶;有界 + LRU 驱逐)
+//   默认桶:key = 来访 IP(攻击者可控)→ 必须有界;驱逐须按"最久未使用"而非插入序,
+//   否则攻击者轮换假 IP 就能把活跃用户的桶挤出,桶重建 = 计数清零 = 放行一波。
 //   专项桶:key = 有 Quota 规则的 IP(管理动作可控)→ 挂在规则上,随规则存亡
 // ----------------------------------------------------------------------------
 struct ZmHttpServer::ZmIpRateLimiter::Impl
@@ -4479,14 +4759,16 @@ struct ZmHttpServer::ZmIpRateLimiter::Impl
 
     std::mutex mtx;   // 短临界:桶查找/创建/驱逐(仅事件循环线程批;耗时微秒级)
     std::unordered_map<string, drogon::RateLimiterPtr> buckets;
-    std::deque<string> order;   // 插入序(驱逐队头)
+    std::list<string> lru;   // 队首 = 最久未使用(list 迭代器稳定,才能 O(1) 提升)
+    std::unordered_map<string, std::list<string>::iterator> lruPos;
     // 注:专项额度桶不在本容器 —— 它挂在 overlay 规则上(见 ZmQuotaSlot),
     //     条目数恒等于 Quota 规则数,不需要也不该有驱逐(驱逐 = 重置额度 = 放行一波)
 
     /**
      * @brief 取(或惰性创建)某 IP 的默认桶
      *
-     * 桶数达到 maxEntries 时按插入序驱逐最旧桶(防 IP 无限增长导致内存泄漏)。
+     * 命中即提升到 LRU 队尾;桶数达到 maxEntries 时驱逐最久未使用者(防 IP 无限
+     * 增长导致内存泄漏)。提升与驱逐均为 O(1)(list::splice + 迭代器表)。
      * 桶创建为低频操作(每 IP 首个请求一次),故在锁内惰性创建。
      *
      * @param ip  对端 IP 字面量
@@ -4497,21 +4779,29 @@ struct ZmHttpServer::ZmIpRateLimiter::Impl
         std::lock_guard lk(mtx);
         auto it = buckets.find(ip);
         if (it != buckets.end())
+        {
+            // 命中即提升:不提升就退化成 FIFO,轮换假 IP 可挤掉活跃桶
+            auto pos = lruPos.find(ip);
+            if (pos != lruPos.end())
+                lru.splice(lru.end(), lru, pos->second);
             return it->second;
+        }
         if (buckets.size() >= maxEntries)
         {
-            // 驱逐最旧(插入序队头)
-            while (!order.empty())
+            // 驱逐最久未使用(队首);迭代器表与桶表必须同步摘除
+            while (!lru.empty())
             {
-                string old = std::move(order.front());
-                order.pop_front();
+                string old = std::move(lru.front());
+                lru.pop_front();
+                lruPos.erase(old);
                 if (buckets.erase(old) > 0)
                     break;
             }
         }
         auto lim = MakeSafeRateLimiter(type, cap, timeSec);
         buckets.emplace(ip, lim);
-        order.emplace_back(ip);
+        lru.emplace_back(ip);
+        lruPos[ip] = std::prev(lru.end());
         return lim;
     }
 };
@@ -4539,12 +4829,45 @@ ZmHttpServer::ZmIpRateLimiter::Create(drogon::RateLimiterType type, size_t capac
 }
 
 /**
+ * @brief 取 X-Forwarded-For 首跳 IP(仅 Options.trustProxyHeaders 开启时使用)
+ *
+ * 语义:最左项 = 原始客户端(右侧各项由中间代理追加)。只接受"非空、长度 ≤64、
+ * 仅含 [0-9A-Za-z.:]"的串;任何畸形一律返回空串,由调用方退回对端 IP。
+ *
+ * @param req 请求
+ * @return 首跳 IP 字面量;无该头或格式非法返回空串
+ */
+static string FirstForwardedFor(const HttpRequestPtr& req)
+{
+    string xff = req->getHeader("X-Forwarded-For");
+    if (xff.empty())
+        return {};
+    size_t comma = xff.find(',');
+    if (comma != string::npos)
+        xff.resize(comma);
+    // 去首尾空白(代理常写成 "1.2.3.4, 5.6.7.8")
+    size_t b = xff.find_first_not_of(" \t");
+    if (b == string::npos)
+        return {};
+    size_t e = xff.find_last_not_of(" \t");
+    string first = xff.substr(b, e - b + 1);
+    if (first.size() > 64)
+        return {};
+    for (char c : first)
+    {
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == ':'))
+            return {};
+    }
+    return first;
+}
+
+/**
  * @brief 组合执行限流判定:overlay 规则优先,未命中走默认 per-IP 桶
  *
  * 判定顺序:封禁 → 429;白名单 → 放行;专项额度 → 独立桶(规则参数变更即重建);
- * 其余 IP 走默认桶。
+ * 其余 IP 走默认桶。key 取值来源见 Options.trustProxyHeaders。
  *
- * @param req   请求(取对端 IP)
+ * @param req   请求(取对端 IP / X-Forwarded-For)
  * @param resp  出参:被限流时写入 429 响应
  * @return true 放行;false 已拒绝(此时 resp 必非空)
  *
@@ -4557,7 +4880,14 @@ ZmHttpServer::ZmIpRateLimiter::Create(drogon::RateLimiterType type, size_t capac
 bool ZmHttpServer::ZmIpRateLimiter::Check(const drogon::HttpRequestPtr& req,
                                           drogon::HttpResponsePtr& resp)
 {
-    string ip = req->getPeerAddr().toIp();
+    // 限流 key:默认只认对端 IP —— 反代/负载均衡后置时全体客户端会同桶,
+    // 需经 Options.trustProxyHeaders 显式开启 X-Forwarded-For(该头可伪造,
+    // 只在入口已被可信代理覆写时才可信任)。
+    string ip;
+    if (s_trustProxy.load(std::memory_order_relaxed))
+        ip = FirstForwardedFor(req);
+    if (ip.empty())
+        ip = req->getPeerAddr().toIp();
     if (ip.empty())
         return true;   // 无对端信息(异常态)不拦
 

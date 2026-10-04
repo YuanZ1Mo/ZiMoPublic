@@ -45,14 +45,21 @@ protected:
     explicit RotatingLoggerBase(const Config& config = Config{});
 
     // 在派生类构造函数体中调用，此时虚表已就绪，get_log_path() 可正确分派
+    // 日志文件打不开（典型：提权进程创建的日志 ACL 只给 Users 读）时逐级降级：
+    // 主路径 → 用户临时目录 → NullSink，并在 stderr 直出原因；绝不因日志失败抛异常。
     void CreateLogger();
     void ReleaseLogger();
 
     // 返回日志文件路径，默认 %ProgramData%\ZiMo\logs\<exe_name>.log，子类可重写
     virtual std::string get_log_path() const;
 
+    // 主路径打不开时的回退日志路径，默认 %TEMP%\ZiMo\logs\<exe_name>.log
+    virtual std::string get_fallback_log_path() const;
+
     Config config_;
     std::shared_ptr<spdlog::logger> logger_;
+    /// 实际使用的日志文件路径（发生回退时与 get_log_path() 不同；空 = 用的是 NullSink）
+    std::string active_sink_path_;
 };
 
 // 默认日志管理器，logger_name 为 DEFAULT，设为默认 logger

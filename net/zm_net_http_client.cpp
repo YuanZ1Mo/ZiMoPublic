@@ -25,6 +25,7 @@
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <locale>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -188,10 +189,17 @@ ZmUrlTarget ParseUrl(const string& raw)
     string authority = (slashPos == string::npos) ? rest : rest.substr(0, slashPos);
     t.path = (slashPos == string::npos) ? "/" : rest.substr(slashPos);
 
-    // userinfo 仅剥离(暂不做 Basic Auth 自动头)
+    // userinfo 仅剥离(暂不做 Basic Auth 自动头):静默丢弃会让"URL 里写了账号密码
+    // 却没生效"变成难查的哑失败。凭据本身不入日志(只提示一次,避免热路径刷屏)。
     size_t at = authority.find_last_of('@');
     if (at != string::npos)
+    {
         authority = authority.substr(at + 1);
+        static std::atomic<bool> s_userinfoWarned{false};
+        if (!s_userinfoWarned.exchange(true))
+            PUBLIC_LOG_WARN("ZmHttpClient:URL 含 userinfo 凭据,已剥离且未作为认证头发送;"
+                            "需要 Basic/Bearer 请在 opts.headers 显式设置 Authorization");
+    }
 
     string host;
     string portStr;
@@ -366,8 +374,11 @@ double RetryDelayMs(const drogon::HttpResponsePtr& resp, int retryIndex,
             if (end != ra.c_str() && v > 0)
                 return std::min(v * 1000.0, capMs);
             // HTTP-date 形态(RFC 7231 IMF-fixdate):"Sun, 06 Nov 1994 08:49:37 GMT"
+            // 必须钉死经典 locale:%a/%b 按 locale 解析,非英文 locale 下会静默失败
+            // 并退化成指数退避(等待时长随运行环境漂移)
             std::tm tm{};
             std::istringstream ss(ra);
+            ss.imbue(std::locale::classic());
             ss >> std::get_time(&tm, "%a, %d %b %Y %H:%M:%S GMT");
             if (!ss.fail())
             {
@@ -503,7 +514,10 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
             if (!m_prelude(*this, err))
             {
                 PUBLIC_LOG_WARN("ZmHttpClient 离核预组装失败: {}", err);
-                FinishErr(drogon::ReqResult::NetworkFailure, 0);
+                // 本地错误(文件过大/打开失败等)与网络故障区分:错误分类仍是
+                // NetworkFailure(调用方按"可重试传输失败"处理),但带上可读原因,
+                // 否则排障时无法从"网络失败"分辨出其实是本地文件问题
+                FinishErr(drogon::ReqResult::NetworkFailure, 0, err);
             }
             else
                 NextAttempt();  // 线程安全:状态机仅经 drogon queueInLoop 与池快照序列化触达共享面
@@ -511,7 +525,7 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
         catch (...)
         {
             PUBLIC_LOG_WARN("ZmHttpClient 离核预组装异常");
-            FinishErr(drogon::ReqResult::NetworkFailure, 0);
+            FinishErr(drogon::ReqResult::NetworkFailure, 0, "离核预组装异常(未捕获)");
         }
     }
 
@@ -669,6 +683,9 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
                     m_curMethod = drogon::HttpMethod::Get;
                     m_curBody = ZMJSON();
                     m_curRaw.clear();
+                    // 预组装体已随方法一起作废:不复位 rawProvided 会让 GET 继续
+                    // 带着"曾提供 raw"的隐性状态,后续判断依赖"GET 不看 raw"才不出错
+                    m_rawProvided = false;
                 }
                 // 调度下一跳(与重试分支同律:经 loop 排队,避免同栈递归;
                 // 零延迟--窗口期由"连接层失败换连"兜底,见 m_lastFailedClient 注)
@@ -743,9 +760,11 @@ class ZmSendMachine : public std::enable_shared_from_this<ZmSendMachine>
     }
 
 /// 直接以错误分类终结(错误码 + 状态码一并带回执)
-    void FinishErr(drogon::ReqResult err, int status)
+    void FinishErr(drogon::ReqResult err, int status, const std::string& why = {})
     {
-        Finish(MakeErrorResult(err, status));
+        ZmHttpResult r = MakeErrorResult(err, status);
+        r.error = why;
+        Finish(std::move(r));
     }
 
     drogon::HttpMethod m_originalMethod;
@@ -840,6 +859,12 @@ class ZmMachineAwaiter
     void await_suspend(std::coroutine_handle<> h)
     {
         m_resumeH = h;
+        // 恢复线程:未显式指定 resumeLoop 时回环到"调用方协程当前所属 loop"。
+        // 就地 resume 会把 co_await 之后的整段业务搬到 lane loop 回调线程上执行,
+        // 破坏调用方(如服务器 handler)的事件循环纪律;取不到(调用方不在任何 loop
+        // 线程上)才退回就地 resume。
+        if (!m_resumeLoop)
+            m_resumeLoop = trantor::EventLoop::getEventLoopOfCurrentThread();
         // 移交:值对象随 ctx 离开帧(此后帧内仅 3 个指针成员;resume 前不触碰 ctx 之外内容)
         auto ctx = m_ctx;
         RunSendMachine(ctx->m, std::move(ctx->url), std::move(ctx->body), std::move(ctx->raw),
@@ -861,7 +886,8 @@ class ZmMachineAwaiter
     void Deliver(const std::shared_ptr<ZmMachineCtx>& ctx, ZmHttpResult&& r)
     {
         ctx->result = std::move(r);
-        // resume 线程语义:默认 = lane loop 回调线程;resumeLoop 指定时回环.
+        // resume 线程语义:await_suspend 已把默认值定为"调用方 loop",此处按它回环;
+        // 两者皆空(调用方不在 loop 线程)时退回就地 resume.
         // 注意:resume 是 Deliver 的最后一条语句,不得在 resume 后触碰本桥成员.
         if (m_resumeLoop && !m_resumeLoop->isInLoopThread())
             m_resumeLoop->queueInLoop([h = m_resumeH]() { h.resume(); });
@@ -1323,9 +1349,16 @@ bool ZmHttpClient::IsReady()
 }
 
 /// 全局唯一关闭(三步序:下载通道 → 普通 lane → 置 Closed);幂等;终态.
-/// 严禁在任一已登记 loop 线程内调用(自锁);业务须在调用前停发新请求
+/// 严禁在任一已登记 loop 线程内调用 —— lane loop 上调用会对自身线程 join
+/// (标准库抛 resource_deadlock_would_occur),其它 loop 上调用则带竞态"成功".
+/// 这里显式拒绝并返回;业务须在调用前停发新请求,并在业务线程调用.
 void ZmHttpClient::Close()
 {
+    if (IsLoopThread())
+    {
+        PUBLIC_LOG_ERROR("ZmHttpClient::Close 禁止在已登记 loop 线程调用(会 join 自身线程),已忽略");
+        return;
+    }
     {
         std::lock_guard lock(s_stateMtx);
         if (s_state != ZmClientState::Initialized)

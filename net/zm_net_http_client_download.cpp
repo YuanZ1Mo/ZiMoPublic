@@ -53,6 +53,13 @@ bool s_dlRunning = false;
 std::mutex s_sessMtx;
 std::set<std::shared_ptr<class ZmDownloadSession>> s_sessions;
 
+// 同 destPath 互斥登记:并发写同一 .part 会被 CreateFileW 的共享模式挡下,但报错
+// 只能落在"打开 .part 失败"上,看不出真因;这里提前登记并给出明确原因。
+// 键取规范化路径(见 DestKey):NTFS 不区分大小写、分隔符两种写法等价,
+// 直接按原串比较会让"D:\a"与"d:/A"这类同一目标绕过登记。
+std::mutex s_destMtx;
+std::set<std::wstring> s_destActive;
+
 /// @return 当前 steady_clock 毫秒时戳(仅用于时间差)
 int64_t NowMs()
 {
@@ -86,6 +93,33 @@ std::wstring ToW(const string& s)
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
     if (!w.empty() && w.back() == L'\0')
         w.pop_back();
+    return w;
+}
+
+/**
+ * @brief 目标路径的互斥键(与文件系统的"同一文件"判定对齐)
+ *
+ * 三件事:UTF-8 → wide(与打开文件同源,避免窄串按 ANSI 解码)、取绝对路径
+ * (消除相对路径与 "."/".." 写法差异)、统一分隔符并小写(NTFS 大小写不敏感)。
+ * 注:不做 8.3 短名/符号链接归一 —— 这两类仍可能绕过,属已知残留。
+ *
+ * @param destPath 下载目标路径(UTF-8)
+ * @return 规范化后的键(取绝对路径失败时退化为"原串小写统一分隔符")
+ */
+std::wstring DestKey(const string& destPath)
+{
+    std::wstring w = ToW(destPath);
+    std::vector<wchar_t> buf(MAX_PATH * 2);
+    DWORD n = ::GetFullPathNameW(w.c_str(), static_cast<DWORD>(buf.size()), buf.data(), nullptr);
+    if (n > 0 && n < buf.size())
+        w.assign(buf.data(), n);
+    for (auto& c : w)
+    {
+        if (c == L'/')
+            c = L'\\';
+        else if (c >= L'A' && c <= L'Z')
+            c = static_cast<wchar_t>(c - L'A' + L'a');
+    }
     return w;
 }
 
@@ -366,6 +400,30 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
         }
 
         // 打开 .part:N = 现有大小(唯一事实源);N=0 截断
+        // 先把 destPath 登记为"在飞":并发同目标会在开文件前就被明确拒绝。
+        // RAII 保证本函数任一失败分支都会摘除登记;成功则移交给会话。
+        struct DestClaim
+        {
+            std::wstring key;
+            ~DestClaim()
+            {
+                if (!key.empty())
+                {
+                    std::lock_guard lk(s_destMtx);
+                    s_destActive.erase(key);
+                }
+            }
+        } claim;
+        {
+            std::wstring key = DestKey(destPath);
+            std::lock_guard lk(s_destMtx);
+            if (!s_destActive.insert(key).second)
+            {
+                err = "该目标文件已有在飞下载会话(同 destPath 串行):" + destPath;
+                return nullptr;
+            }
+            claim.key = std::move(key);
+        }
         std::wstring part = ToW(destPath + ".part");
         s->m_file = CreateFileW(part.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
                                FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -407,6 +465,8 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
         s->m_lastWriteMs = s->m_lastActivityMs;
 
         // 写线程(成员声明序保证:m_writer 为最后成员,~session 先于其析构 join)
+        s->m_destKey = claim.key;
+        claim.key.clear();   // 登记移交会话,由 Deliver / 析构摘除
         s->m_writer = std::thread([raw = s.get()]() { raw->WriterLoop(); });
         return s;
     }
@@ -440,6 +500,9 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
             else
                 m_writer.join();
         }
+        // 兜底摘除:未走 Deliver 的路径(异常/放弃)也要放掉 destPath 互斥。
+        // 放在 join 之后:写线程可能正在 Deliver 里摘同一把登记。
+        ReleaseDestClaim();
     }
 
   private:
@@ -468,6 +531,7 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
     // -- 状态(dlLoop 侧) --
     string m_url;
     string m_destPath;
+    std::wstring m_destKey;   // 同 destPath 互斥登记键(空 = 未持有;由 Deliver/析构摘除)
     ZmHttpClient::ZmHttpRequestOptionsPtr m_opts;
     ZmDoneFn m_done;
 
@@ -1388,6 +1452,17 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
         WriterFail("通道关闭");
     }
 
+    /// 摘除 destPath 互斥登记(幂等;Deliver 与析构都会调用)
+    void ReleaseDestClaim()
+    {
+        if (m_destKey.empty())
+            return;
+        std::wstring key = std::move(m_destKey);
+        m_destKey.clear();
+        std::lock_guard lk(s_destMtx);
+        s_destActive.erase(key);
+    }
+
     /// 终态收尾:摘除登记 → 回执.hold 保活至本函数退出(~session 若在此触发,
     /// 析构自检会 detach 写线程自身,线程随后自然退出).
     void Deliver(ZmHttpClient::ZmDownloadResult&& r)
@@ -1402,6 +1477,7 @@ class ZmDownloadSession : public std::enable_shared_from_this<ZmDownloadSession>
                 s_sessions.erase(it);
             }
         }
+        ReleaseDestClaim();   // 终态即释放目标互斥(此后同 destPath 可再起新会话)
         if (m_done)
         {
             ZmDoneFn d = std::move(m_done);
@@ -1709,6 +1785,11 @@ class ZmDownloadAwaiter
     void await_suspend(std::coroutine_handle<> h)
     {
         m_resumeH = h;
+        // 恢复线程:未显式指定 resumeLoop 时回环到"调用方协程当前所属 loop"。
+        // 本通道的终态回执由写线程发出,就地 resume 会让 co_await 之后的整段业务
+        // 跑在写线程上(跨线程执行事件循环业务);取不到才退回就地 resume。
+        if (!m_resumeLoop)
+            m_resumeLoop = trantor::EventLoop::getEventLoopOfCurrentThread();
         auto ctx = m_ctx;
         string err;
         bool accepted = ZmHttpDownloadChannel::StartDownload(

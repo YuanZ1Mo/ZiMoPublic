@@ -197,6 +197,10 @@ public:
         /// （库已链接，无孪生照发原文件）
         bool brotliStatic = false;
         bool ticketDisabled = false;       ///< TLS SessionTicket 禁用（安全项）
+        /// 反代/负载均衡后置：true 时限流 key 取 X-Forwarded-For 首跳。
+        /// 默认 false = 只认对端 IP；开启前提是入口已被可信代理覆写该头，
+        /// 否则客户端可伪造头绕开限流（同时也让 FIFO/LRU 驱逐失去意义）。
+        bool trustProxyHeaders = false;
         std::string certFile;              ///< 全局证书（空 = 纯 HTTP）
         std::string keyFile;               ///< 全局私钥（与 certFile 配套）
         // 注：CORS 白名单**不在本结构体** —— 它是业务策略而非传输参数，
@@ -282,16 +286,20 @@ public:
      * 只能调用一次；未 Init 就 Open 会报错。
      *
      * @param opts  全局运行参数（见 Options）
-     * @return true 初始化成功；false 状态非法（已初始化）或参数/证书不可用
+     * @return true 初始化成功；false 状态非法（已初始化/已关闭）或已被并发 Init 抢占
+     *         （后者未产生副作用，可安全重试；本函数不做参数/证书校验，证书可用性由
+     *          调用方按 Options.certFile 是否为空表达）
      */
     static bool Init(const Options& opts);
 
     /**
      * @brief 启动服务器：后台线程跑 app().run()
      *
-     * 须已 Init 且已登记至少一个监听；绑定失败（端口占用等）在 300ms 内探测到。
+     * 须已 Init 且已登记至少一个监听；端口占用在起线程前预探测并干净返回 false
+     * （捆抛的 trantor 在 bind 失败处直接 exit(1)，不能依赖其抛异常）。
      *
-     * @return true 启动成功；false 未 Init / 无监听 / 绑定失败
+     * @return true 启动成功；false 未 Init / 无监听 / 归属校验不过 / 端口被占用 /
+     *         run 线程启动失败或异常 / 等待就绪超时（失败均回退 Initialized 可重试）
      *
      * @example
      *   ZmHttpServer::Init(opts);
@@ -309,16 +317,37 @@ public:
     static void Close();
 
     /**
-     * @brief 是否已完成一次性初始化
-     * @return true 状态 ≥ Initialized
+     * @brief 是否已完成一次性初始化（可登记监听/路由）
+     * @return true 状态为 Initialized/Opened；false 仍为 Uninit 或已 Closed
+     *         （不看事件循环死活：Open 失败会回退到 Initialized 并允许修正后重试）
      */
     static bool IsInitialized();
 
     /**
      * @brief 服务器是否处于运行中
-     * @return true 已 Open 且未 Close
+     * @return true 已 Open 且未 Close 且 run 线程未抛异常（运行期抛异常 = 事件循环已死）
      */
     static bool IsOpened();
+
+    /**
+     * @brief 运行时指标快照（FinalizeResponse 出口累计；连接已断的响应不结算）
+     */
+    struct ZmMetrics
+    {
+        uint64_t total = 0;           ///< 已结算响应总数
+        uint64_t s2xx = 0;            ///< 状态码 2xx
+        uint64_t s3xx = 0;            ///< 状态码 3xx
+        uint64_t s4xx = 0;            ///< 状态码 4xx
+        uint64_t s5xx = 0;            ///< 状态码 5xx
+        uint64_t inflight = 0;        ///< 在飞请求数（PreRouting 起算，PreSending 结算）
+        uint64_t latencyLe100ms = 0;  ///< 耗时 ≤100ms
+        uint64_t latencyLe500ms = 0;  ///< 100ms ~ 500ms
+        uint64_t latencyLe2s = 0;     ///< 500ms ~ 2s
+        uint64_t latencyGt2s = 0;     ///< >2s
+    };
+
+    /// @return 指标快照（各字段原子读；统计口径见 ZmMetrics）
+    static ZmMetrics GetMetricsSnapshot();
 
     /**
      * @brief 本面监听是否启用 TLS（一对象一端口）
@@ -1160,12 +1189,13 @@ private:
      * @param attachmentName  非空 = 以附件下载
      * @param fileSize        已取的文件大小
      * @param mtimeSec        已取的最后写入秒
+     * @param etagKey         ETag 前缀（同 ZmHttpSendFileOptions::etagKey；空 = 仅 size-mtime）
      * @return 响应（200/206/304/416）
      */
     static drogon::Task<drogon::HttpResponsePtr>
     SendFileCoroImpl(const drogon::HttpRequestPtr& req, const std::string& path,
                      const std::string& attachmentName, size_t fileSize,
-                     int64_t mtimeSec);
+                     int64_t mtimeSec, const std::string& etagKey = "");
 
     /**
      * @brief 已知元信息的流式发送内部实现（分工同 SendFileCoroImpl）

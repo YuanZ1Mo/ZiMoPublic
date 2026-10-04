@@ -66,6 +66,9 @@ struct ZmHttpResult
     int    retries = 0;                 ///< 实际重试次数
     bool   followedRedirect = false;    ///< 是否发生过重定向跟随
     std::string finalUrl;               ///< 重定向终结 URL
+    /// 失败原因可读文本。本地错误（离核预组装失败：文件过大/打开失败等）必定填充，
+    /// 网络类错误可空；判定"是不是网络问题"请看 err，不要看 error 是否为空
+    std::string error;
 
     /// Content-Type 为 JSON 时解析为 ZMJSON(解析失败空对象 + 告警日志)
     ZMJSON Json() const;
@@ -116,10 +119,12 @@ public:
     /// 已初始化且未 Close
     static bool IsReady();
     /// 全局唯一关闭(三步序:①下载通道 ②普通 lane ③置 Closed);幂等;终态.
-    /// 严禁在任一已登记 loop 线程内调用(自锁).
+    /// 必须由业务线程调用:任一已登记 loop 线程上调用会被拒绝并返回
+    /// （loop 线程 join 自身会抛 resource_deadlock_would_occur）。
     static void Close();
 
-    // ── 协程(推荐;resume 线程默认 = 客户端 lane loop,可经 opts.resumeLoop 回环) ──
+    // ── 协程(推荐;resume 线程默认 = 调用方协程所属 loop,可经
+    //    opts.resumeLoop 指定别的 loop 回环) ──
     static drogon::Task<ZmHttpResult> SendCoro(drogon::HttpMethod m, const std::string& url,
         const ZMJSON& body = {}, const ZmHttpRequestOptions& opts = {});
     static drogon::Task<ZmHttpResult> GetCoro(const std::string& url,

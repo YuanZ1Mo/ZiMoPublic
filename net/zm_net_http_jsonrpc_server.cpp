@@ -102,6 +102,8 @@ ZMJSON ZmHttpJsonRpcServer::ParseRequest(const HttpRequestPtr& req)
 //     -32602  Invalid params：params 存在但非 object/array
 //     -32601  Method not found：未知 method
 //     -32603  Internal error：handler 内部异常（或业务返回 false 未给 code）
+//   有意裁剪（与规范不同，错误 message 已点明）：不支持批量数组、不支持通知
+//   （缺 id 按无效请求回包，而非静默不回）。
 namespace
 {
 /**
@@ -137,18 +139,23 @@ ZMJSON ZmHttpJsonRpcServer::Dispatch(const ZMJSON& req)
         return rsp;
     }
 
-    // 必须是对象（批量数组、标量一律视为无效请求）
+    // 必须是对象。批量数组本面**有意不支持**（规范要求回批量信封数组，与本面
+    // "HTTP 恒 200 + 单信封"的契约冲突），按无效请求处理并在 message 点明。
     if (!req.is_object())
     {
-        rsp["error"] = MakeJsonrpcError(-32600, "Invalid Request");
+        rsp["error"] =
+            MakeJsonrpcError(-32600, "Invalid Request (batch requests are not supported)");
         return rsp;
     }
 
-    // id 必须存在（兼容语义：客户端恒带 id；缺 id 视为无效请求，不按通知处理）
+    // id 必须存在。本面**有意不支持 JSON-RPC 通知**（通知按规范不回包，而本面
+    // HTTP 恒 200 + 信封响应，语义无法两全）：缺 id 一律按无效请求回 -32600，
+    // 错误 message 里点明原因，便于调用方区分"报文写错"与"用了不支持的通知"。
     if (!req.contains("id") ||
         !(req["id"].is_number_integer() || req["id"].is_string() || req["id"].is_null()))
     {
-        rsp["error"] = MakeJsonrpcError(-32600, "Invalid Request, Missing id Parameter");
+        rsp["error"] = MakeJsonrpcError(
+            -32600, "Invalid Request, Missing id Parameter (notifications are not supported)");
         return rsp;
     }
     rsp["id"] = req["id"];               // 校验通过后才回填 id（保证键序不变）
@@ -172,7 +179,8 @@ ZMJSON ZmHttpJsonRpcServer::Dispatch(const ZMJSON& req)
     // -32602 params
     if (req.contains("params") && !(req["params"].is_object() || req["params"].is_array()))
     {
-        rsp["error"] = MakeJsonrpcError(-32602, "Invalid params, Missing params Parameter");
+        // 文案须描述真实原因：params 存在但类型非法（原文案说 "Missing"，误导排障）
+        rsp["error"] = MakeJsonrpcError(-32602, "Invalid params, params must be object or array");
         return rsp;
     }
     ZMJSON params = req.contains("params") ? req["params"] : ZMJSON::object();
@@ -202,6 +210,13 @@ ZMJSON ZmHttpJsonRpcServer::Dispatch(const ZMJSON& req)
     {
         // 业务异常不上抛：统一转 -32603，避免协程栈上抛出导致连接被断
         PUBLIC_LOG_ERROR("JRPC method '{}' 异常: {}", method, e.what());
+        rsp["error"] = MakeJsonrpcError(-32603, "Internal error");
+        return rsp;
+    }
+    catch (...)
+    {
+        // 非 std 异常（裸类型抛出）同样必须收口：否则穿透协程 → 框架断连接而非回 -32603
+        PUBLIC_LOG_ERROR("JRPC method '{}' 异常(非 std::exception)", method);
         rsp["error"] = MakeJsonrpcError(-32603, "Internal error");
         return rsp;
     }
@@ -237,5 +252,3 @@ void ZmHttpJsonRpcServer::GateAdvice(const HttpRequestPtr& req, AdviceCallback&&
     }
     cb(HttpResponse::newNotFoundResponse());
 }
-
-

@@ -11,6 +11,33 @@
 using namespace drogon;
 using std::string;
 
+namespace
+{
+/**
+ * @brief 路径是否落在前缀之下（段边界感知 + ASCII 大小写不敏感）
+ *
+ * 门的对面是"文件系统按大小写不敏感解析"的请求路径，故前缀判定也不能按字节
+ * 直接比较：`rfind(denied + "/", 0)` 会漏掉 `/Secret/...` 这类大小写变体。
+ * 段边界比较可避免 `/api` 误伤 `/apix`。
+ *
+ * @param path    请求路径
+ * @param prefix  前缀（如 "/secret"）
+ * @return true 命中前缀自身或其子路径
+ */
+bool PathUnderPrefixNoCase(const string& path, const string& prefix)
+{
+    if (prefix.empty() || path.size() < prefix.size())
+        return false;
+    for (size_t i = 0; i < prefix.size(); ++i)
+    {
+        if (std::tolower(static_cast<unsigned char>(path[i])) !=
+            std::tolower(static_cast<unsigned char>(prefix[i])))
+            return false;
+    }
+    return path.size() == prefix.size() || path[prefix.size()] == '/';
+}
+}  // namespace
+
 // ── 构造 ──
 /**
  * @brief 构造前端面实例
@@ -228,8 +255,8 @@ void ZmHttpFrontendServer::GateAdvice(const HttpRequestPtr& req,
         }
         for (const string& other : m_otherRootPaths)
         {
-            // 前缀匹配须带 "/" 边界，避免 "/app2" 被 "/app" 误伤
-            if (path == other || path.rfind(other + "/", 0) == 0)
+            // 前缀匹配须带 "/" 边界且忽略大小写（文件系统本身不区分大小写）
+            if (PathUnderPrefixNoCase(path, other))
             {
                 cb(HttpResponse::newNotFoundResponse());
                 return;
@@ -244,7 +271,8 @@ void ZmHttpFrontendServer::GateAdvice(const HttpRequestPtr& req,
     {
         for (const string& denied : m_deniedPaths)
         {
-            if (path == denied || path.rfind(denied + "/", 0) == 0)
+            // 同上：大小写变体（/Secret/...）不得绕过封禁
+            if (PathUnderPrefixNoCase(path, denied))
             {
                 cb(HttpResponse::newNotFoundResponse());
                 return;
@@ -289,6 +317,11 @@ void ZmHttpFrontendServer::CacheHeaderAdvice(const HttpRequestPtr& req,
 
     if (!IsLocalPortIn(req))
         return;                      // 只管本面端口产生的响应
+    // 只给"成功且可缓存"的状态加头：自定义 404 页也是文件响应（带 Last-Modified），
+    // 不加状态过滤会被当成静态资源下发缓存策略
+    const int code = static_cast<int>(resp->getStatusCode());
+    if (code != 200 && code != 206 && code != 304)
+        return;
     // 静态响应特征：文件通道（带 Last-Modified；注：文件型 getBody() 亦非空，
     // 不能以 body 为空判定）；已有 Cache-Control 不覆盖
     if (!resp->getHeader("Last-Modified").empty() &&
